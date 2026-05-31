@@ -205,6 +205,7 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool just_restored  = false; // set on disk slot-restore; one-shot, gates restored-slot KV reuse
 
     stop_type stop;
 
@@ -2284,7 +2285,9 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+        // slot.task is null when create_checkpoint is called from do_slot_restore (a restore has
+        // no active task); use -1 so the restored checkpoint is simply not tied to a current task.
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2574,6 +2577,20 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->just_restored = true;
+
+                    // Reconstruct a context checkpoint at the restored position so the prompt-cache
+                    // reuse path can reuse this state on the next matching request. Hybrid/recurrent
+                    // (and SWA) models cannot partially rewind their memory, so without a checkpoint
+                    // the matcher forces a full re-prefill; other models do not need it.
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                        const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (ckpt_pos_min >= 0) {
+                            slot->prompt.checkpoints.clear();
+                            create_checkpoint(*slot, 0, ckpt_pos_min, ckpt_pos_max);
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3281,6 +3298,10 @@ private:
 
                                 if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
+                                    // reuse a tail checkpoint (e.g. restored from disk) when genuinely-new tokens follow,
+                                    // which supply the required logits so the >=1-token guarantee still holds
+                                    const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
+                                    const bool has_new_suffix = (size_t) slot.task->n_tokens() > (size_t) n_past;
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
@@ -3291,7 +3312,7 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            return cur.pos_min == 0 || cur.pos_min < pos_min_thold || (slot_was_restored && has_new_suffix && cur.pos_min == pos_min_thold);
                                         }
                                     );
 
