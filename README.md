@@ -1,5 +1,11 @@
 # llama.cpp
 
+> **🔧 Fork note:** This is a patched fork of upstream llama.cpp. The `main-patched`
+> branch adds **disk KV caching for recurrent/hybrid models** (Qwen3.6, Qwen3-Next, Mamba,
+> Falcon-H, Jamba, …) and **text-turn caching on `--mmproj` servers**, including an opt-in
+> automatic cross-process prompt cache. See **[README-FORK.md](README-FORK.md)** for what
+> it does, the new flags, and how to use/test/update it. Everything below is stock upstream.
+
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
