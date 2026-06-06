@@ -145,6 +145,25 @@ curl http://localhost:8080/slots/0?action=save  -d '{"filename":"snap1.bin"}'
 curl http://localhost:8080/slots/0?action=restore -d '{"filename":"snap1.bin"}'
 ```
 
+### Pinning a snapshot (permanent, never-evicted cache)
+
+By default the auto-cache evicts least-recently-used snapshots once `--slot-save-max-count` /
+`--slot-save-max-mb` are exceeded. To keep one snapshot **forever** — e.g. a large fixed
+documentation / system-prompt prefix that every request should reuse — drop a `.pin` marker next
+to its state file:
+
+```bash
+# pin: this snapshot is now never evicted and no longer counts against the caps
+touch <slot-save-path>/auto-<fingerprint>-<hash>-<n>.bin.pin
+# unpin: it rejoins the normal LRU pool
+rm    <slot-save-path>/auto-<fingerprint>-<hash>-<n>.bin.pin
+```
+
+A pinned snapshot is otherwise a normal snapshot — still discovered and restored exactly like any
+other (including across processes), so a fresh/cold instance still warms it from disk in a fraction
+of a second. This lets a permanent prefix live **inside the shared cache pool** without dedicating
+an instance to it. (The marker is a plain file; no flag or restart needed.)
+
 ---
 
 ## Branches
