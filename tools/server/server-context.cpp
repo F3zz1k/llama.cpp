@@ -271,6 +271,12 @@ static void slot_save_enforce_limits(const std::string & dir,
                 present.count(p.substr(0, p.size() - 5))) {
                 continue;
             }
+            // a "<X>.pin" file marks "<X>" as PINNED (never evicted, excluded from caps). Like the
+            // other sidecars: skip it here when its state file is present; reaped below if orphaned.
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                present.count(p.substr(0, p.size() - 4))) {
+                continue;
+            }
             // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
             // accumulate (we never count them) and eat real on-disk space forever.
             if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
@@ -283,9 +289,21 @@ static void slot_save_enforce_limits(const std::string & dir,
                 std::filesystem::remove(p, fec);
                 continue;
             }
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                !present.count(p.substr(0, p.size() - 4))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
 
             slot_save_unit u;
             u.state_path = p;
+            // PINNED snapshots (a sibling "<state>.pin" marker) are never evicted and are excluded
+            // from the count/byte caps entirely — a reserved, persistent entry (e.g. a permanent
+            // doc / system-prompt prefix) that coexists with the normal LRU pool. Pin with
+            // `touch <snapshot>.pin`; unpin by removing it. The index/restore path is unchanged.
+            if (present.count(p + ".pin")) {
+                continue;
+            }
             u.bytes = std::filesystem::file_size(p, fec);
             if (fec) {
                 continue;
@@ -422,6 +440,17 @@ static constexpr uint32_t SLOT_META_VERSION = 1u;
 // identical KV geometry — a Q4_0-KV blob loaded into an F16 ctx, or a different
 // rope/yarn scale (positions are baked into the saved state), silently corrupts —
 // so cache_type_k/v and rope_scale are NOT optional.
+// OPERATIONAL NOTE (auto disk prompt cache): this fingerprint is the cache IDENTITY.
+// A snapshot is only restorable by a server whose fingerprint compares == (operator==
+// below), and it deliberately includes n_ctx, mmproj_loaded, cache-type-k/v,
+// slot-save-block and rope/yarn -- NOT just the model. CONSEQUENCE: every server that
+// SHARES a --slot-save-path (a primary + its scale-out replicas + any refresh/pin
+// helper) MUST be launched with IDENTICAL -c, --mmproj, --cache-type-k/v,
+// --slot-save-block and rope/yarn. A mismatch (observed in prod: a seed at -c 524288
+// + --mmproj vs replicas/pin-helper at -c 262144 no-mmproj) SILENTLY splits the store
+// into incompatible fingerprint namespaces: each side skips the other-fingerprint .bins
+// during indexing, so a cross-instance or cold-start lookup never matches and you get a
+// full cold prefill instead of a warm restore -- no error, just slow.
 struct model_fp {
     uint64_t fp_model      = 0; // hash of llama_model_desc + size + n_params (+ n_embd/n_layer)
     uint32_t fp_n_vocab    = 0;
