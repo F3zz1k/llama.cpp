@@ -771,6 +771,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    // the auto disk prompt/KV cache needs a directory to live in; fail fast & loud rather than
+    // silently doing nothing if --slot-save-auto is set without --slot-save-path.
+    if (params.slot_save_auto && params.slot_save_path.empty()) {
+        throw std::invalid_argument("--slot-save-auto requires --slot-save-path to be set");
+    }
+    if (params.slot_save_auto && params.slot_save_block <= 0) {
+        throw std::invalid_argument("--slot-save-block must be > 0");
+    }
+
     return true;
 }
 
@@ -3298,6 +3307,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-max-count"}, "N",
+        string_format("max number of slot-save snapshots kept in --slot-save-path (treated as a dedicated dir); oldest are evicted (default: %d, 0 = unlimited)", params.slot_save_max_count),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-max-count must be >= 0 (0 = unlimited)");
+            }
+            params.slot_save_max_count = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_COUNT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-max-mb"}, "N",
+        string_format("max total size (MiB) of the --slot-save-path store; oldest snapshots are evicted (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-max-mb must be >= 0 (0 = unlimited)");
+            }
+            params.slot_save_max_bytes = (int64_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-auto"},
+        "automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)",
+        [](common_params & params) {
+            params.slot_save_auto = true;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_AUTO").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-block"}, "N",
+        string_format("token-ID hash block size for the auto disk cache index; reuse granularity "
+                      "is one block (default: %d)", params.slot_save_block),
+        [](common_params & params, int value) {
+            params.slot_save_block = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
