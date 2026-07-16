@@ -2142,6 +2142,34 @@ private:
         }
     }
 
+    // AUTO-SAVE (shutdown): persist every slot's warm KV on graceful terminate — the third
+    // call site of auto_save_slot_if_useful, symmetric with the idle-flush and
+    // get_available_slot sites. Called exactly once, from server_context::start_loop()
+    // after the queue loop has exited: same (main) thread that owns all slot mutation,
+    // update_slots quiescent, strictly before llama_backend_free() in the caller's
+    // clean_up(). Invariant 1: gate first.
+    //
+    // Processing slots ARE saved (deliberately, unlike invariant 5's release-site caveat): the
+    // queue loop has fully exited, so we sit on an update_slots() boundary where prompt.tokens ==
+    // KV length for both prefill and generation (handle_last_sampled_token pushes the sampled
+    // token and llama_decode writes its KV within one update_slots; the next, unprocessed token
+    // is staged in slot.sampled, outside both prompt.tokens and the KV). A mid-prefill snapshot of
+    // a long prompt is thus coherent AND the highest-value thing to keep — a re-run extends it and
+    // skips the reprefill (both attention and recurrent). auto_save_slot_if_useful's own dedup +
+    // LRU bound the only residual (a recurrent mid-generation snapshot a shorter re-request can't
+    // rewind into — a safe, evictable write).
+    void auto_save_slots_at_shutdown() {
+        if (!auto_cache_enabled()) {
+            return; // off by default
+        }
+        if (sleeping) {
+            return; // sleep entry destroy()'d ctx_tgt; the warm KV is already gone
+        }
+        for (auto & slot : slots) {
+            auto_save_slot_if_useful(slot);
+        }
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -5398,6 +5426,10 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // graceful shutdown: the queue loop has exited (no update_slots running) but the
+    // backend is still alive — llama_backend_free() runs later, in the caller's
+    // clean_up(). Last safe point to persist slots' warm KV to the auto disk cache.
+    impl->auto_save_slots_at_shutdown();
 }
 
 void server_context::terminate() {
