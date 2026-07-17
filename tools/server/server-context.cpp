@@ -519,73 +519,10 @@ static void slot_save_enforce_limits(const std::string & dir,
 // in-memory prefix-reuse path; auto-restore fires only when in-memory reuse is poor.
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t SLOT_META_MAGIC   = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
-static constexpr uint32_t SLOT_META_VERSION = 1u;
-
-// Model/quant/context fingerprint that MUST match for a restore to be sound. All
-// fields are stable inference-affecting identity captured once at model load and
-// compared by exact equality (pure-CPU int compares). See invariant 3. The blob
-// produced by llama_state_seq_save_file is only safe to load into a context with
-// identical KV geometry — a Q4_0-KV blob loaded into an F16 ctx, or a different
-// rope/yarn scale (positions are baked into the saved state), silently corrupts —
-// so cache_type_k/v and rope_scale are NOT optional.
-struct model_fp {
-    uint64_t fp_model      = 0; // hash of llama_model_desc + size + n_params (+ n_embd/n_layer)
-    uint32_t fp_n_vocab    = 0;
-    uint32_t fp_n_ctx_train= 0;
-    uint32_t fp_n_embd     = 0;
-    uint32_t fp_n_layer    = 0;
-    uint32_t fp_rope_type  = 0;
-    uint32_t fp_cache_k    = 0; // ggml_type of K cache (enum int)
-    uint32_t fp_cache_v    = 0; // ggml_type of V cache (enum int)
-    uint32_t fp_n_ctx      = 0; // effective per-seq n_ctx
-    uint32_t fp_kv_full    = 0; // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0
-    uint32_t fp_block      = 0; // slot_save_block this snapshot was hashed with
-    uint64_t fp_rope_scale = 0; // bit-pattern of effective rope_freq_scale (position-critical)
-    // rope_freq_base and ALL YaRN params also bake positions into the saved KV state exactly as
-    // rope_freq_scale does — a same-model run differing only in --rope-freq-base or any --yarn-*
-    // flag would otherwise pass the fingerprint and silently restore positionally-corrupt state.
-    // All are bit-cast (float->u32) into identity; yarn_orig_ctx is an int. "0/negative = use
-    // model-trained value" is normalized in auto_compute_fingerprint so equal effective configs match.
-    uint64_t fp_rope_base       = 0; // bit-pattern of effective rope_freq_base
-    uint32_t fp_yarn_ext        = 0; // bit-pattern of yarn_ext_factor
-    uint32_t fp_yarn_attn       = 0; // bit-pattern of yarn_attn_factor
-    uint32_t fp_yarn_beta_fast  = 0; // bit-pattern of yarn_beta_fast
-    uint32_t fp_yarn_beta_slow  = 0; // bit-pattern of yarn_beta_slow
-    uint32_t fp_yarn_orig_ctx   = 0; // yarn_orig_ctx (int)
-    uint64_t fp_lora       = 0; // hash of active LoRA-set ids+scales (0 if none)
-    // refuse cross-shape restores: 1 if the server was launched with --mmproj (mctx != nullptr),
-    // else 0. The auto-cache only ever persists text-only prefixes, but mmproj-aware rope (M-RoPE)
-    // and projector wiring CAN alter the text KV layout, so we conservatively REFUSE to cross-load
-    // a text-only-server snapshot into an mmproj server (or vice-versa) — they get disjoint stores.
-    // Removing this bit later would require proving the text KV layout is identical across the two
-    // deployment shapes.
-    uint32_t fp_mmproj_loaded   = 0;
-    // gguf-header hash of the loaded --mmproj file (0 on a text-only server); see
-    // mmproj_header_fingerprint. Catches projector swap, requantization and dimension
-    // changes that the fp_mmproj_loaded 0/1 bit cannot. NOT part of operator== yet:
-    // text KV is projector-independent and v1 metas do not carry this field, so the
-    // compare lands together with the version-aware v2 meta read (which backfills v1)
-    // — comparing it before then would refuse every existing v1 snapshot on an
-    // --mmproj server.
-    uint64_t fp_mmproj          = 0;
-
-    // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
-    // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
-    // with a different block size cannot be longest-prefix-matched against the current index.
-    bool operator==(const model_fp & o) const {
-        return fp_model == o.fp_model && fp_n_vocab == o.fp_n_vocab &&
-               fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
-               fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
-               fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
-               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
-               fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
-               fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
-               fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
-               fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
-               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded;
-    }
-};
+// The .meta sidecar format layer (model_fp, SLOT_META_* constants, slot_meta_write/
+// slot_meta_read) lives in server-common.{h,cpp} so the parser of untrusted on-disk
+// bytes links into a standalone fuzz/unit test (tests/test-slot-meta.cpp). Everything
+// below is the cache logic proper and stays private to this translation unit.
 
 // 64-bit chained block hash over token IDs. Each token folds via FNV-1a then a
 // splitmix avalanche; block k's output seeds block k+1, so the hash at every block
@@ -731,6 +668,13 @@ struct auto_cache_index {
     std::mutex mtx;
     std::unordered_map<uint64_t, auto_cache_entry> by_boundary;
     std::unordered_set<std::string> indexed_files;    // state paths already scanned (incremental refresh)
+    // state paths whose .meta failed to parse (corrupt, torn, or a version this binary does not
+    // know). Units are immutable once atomically renamed, so a rejected file can never become
+    // parseable — remembering it means a rescan never re-opens it, and a FUTURE meta version
+    // bump costs each old reader one read total instead of one per scan. Reconciled together
+    // with indexed_files when files disappear (auto_index_drop_missing_locked), so a peer
+    // evicting a rejected unit lets a later same-name re-create be examined afresh.
+    std::unordered_set<std::string> rejected_files;
     bool scanned = false;
     std::filesystem::file_time_type dir_mtime{};      // dir mtime as of the last scan
     std::chrono::steady_clock::time_point last_refresh{}; // throttle: skip stat storms in a burst
@@ -740,156 +684,6 @@ struct auto_cache_index {
 // path (a forced refresh on a lookup miss bypasses it). Sub-second so a peer's new snapshot is
 // visible within ~1 prefill of being written — effectively immediate from the user's view.
 static constexpr int AUTO_REFRESH_MIN_MS = 1000;
-
-// Sidecar path twins for an auto snapshot's state file. `.logits` is the committed
-// (byte-identical) regenerate sidecar; `.meta` is the NEW tokens+fingerprint
-// sidecar this feature adds so the startup scan / pre-restore verify reads only a
-// tiny file, never the multi-GB state.
-static std::string slot_meta_sidecar_path(const std::string & state_filepath) {
-    return state_filepath + ".meta";
-}
-
-// Best-effort atomic write of the .meta sidecar (LE, temp+rename — the exact idiom
-// of slot_logits_write). Layout: magic/version, fingerprint fields, tok_count,
-// chain_hash, then int32 tokens[tok_count]. Returns true on success. Never throws.
-static bool slot_meta_write(const std::string & state_filepath,
-                            const model_fp & fp,
-                            const llama_tokens & toks,
-                            uint64_t chain_hash) {
-    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
-    const std::string tmp     = sidecar + ".tmp";
-
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        return false;
-    }
-    auto put_u32 = [&](uint32_t v) {
-        const unsigned char b[4] = {
-            (unsigned char)( v        & 0xFF),
-            (unsigned char)((v >> 8)  & 0xFF),
-            (unsigned char)((v >> 16) & 0xFF),
-            (unsigned char)((v >> 24) & 0xFF),
-        };
-        f.write((const char *) b, 4);
-    };
-    auto put_u64 = [&](uint64_t v) {
-        put_u32((uint32_t)(v & 0xFFFFFFFFu));
-        put_u32((uint32_t)(v >> 32));
-    };
-    put_u32(SLOT_META_MAGIC);
-    put_u32(SLOT_META_VERSION);
-    put_u64(fp.fp_model);
-    put_u32(fp.fp_n_vocab);
-    put_u32(fp.fp_n_ctx_train);
-    put_u32(fp.fp_n_embd);
-    put_u32(fp.fp_n_layer);
-    put_u32(fp.fp_rope_type);
-    put_u32(fp.fp_cache_k);
-    put_u32(fp.fp_cache_v);
-    put_u32(fp.fp_n_ctx);
-    put_u32(fp.fp_kv_full);
-    put_u32(fp.fp_block);
-    put_u64(fp.fp_rope_scale);
-    // rope_freq_base + YaRN fingerprint fields
-    put_u64(fp.fp_rope_base);
-    put_u32(fp.fp_yarn_ext);
-    put_u32(fp.fp_yarn_attn);
-    put_u32(fp.fp_yarn_beta_fast);
-    put_u32(fp.fp_yarn_beta_slow);
-    put_u32(fp.fp_yarn_orig_ctx);
-    put_u64(fp.fp_lora);
-    // mmproj deployment-shape bit — refuses cross-shape restores.
-    put_u32(fp.fp_mmproj_loaded);
-    put_u32((uint32_t) toks.size());
-    put_u64(chain_hash);
-    // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
-    // contract is native-LE, matching slot_logits_write's float payload).
-    f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
-    f.flush();
-    if (!f.good()) {
-        f.close();
-        std::error_code ec;
-        std::filesystem::remove(tmp, ec);
-        return false;
-    }
-    f.close();
-    std::error_code ec;
-    std::filesystem::rename(tmp, sidecar, ec); // atomic replace
-    if (ec) {
-        std::filesystem::remove(tmp, ec);
-        return false;
-    }
-    return true;
-}
-
-// Read a .meta sidecar. Returns true and fills `fp_out` + `toks_out` iff a valid
-// sidecar exists. Any short read / bad magic / version mismatch => false with
-// outputs cleared (invariant 4). Never throws. Note: `chain_hash` is recorded for
-// debuggability but the authority for reuse is always the byte-compared tokens.
-static bool slot_meta_read(const std::string & state_filepath,
-                           model_fp & fp_out,
-                           llama_tokens & toks_out) {
-    fp_out = model_fp{};
-    toks_out.clear();
-    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
-    std::ifstream f(sidecar, std::ios::binary);
-    if (!f) {
-        return false;
-    }
-    auto get_u32 = [&](uint32_t & v) -> bool {
-        unsigned char b[4];
-        f.read((char *) b, 4);
-        if (f.gcount() != 4) {
-            return false;
-        }
-        v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
-        return true;
-    };
-    auto get_u64 = [&](uint64_t & v) -> bool {
-        uint32_t lo = 0, hi = 0;
-        if (!get_u32(lo) || !get_u32(hi)) {
-            return false;
-        }
-        v = (uint64_t) lo | ((uint64_t) hi << 32);
-        return true;
-    };
-    uint32_t magic = 0, version = 0;
-    if (!get_u32(magic) || !get_u32(version)) {
-        return false;
-    }
-    if (magic != SLOT_META_MAGIC || version != SLOT_META_VERSION) {
-        return false;
-    }
-    model_fp fp;
-    uint32_t tok_count = 0;
-    uint64_t chain_hash = 0;
-    if (!get_u64(fp.fp_model)         || !get_u32(fp.fp_n_vocab)       || !get_u32(fp.fp_n_ctx_train) ||
-        !get_u32(fp.fp_n_embd)        || !get_u32(fp.fp_n_layer)       || !get_u32(fp.fp_rope_type)   ||
-        !get_u32(fp.fp_cache_k)       || !get_u32(fp.fp_cache_v)       || !get_u32(fp.fp_n_ctx)       ||
-        !get_u32(fp.fp_kv_full)       || !get_u32(fp.fp_block)         || !get_u64(fp.fp_rope_scale)  ||
-        // rope_freq_base + YaRN — must be read in the same order slot_meta_write emits.
-        !get_u64(fp.fp_rope_base)     || !get_u32(fp.fp_yarn_ext)      || !get_u32(fp.fp_yarn_attn)   ||
-        !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
-        // mmproj deployment-shape bit — read in the same order slot_meta_write emits.
-        !get_u64(fp.fp_lora)          || !get_u32(fp.fp_mmproj_loaded) ||
-        !get_u32(tok_count)           || !get_u64(chain_hash)) {
-        return false;
-    }
-    (void) chain_hash;
-    // sanity-bound the count so a corrupt header cannot make us allocate gigabytes.
-    if (tok_count > (1u << 28)) {
-        return false;
-    }
-    toks_out.resize(tok_count);
-    const std::streamsize want = (std::streamsize) tok_count * (std::streamsize) sizeof(int32_t);
-    f.read((char *) toks_out.data(), want);
-    if (f.gcount() != want) {
-        toks_out.clear();
-        return false;
-    }
-    fp_out = fp;
-    return true;
-}
 
 struct server_slot {
     int id;
@@ -1859,17 +1653,41 @@ private:
             if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
                 continue;
             }
-            // already indexed by a prior scan? cheap skip so a refresh only opens NEW files.
-            if (auto_idx.indexed_files.count(p)) {
+            // already indexed — or already parse-rejected — by a prior scan? cheap skip so a
+            // refresh only opens NEW files (units are immutable after their atomic rename).
+            if (auto_idx.indexed_files.count(p) || auto_idx.rejected_files.count(p)) {
                 continue;
             }
+            // The publish sequence renames the .bin first and the .meta LAST, so a scan can
+            // legitimately list a final-named .bin whose sidecar has not landed yet (a peer
+            // mid-publish, or a writer that crashed in between — a later identical-prefix
+            // save completes the unit under the same deterministic name). A MISSING sidecar
+            // is therefore transient, not a verdict: skip WITHOUT caching so the next scan
+            // retries. Only a sidecar that already EXISTS is immutable published state, so
+            // only its parse failures may be remembered as permanent rejections. The
+            // existence check runs BEFORE the read: a .meta that lands in between is simply
+            // parsed (or retried next scan), never mis-cached.
+            std::error_code sec;
+            const bool meta_present = std::filesystem::exists(slot_meta_sidecar_path(p), sec) && !sec;
             model_fp fp;
             llama_tokens toks;
-            if (!slot_meta_read(p, fp, toks)) {
-                continue; // no/short/corrupt meta -> not indexable (invariant 4)
+            std::vector<server_media_record> media;
+            if (!slot_meta_read(p, cur_fp.fp_mmproj, fp, toks, media)) {
+                if (meta_present) {
+                    // short/corrupt meta, or an unknown version -> not indexable (invariant 4);
+                    // remember the rejection so rescans never re-open the file.
+                    auto_idx.rejected_files.insert(p);
+                }
+                continue;
             }
             if (!(fp == cur_fp)) {
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
+            }
+            if (!media.empty()) {
+                // media (v2) units need the media-aware chain hash to be indexed; until that is
+                // wired, leave them unindexed (NOT rejected: they are valid units, and the
+                // rehash will pick them up). Nothing writes v2 sidecars yet, so no unit is lost.
+                continue;
             }
             const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
             auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
@@ -1967,6 +1785,16 @@ private:
         for (const auto & p : gone) {
             auto_idx.indexed_files.erase(p);
         }
+        // also forget parse-rejected units whose files a peer evicted, so a later
+        // re-create under the same deterministic name is examined afresh.
+        for (auto it = auto_idx.rejected_files.begin(); it != auto_idx.rejected_files.end(); ) {
+            std::error_code ec;
+            if (!std::filesystem::exists(*it, ec) || ec) {
+                it = auto_idx.rejected_files.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void auto_index_drop_missing() {
@@ -2034,11 +1862,19 @@ private:
         // read the small .meta sidecar (tokens + fp) — never opens the multi-GB state file (invariant 5).
         model_fp disk_fp;
         llama_tokens disk_toks;
-        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
+        std::vector<server_media_record> disk_media;
+        if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
             return 0; // invariant 4
         }
         if (!(disk_fp == cur_fp)) {
             return 0; // invariant 3
+        }
+        if (!disk_media.empty()) {
+            // media (v2) units restore only with per-record identity verification and a
+            // request-driven chunk rebuild; until those are wired, refuse (invariant 4 —
+            // fall back to a normal prefill). Unreachable today: media units are never
+            // indexed, so no candidate can point at one.
+            return 0;
         }
         // byte-verify: longest common prefix of the persisted tokens and the request (invariant 2).
         const size_t lim = std::min(disk_toks.size(), req.size());
