@@ -59,6 +59,28 @@ def verify_and_copy_fixture(dst: str, names=None):
             shutil.copy(path, dst)
 
 
+def test_text_only_meta_byte_identical():
+    """The current binary re-emits the golden unit for the capture prompt with the same
+    deterministic filename and byte-identical contents (invariant 0: text-only on-disk
+    behaviour is frozen at the pre-media base build's)."""
+    global server
+    server.slot_save_path = CACHE_DIR
+    server.slot_save_auto = True
+    server.start()
+    res = server.make_request("POST", "/completion", data=GOLDEN_REQUEST)
+    assert res.status_code == 200
+    # graceful stop -> auto_save_slots_at_shutdown publishes the unit
+    server.stop()
+
+    # same filenames as the fixture capture (the name encodes fp_model, the block-chain
+    # hash and the token count — a drift in any of them shows up here first)
+    assert sorted(os.listdir(CACHE_DIR)) == sorted(FIXTURE_SHA256)
+    for name, expected in FIXTURE_SHA256.items():
+        with open(os.path.join(CACHE_DIR, name), "rb") as f:
+            actual = hashlib.sha256(f.read()).hexdigest()
+        assert actual == expected, f"{name}: emitted bytes differ from the golden fixture"
+
+
 def test_v1_meta_still_indexed():
     """The frozen v1 fixture unit is indexed and restored by the current binary."""
     global server
@@ -139,6 +161,102 @@ def test_missing_meta_is_transient_not_rejected():
     prompt_n_warm = res.body["timings"]["prompt_n"]
     # the lookup-miss rescan must now index the completed unit and restore from it
     assert prompt_n_warm <= prompt_n_cold - 256
+    assert res.body["content"] == content_cold
+
+
+def test_torn_unit_refused():
+    """A hand-crafted torn unit — a pristine, indexable .meta over a truncated .bin —
+    is refused at restore time without a crash: the state load fails, the slot is left
+    cleared and the request falls through to a clean full prefill."""
+    global server
+
+    # cold baseline: no auto cache, full prefill
+    server.start()
+    res = server.make_request("POST", "/completion", data=GOLDEN_REQUEST)
+    assert res.status_code == 200
+    prompt_n_cold = res.body["timings"]["prompt_n"]
+    content_cold = res.body["content"]
+    server.stop()
+
+    # tear the unit: the sidecar is the fixture's (parses, fp-matches, gets indexed),
+    # the state file is cut in half (llama_state_seq_load_file must fail cleanly)
+    bin_name = next(n for n in FIXTURE_SHA256 if n.endswith(".bin"))
+    meta_name = next(n for n in FIXTURE_SHA256 if n.endswith(".meta"))
+    verify_and_copy_fixture(CACHE_DIR, names={meta_name})
+    with open(os.path.join(FIXTURE_DIR, bin_name), "rb") as f:
+        pristine_bin = f.read()
+    with open(os.path.join(CACHE_DIR, bin_name), "wb") as f:
+        f.write(pristine_bin[: len(pristine_bin) // 2])
+
+    server.slot_save_path = CACHE_DIR
+    server.slot_save_auto = True
+    server.cache_ram = 0  # any reuse below could then only have come from the torn unit
+    server.start()
+    res = server.make_request("POST", "/completion", data=GOLDEN_REQUEST)
+    assert res.status_code == 200
+    # the indexed unit was selected, the load failed, and the request cold-prefilled
+    assert res.body["timings"]["cache_n"] == 0
+    assert res.body["timings"]["prompt_n"] == prompt_n_cold
+    assert res.body["content"] == content_cold
+
+
+SLOT_META_VERSION_OFF = 4  # the version dword sits right after the 4-byte magic
+
+
+def test_unknown_meta_version_skipped():
+    """A sidecar with an unknown future version is skipped cleanly AND remembered by
+    filename: published units are immutable after their atomic rename, so a rejection
+    is permanent and no rescan in this process may ever re-open the file. The probe
+    below violates that immutability on purpose — it swaps a valid v1 sidecar in under
+    the SAME name; if any rescan re-opened the file, the unit would restore (exactly
+    what test_v1_meta_still_indexed proves for a fresh process)."""
+    global server
+
+    # cold baseline: no auto cache, full prefill
+    server.start()
+    res = server.make_request("POST", "/completion", data=GOLDEN_REQUEST)
+    assert res.status_code == 200
+    prompt_n_cold = res.body["timings"]["prompt_n"]
+    content_cold = res.body["content"]
+    server.stop()
+
+    # the fixture unit with its sidecar's version dword bumped to 99
+    bin_name = next(n for n in FIXTURE_SHA256 if n.endswith(".bin"))
+    meta_name = next(n for n in FIXTURE_SHA256 if n.endswith(".meta"))
+    verify_and_copy_fixture(CACHE_DIR, names={bin_name})
+    with open(os.path.join(FIXTURE_DIR, meta_name), "rb") as f:
+        pristine_meta = f.read()
+    v99 = bytearray(pristine_meta)
+    struct.pack_into("<I", v99, SLOT_META_VERSION_OFF, 99)
+    with open(os.path.join(CACHE_DIR, meta_name), "wb") as f:
+        f.write(bytes(v99))
+
+    server.slot_save_path = CACHE_DIR
+    server.slot_save_auto = True
+    server.cache_ram = 0    # reuse below could then only come from the disk unit
+    server.server_slots = True  # for the slot erase below
+    server.start()
+
+    # skipped cleanly: full prefill, unchanged output, no crash
+    res = server.make_request("POST", "/completion", data=GOLDEN_REQUEST)
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] == 0
+    assert res.body["timings"]["prompt_n"] == prompt_n_cold
+    assert res.body["content"] == content_cold
+
+    # the sidecar becomes valid IN PLACE (same filename); the resident KV is erased so
+    # only a disk restore could shrink the next prefill
+    with open(os.path.join(CACHE_DIR, meta_name), "wb") as f:
+        f.write(pristine_meta)
+    res = server.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+
+    # remembered by filename: the lookup-miss rescan must NOT re-open the rejected
+    # unit, so the request cold-prefills again
+    res = server.make_request("POST", "/completion", data=GOLDEN_REQUEST)
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] == 0
+    assert res.body["timings"]["prompt_n"] == prompt_n_cold
     assert res.body["content"] == content_cold
 
 
@@ -269,6 +387,8 @@ VISION_TEXT_PRE  = "Please describe the picture in as much detail as you possibl
 # >= 2 blocks between the two images of the adjacent test, so the block+chunk-safe clamp
 # can land between them and reuse provably extends past the first image
 VISION_TEXT_MID  = "Now compare it carefully against this second picture here. " * 3
+# a text-only prompt spanning several 16-token blocks (text-on-vision-server tests)
+VISION_TEXT_STORY = "Tell me a very long story about a dog named Spot. " * 4
 
 
 def make_vision_server(auto: bool) -> ServerProcess:
@@ -286,18 +406,21 @@ def make_vision_server(auto: bool) -> ServerProcess:
     return vs
 
 
-def vision_request(vs: ServerProcess, contents: list):
+def vision_request(vs: ServerProcess, contents: list, id_slot: int | None = None):
     parts = []
     for c in contents:
         if c.startswith("data:image/"):
             parts.append({"type": "image_url", "image_url": {"url": c}})
         else:
             parts.append({"type": "text", "text": c})
-    res = vs.make_request("POST", "/chat/completions", data={
+    data = {
         "temperature": 0,
         "max_tokens": 8,
         "messages": [{"role": "user", "content": parts}],
-    })
+    }
+    if id_slot is not None:
+        data["id_slot"] = id_slot
+    res = vs.make_request("POST", "/chat/completions", data=data)
     assert res.status_code == 200
     timings = res.body["timings"]
     content = res.body["choices"][0]["message"]["content"]
@@ -312,6 +435,31 @@ def read_v2_metas():
         if version == 2:
             out.append((p, toks, media))
     return out
+
+
+def test_text_only_on_vision_server():
+    """A TEXT-ONLY prompt on a --mmproj server caches and restores across a restart —
+    the #21133 case: the media gate is per-request, so merely loading a projector must
+    not disable text caching."""
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_cold, cache_n_cold, content_cold = vision_request(vs, [VISION_TEXT_STORY])
+    assert cache_n_cold == 0
+    assert prompt_n_cold > 32  # sanity: spans several 16-token blocks
+    vs.stop()  # shutdown flush publishes the unit
+
+    # the persisted unit keeps the base v1 on-disk shape (no media section)
+    metas = glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))
+    assert len(metas) == 1
+    assert read_v2_metas() == []
+
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_warm, cache_n_warm, content_warm = vision_request(vs, [VISION_TEXT_STORY])
+    vs.stop()
+    assert prompt_n_warm <= 16  # at most a partial block re-decoded
+    assert cache_n_warm >= prompt_n_cold - 16
+    assert content_warm == content_cold
 
 
 def test_vision_full_reuse():
@@ -462,6 +610,72 @@ def test_corrupt_v2_meta_fallback():
             # pre-image prefix — reuse stops before the image, which is re-processed
             assert 16 <= cache_n <= s1, corrupt.__name__
             assert prompt_n >= prompt_n_cold - s1, corrupt.__name__
+
+
+def test_cross_process_share():
+    """Two live processes share one cache dir: A publishes a media snapshot (shutdown
+    flush), and B — running since BEFORE the unit existed — picks it up through the
+    dir-mtime refresh / lookup-miss rescan and restores it."""
+    a = make_vision_server(auto=True)
+    b = make_vision_server(auto=True)
+    b.server_port = 8580  # distinct port: both processes are alive at once
+    a.start()
+    b.start()  # B's startup scan sees an EMPTY dir — the unit must arrive via refresh
+
+    prompt_n_cold, cache_n_cold, content_cold = vision_request(a, [VISION_TEXT_PRE, IMG_DATA_URI])
+    assert cache_n_cold == 0
+    a.stop()  # A's shutdown flush publishes the unit
+    assert len(read_v2_metas()) == 1
+
+    prompt_n_warm, cache_n_warm, content_warm = vision_request(b, [VISION_TEXT_PRE, IMG_DATA_URI])
+    b.stop()
+    assert prompt_n_warm <= 16
+    assert cache_n_warm >= prompt_n_cold - 16
+    assert content_warm == content_cold
+
+
+def make_parallel_vision_server() -> ServerProcess:
+    vs = ServerPreset.tinygemma3()
+    vs.n_slots = 2   # --parallel 2: n_ctx is split across slots (1024 each)
+    vs.n_ctx = 2048
+    vs.temperature = 0.0
+    vs.slot_save_path = CACHE_DIR
+    vs.slot_save_auto = True
+    vs.slot_save_block = 16
+    return vs
+
+
+def test_parallel_slots_media():
+    """--parallel 2 with CONCURRENT media + text traffic sharing one cache dir: each
+    slot's sequence saves and restores independently (general users run multi-slot —
+    prod's --parallel 1 must not be a hidden assumption)."""
+    vs = make_parallel_vision_server()
+    vs.start()
+    media_cold, text_cold = parallel_function_calls([
+        (vision_request, (vs, [VISION_TEXT_PRE, IMG_DATA_URI], 0)),
+        (vision_request, (vs, [VISION_TEXT_STORY], 1)),
+    ])
+    assert media_cold is not None and text_cold is not None
+    assert media_cold[1] == 0 and text_cold[1] == 0  # both truly cold
+    vs.stop()  # shutdown flush persists BOTH slots
+
+    # the media slot published a v2 unit, the text slot a v1 unit, in the same dir
+    assert len(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))) == 2
+    assert len(read_v2_metas()) == 1
+
+    vs = make_parallel_vision_server()
+    vs.start()
+    media_warm, text_warm = parallel_function_calls([
+        (vision_request, (vs, [VISION_TEXT_PRE, IMG_DATA_URI], 0)),
+        (vision_request, (vs, [VISION_TEXT_STORY], 1)),
+    ])
+    assert media_warm is not None and text_warm is not None
+    vs.stop()
+    for (prompt_n_cold, _, content_cold), (prompt_n_warm, cache_n_warm, content_warm) in (
+            (media_cold, media_warm), (text_cold, text_warm)):
+        assert prompt_n_warm <= 16
+        assert cache_n_warm >= prompt_n_cold - 16
+        assert content_warm == content_cold
 
 
 # --- manual /slots endpoints (per-slot media gate) --------------------------------
