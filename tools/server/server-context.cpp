@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -560,6 +561,14 @@ struct model_fp {
     // Removing this bit later would require proving the text KV layout is identical across the two
     // deployment shapes.
     uint32_t fp_mmproj_loaded   = 0;
+    // gguf-header hash of the loaded --mmproj file (0 on a text-only server); see
+    // mmproj_header_fingerprint. Catches projector swap, requantization and dimension
+    // changes that the fp_mmproj_loaded 0/1 bit cannot. NOT part of operator== yet:
+    // text KV is projector-independent and v1 metas do not carry this field, so the
+    // compare lands together with the version-aware v2 meta read (which backfills v1)
+    // — comparing it before then would refuse every existing v1 snapshot on an
+    // --mmproj server.
+    uint64_t fp_mmproj          = 0;
 
     // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
     // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
@@ -610,6 +619,97 @@ static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B,
         }
     }
     return out;
+}
+
+// Identity hash of an mmproj GGUF file from its header only (no tensor data read,
+// ~ms even for a multi-GB file): FNV-1a/splitmix chain over every KV pair (key +
+// typed value bytes), every tensor's name/shape/type, plus the file size. Computed
+// once whenever an mmproj is loaded — it feeds model_fp.fp_mmproj and is exposed in
+// /props for operators. Fills `out` and returns true; returns false if the header
+// cannot be parsed (the caller treats that as a load failure — mtmd just loaded the
+// same file, so a parse failure here means it changed under us).
+static bool mmproj_header_fingerprint(const std::string & path, uint64_t & out) {
+    out = 0;
+    gguf_init_params iparams = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), iparams);
+    if (gctx == nullptr) {
+        return false;
+    }
+    uint64_t h = 0xcbf29ce484222325ULL;
+    auto mix_bytes = [&h](const void * p, size_t n) {
+        const unsigned char * b = (const unsigned char *) p;
+        for (size_t i = 0; i < n; ++i) {
+            h ^= (uint64_t) b[i]; h *= 0x100000001b3ULL;
+        }
+    };
+    // every variable-length field folds its length in first so adjacent fields can
+    // never alias ("ab"+"c" vs "a"+"bc"); counts/types fold in via auto_hash_mix.
+    auto mix_str = [&](const char * s) {
+        const size_t n = strlen(s);
+        h = auto_hash_mix(h, (int32_t) n);
+        mix_bytes(s, n);
+    };
+    auto mix_u64 = [&](uint64_t v) {
+        h = auto_hash_mix(h, (int32_t) (v & 0xFFFFFFFFu));
+        h = auto_hash_mix(h, (int32_t) (v >> 32));
+    };
+    // element size of a scalar gguf type; 0 for string/array (handled separately;
+    // bool arrays are stored as int8, matching gguf_get_arr_data's contract).
+    auto scalar_size = [](gguf_type t) -> size_t {
+        switch (t) {
+            case GGUF_TYPE_UINT8:  case GGUF_TYPE_INT8:  case GGUF_TYPE_BOOL:    return 1;
+            case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16:                         return 2;
+            case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: return 4;
+            case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: return 8;
+            default:                                                             return 0;
+        }
+    };
+    const int64_t n_kv = gguf_get_n_kv(gctx);
+    h = auto_hash_mix(h, (int32_t) n_kv);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        mix_str(gguf_get_key(gctx, i));
+        const gguf_type t = gguf_get_kv_type(gctx, i);
+        h = auto_hash_mix(h, (int32_t) t);
+        if (t == GGUF_TYPE_STRING) {
+            mix_str(gguf_get_val_str(gctx, i));
+        } else if (t == GGUF_TYPE_ARRAY) {
+            const gguf_type at = gguf_get_arr_type(gctx, i);
+            const size_t    an = gguf_get_arr_n(gctx, i);
+            h = auto_hash_mix(h, (int32_t) at);
+            mix_u64((uint64_t) an);
+            if (at == GGUF_TYPE_STRING) {
+                for (size_t j = 0; j < an; ++j) {
+                    mix_str(gguf_get_arr_str(gctx, i, j));
+                }
+            } else if (an > 0 && scalar_size(at) > 0) {
+                mix_bytes(gguf_get_arr_data(gctx, i), an * scalar_size(at));
+            }
+        } else if (scalar_size(t) > 0) {
+            mix_bytes(gguf_get_val_data(gctx, i), scalar_size(t));
+        }
+    }
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    h = auto_hash_mix(h, (int32_t) n_tensors);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        mix_str(gguf_get_tensor_name(gctx, i));
+        h = auto_hash_mix(h, (int32_t) gguf_get_tensor_type(gctx, i));
+        const int64_t * ne = gguf_get_tensor_ne(gctx, i);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix_u64((uint64_t) ne[d]);
+        }
+    }
+    gguf_free(gctx);
+    std::error_code ec;
+    const uintmax_t fsize = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return false;
+    }
+    mix_u64((uint64_t) fsize);
+    out = h;
+    return true;
 }
 
 // One in-memory index entry: the longest snapshot that reaches a given block
@@ -1517,6 +1617,10 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // gguf-header hash of the loaded mmproj file, computed once at load whenever
+    // --mmproj is set (0 on a text-only server); see mmproj_header_fingerprint.
+    uint64_t fp_mmproj = 0;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -1619,6 +1723,7 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+        fp_mmproj = 0;
     }
 
     // ----- auto disk cache: fingerprint, index, restore, save (all gated by auto_cache_enabled()) -----
@@ -1701,6 +1806,8 @@ private:
         // deployment-shape bit (invariant 3): text-only server vs --mmproj server get
         // disjoint stores (mmproj-aware rope/projector wiring can change the text KV layout).
         fp.fp_mmproj_loaded = (mctx != nullptr) ? 1u : 0u;
+        // projector identity, computed at mmproj load (0 on a text-only server).
+        fp.fp_mmproj        = fp_mmproj;
         return fp;
     }
 
@@ -2427,6 +2534,16 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            // projector identity fingerprint (header-only read, ~ms): guards media KV
+            // snapshots against projector swap/requant/dimension changes and is exposed
+            // in /props. Computed whenever an mmproj is loaded — NOT gated on the auto
+            // disk cache — precisely because /props reports it.
+            if (!mmproj_header_fingerprint(mmproj_path, fp_mmproj)) {
+                SRV_ERR("failed to fingerprint multimodal projector, '%s'\n", mmproj_path.c_str());
+                return false;
+            }
+            SRV_INF("multimodal projector fingerprint: %016" PRIx64 "\n", fp_mmproj);
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -5459,6 +5576,7 @@ server_context_meta server_context::get_meta() const {
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
         /* has_mtmd               */ impl->mctx != nullptr,
+        /* fp_mmproj              */ impl->fp_mmproj,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* has_inp_video          */ impl->chat_params.allow_video,
@@ -6051,6 +6169,13 @@ void server_routes::init_routes() {
             if (!tmpl_tools.empty()) {
                 props["chat_template_tool_use"] = tmpl_tools;
             }
+        }
+        if (meta->has_mtmd) {
+            // projector identity fingerprint (hex, matches the startup log line) so
+            // operators can tell which mmproj a KV snapshot store belongs to.
+            char fp_hex[17];
+            snprintf(fp_hex, sizeof(fp_hex), "%016" PRIx64, meta->fp_mmproj);
+            props["fp_mmproj"] = fp_hex;
         }
         res->ok(props);
         return res;

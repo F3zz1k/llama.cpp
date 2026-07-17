@@ -19,6 +19,7 @@ struct server_context_meta {
     std::set<std::string> model_tags;
     std::string model_path;
     bool has_mtmd;
+    uint64_t fp_mmproj; // gguf-header hash of the loaded mmproj file (0 when text-only)
     bool has_inp_image;
     bool has_inp_audio;
     bool has_inp_video;
