@@ -1221,6 +1221,17 @@ struct server_slot {
         const auto & chunk = input_tokens.find_chunk(idx);
         int32_t res = 0;
 
+        // stub tripwire: a placeholder chunk (identity-only, no pixels/samples — e.g. one
+        // rehydrated by a manual media restore) can never be encoded. No request-driven path
+        // puts one here (request chunks always carry real data), so reaching this means the
+        // slot's state is inconsistent — refuse and clear (seq + prompt cache) rather than
+        // fail mid-decode with the sequence half-written.
+        if (mtmd_input_chunk_is_placeholder(chunk.get())) {
+            SLT_ERR(*this, "refusing to encode a placeholder media chunk, idx = %zu; clearing slot state\n", idx);
+            prompt_clear();
+            return -1;
+        }
+
         auto try_decode = [&]() -> int32_t {
             if (mbatch) {
                 float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
@@ -1845,6 +1856,85 @@ private:
         slot.prompt.checkpoints.clear();
         slot.just_restored = false;
         slot.restored_logits.clear();
+    }
+
+    // MANUAL-RESTORE rehydration: a media snapshot's state file persists LLAMA_TOKEN_NULL
+    // cells, so after do_slot_restore the slot's prompt holds NULL cells with no live chunks
+    // behind them — a shape no downstream consumer can traverse. Unlike the auto path there is
+    // no request to rebuild from, so the v2 .meta sidecar's identity records are rehydrated
+    // into STUB chunks (mtmd_input_chunk_init_stub: id + geometry, placeholder data). Stubs
+    // verify and count positions exactly like live chunks; the persisted embeddings are already
+    // inside the loaded KV state, so their pixels are never needed — any path that would
+    // re-encode one refuses and clears (see process_mtmd_chunk). Returns false with `err` set
+    // when the snapshot cannot be rehydrated (missing/invalid sidecar, fingerprint mismatch,
+    // sidecar/state divergence, irreproducible chunk geometry); the caller must then drop the
+    // restored state. A text snapshot (no NULL cells) returns true untouched.
+    bool manual_restore_rehydrate_media(server_slot & slot, const std::string & filepath, std::string & err) {
+        const llama_tokens & cells = slot.prompt.tokens.get_cell_tokens();
+        if (std::find(cells.begin(), cells.end(), LLAMA_TOKEN_NULL) == cells.end()) {
+            return true; // text snapshot: nothing to rehydrate
+        }
+        if (!mctx) {
+            err = "state file contains media cells but the server has no multimodal projector loaded";
+            return false;
+        }
+        model_fp disk_fp;
+        llama_tokens disk_toks;
+        std::vector<server_media_record> disk_media;
+        if (!slot_meta_read(filepath, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
+            err = "state file contains media cells but has no valid .meta sidecar to rebuild them from";
+            return false;
+        }
+        if (disk_media.empty()) {
+            // unreachable via our own writers (a v1 sidecar with NULL cells is rejected by
+            // slot_meta_read), kept as an explicit guard against future format drift
+            err = ".meta sidecar carries no media records for a media state file";
+            return false;
+        }
+        if (!(disk_fp == cur_fp)) {
+            err = "snapshot fingerprint mismatch (model, projector or context geometry changed)";
+            return false;
+        }
+        if (disk_toks != cells) {
+            err = ".meta sidecar does not describe this state file";
+            return false;
+        }
+        // rebuild the prompt: text cells verbatim, each record as a stub chunk. slot_meta_read
+        // guarantees the records tile the NULL cells exactly, so this walk covers every cell
+        // (push_back(llama_token) throws on a NULL cell outside a record — impossible here, but
+        // the catch keeps a corrupt sidecar from unwinding through the server loop).
+        server_tokens rebuilt;
+        rebuilt.has_mtmd = true;
+        try {
+            size_t r = 0;
+            for (size_t i = 0; i < cells.size(); ) {
+                if (r < disk_media.size() && i == (size_t) disk_media[r].start_idx) {
+                    const auto & rec = disk_media[r];
+                    mtmd::input_chunk_ptr stub(mtmd_input_chunk_init_stub(
+                            mctx, rec.is_audio != 0, rec.id.c_str(),
+                            rec.n_tokens, (llama_pos) rec.n_pos, rec.nx, rec.ny));
+                    if (!stub) {
+                        err = "cannot rebuild a media chunk with the snapshot's geometry on this model";
+                        return false;
+                    }
+                    rebuilt.push_back(stub.get()); // copies
+                    i += rec.n_tokens;
+                    r++;
+                } else {
+                    rebuilt.push_back(cells[i]);
+                    i++;
+                }
+            }
+        } catch (const std::exception & e) {
+            err = std::string("rehydration failed: ") + e.what();
+            return false;
+        }
+        if (rebuilt.get_cell_tokens() != cells || !rebuilt.validate(ctx_tgt)) {
+            err = "rehydrated prompt failed validation";
+            return false;
+        }
+        slot.prompt.tokens = std::move(rebuilt);
+        return true;
     }
 
     // AUTO-RESTORE wrapper: byte-verify the candidate's persisted cells against the request prefix
@@ -2726,8 +2816,12 @@ private:
         // AUTO disk prompt/KV cache (invariant 1): compute the model fingerprint and build the
         // longest-prefix index ONCE, header-only — but ONLY when the feature is enabled. When OFF
         // this is a single boolean test and nothing else (no fingerprint, no scan, no allocation).
-        if (auto_cache_enabled()) {
+        // The fingerprint alone is also needed whenever --slot-save-path is set: manual media
+        // snapshots persist it in their v2 .meta sidecar and manual restores verify against it.
+        if (auto_cache_enabled() || !params_base.slot_save_path.empty()) {
             cur_fp = auto_compute_fingerprint();
+        }
+        if (auto_cache_enabled()) {
             auto_index_scan();
             SRV_INF("auto disk prompt cache enabled: indexed %zu prefix boundaries from %s (block=%d)\n",
                     auto_idx.by_boundary.size(), params_base.slot_save_path.c_str(), params_base.slot_save_block);
@@ -3387,15 +3481,6 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // if multimodal is enabled, send an error and return false
-    bool check_no_mtmd(const int id_task) {
-        if (mctx) {
-            send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
-        return true;
-    }
-
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -3887,10 +3972,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -3904,13 +3985,32 @@ private:
                         break;
                     }
 
-                    const size_t token_count = slot->prompt.tokens.size();
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    // per-slot media gate (a server-wide check_no_mtmd used to 501 every manual
+                    // save under --mmproj, even for text-only slots): a text slot persists its
+                    // plain token-id list, byte-identical to the pre-media format; a media slot
+                    // persists its cell-aligned list (media cells LLAMA_TOKEN_NULL) plus a v2
+                    // .meta sidecar carrying the per-chunk identity records — the same identity
+                    // layer the auto disk cache uses.
+                    const bool slot_has_media = slot->prompt.tokens.has_media();
+                    std::vector<server_media_record> media;
+                    if (slot_has_media) {
+                        try {
+                            media = slot->prompt.tokens.extract_media_records();
+                        } catch (const std::exception & e) {
+                            // identity-less chunk (e.g. a placeholder bitmap): it could never be
+                            // re-verified or rehydrated, so the snapshot must not be persisted
+                            send_error(task, std::string("cannot save slot: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                    }
+                    const llama_tokens tokens = slot_has_media ? slot->prompt.tokens.get_cell_tokens()
+                                                               : slot->prompt.tokens.get_text_tokens();
+                    const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
                     // persist this slot's last-token logits as a sidecar (FULL/recurrent
@@ -3936,6 +4036,25 @@ private:
                         } else {
                             SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, token_count=%zu); sidecar omitted\n",
                                     slot->logits_last_n_tokens, token_count);
+                        }
+                    }
+
+                    // media snapshots publish their identity sidecar (v2 .meta) next to the state
+                    // file: a manual restore rebuilds the prompt's media chunks from it, since —
+                    // unlike the auto-restore path — there is no request to rebuild from. Text
+                    // snapshots keep the base on-disk shape (state file + optional .logits, no
+                    // .meta). A media state file without its sidecar is unrestorable, so a failed
+                    // sidecar write withdraws the whole unit and errors the save (never publish a
+                    // unit that can only be half-loaded). chain_hash is 0: manual units carry
+                    // user-chosen filenames and are never indexed by the auto cache — restore
+                    // authority is the byte-compared tokens.
+                    if (nwrite > 0 && slot_has_media) {
+                        if (!slot_meta_write(filepath, cur_fp, tokens, 0, media)) {
+                            std::error_code ec;
+                            std::filesystem::remove(filepath, ec);
+                            std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
+                            send_error(task, "failed to write the .meta sidecar for a media slot snapshot", ERROR_TYPE_SERVER);
+                            break;
                         }
                     }
 
@@ -3971,7 +4090,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -4000,6 +4118,33 @@ private:
                         break;
                     }
 
+                    // media snapshots: rebuild the prompt's media chunks as stubs from the v2
+                    // .meta sidecar — without them the restored NULL cells are untraversable.
+                    // Any rehydration failure drops the loaded state entirely (a half-rehydrated
+                    // slot must never survive to serve requests) and errors with the reason.
+                    {
+                        std::string err;
+                        if (!manual_restore_rehydrate_media(*slot, filepath, err)) {
+                            auto_restore_drop(*slot);
+                            send_error(task, "cannot restore media snapshot: " + err, ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                    }
+
+                    // SWA models (PART seq_rm, n_swa > 0): reconstruct a checkpoint at the restored
+                    // position, mirroring auto_restore_into_slot — the downstream checkpoint search
+                    // finds none in a fresh process and would force a full re-process on the next
+                    // request, silently discarding the restore. (FULL models get theirs inside
+                    // do_slot_restore; non-SWA attention models skip the checkpoint machinery.)
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0) {
+                        const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                        const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (ckpt_pos_min >= 0) {
+                            slot->prompt.checkpoints.clear();
+                            create_checkpoint(*slot, 0, ckpt_pos_min, ckpt_pos_max);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -4015,9 +4160,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -4699,10 +4841,11 @@ private:
                             //     keeping the full restored state, then continue normal autoregression;
                             //   - otherwise: fall back to a SAFE clear-then-reprefill (never crash).
                             // Gated so it is unreachable for non-recurrent models, with-suffix requests
-                            // and non-generative slots. Media prompts DO reach it: the auto path was never
-                            // behind check_no_mtmd (that guards only the manual /slots endpoints), and a
-                            // byte-identical media resend on a FULL-seq_rm model restores its whole
-                            // snapshot and lands exactly here. The body is media-safe by construction:
+                            // and non-generative slots. Media prompts DO reach it: the auto path never
+                            // had a server-wide mtmd gate (and the manual /slots endpoints now gate
+                            // per-slot), so a byte-identical media resend on a FULL-seq_rm model
+                            // restores its whole snapshot and lands exactly here.
+                            // The body is media-safe by construction:
                             // init_sampler skips LLAMA_TOKEN_NULL cells, and the speculative begin feeds
                             // get_text_tokens() (the media-safe accessor), never get_tokens(). With-suffix
                             // restore reuse is left entirely to the unchanged relaxed-predicate path below.

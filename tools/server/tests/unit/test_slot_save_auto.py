@@ -462,3 +462,205 @@ def test_corrupt_v2_meta_fallback():
             # pre-image prefix — reuse stops before the image, which is re-processed
             assert 16 <= cache_n <= s1, corrupt.__name__
             assert prompt_n >= prompt_n_cold - s1, corrupt.__name__
+
+
+# --- manual /slots endpoints (per-slot media gate) --------------------------------
+# a server-wide check_no_mtmd guard used to 501 EVERY manual save/restore/erase as
+# soon as --mmproj was loaded. The gate is per-slot now: text slots keep the exact
+# pre-media behaviour (state file + optional .logits, no sidecar), media slots write
+# a v2 .meta and restore by rehydrating identity-only STUB chunks from it — stubs
+# verify and count positions like live chunks but can never be re-encoded (any path
+# that would need to refuses and clears the slot instead).
+#
+# Snapshots here are taken with n_predict=0 (prompt-only): on an SWA model a snapshot
+# that extends PAST the follow-up request (e.g. by generated tokens) invalidates the
+# restored checkpoint (pos_max > pos_next) and forces a cold re-process, so the
+# identical resend below could not demonstrate reuse. Prompt-only manual snapshots
+# are exactly the restorable artifact class (mirroring the FULL-model finding).
+
+MEDIA_MARKER = "<__media__>"  # mtmd_default_marker()
+IMG_B64 = IMG_DATA_URI.split(",", 1)[1]
+IMG2_B64 = IMG2_DATA_URI.split(",", 1)[1]
+MEDIA_PROMPT = VISION_TEXT_PRE + MEDIA_MARKER + " Describe it now."
+
+
+def make_manual_vision_server() -> ServerProcess:
+    # raw /completion prompts carry media via the plain media marker (no chat template)
+    os.environ["LLAMA_MEDIA_MARKER"] = MEDIA_MARKER
+    vs = make_vision_server(auto=False)
+    vs.slot_save_path = CACHE_DIR
+    return vs
+
+
+def raw_media_request(vs: ServerProcess, prompt_string: str, files: list, n_predict: int = 8):
+    """/completion with a raw prompt string + media files: byte-stable across resends
+    (no chat-template re-render), which is what snapshot-matching follow-ups need."""
+    res = vs.make_request("POST", "/completion", data={
+        "prompt": {"prompt_string": prompt_string, "multimodal_data": files},
+        "n_predict": n_predict,
+        "temperature": 0,
+        "cache_prompt": True,
+        "id_slot": 0,
+    })
+    assert res.status_code == 200
+    t = res.body["timings"]
+    return t["prompt_n"], t["cache_n"], res.body["content"]
+
+
+def test_manual_slots_text_on_vision_server():
+    """Manual save/restore/erase of a TEXT slot works under --mmproj (per-slot gate
+    replacing the server-wide 501) and keeps the base on-disk shape: no .meta."""
+    prompt_a = "Tell me a very long story about a dog named Spot. " * 2
+
+    # prompt-only snapshot (see the n_predict=0 note above)
+    vs = make_manual_vision_server()
+    vs.start()
+    res = vs.make_request("POST", "/completion", data={
+        "prompt": prompt_a, "n_predict": 0, "temperature": 0,
+        "cache_prompt": True, "id_slot": 0,
+    })
+    assert res.status_code == 200
+    prompt_n_full = res.body["timings"]["prompt_n"]
+    assert prompt_n_full > 0
+
+    res = vs.make_request("POST", "/slots/0?action=save", data={"filename": "text.bin"})
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    assert n_saved == prompt_n_full  # prompt-only snapshot
+    # text snapshots keep the pre-media on-disk shape: no identity sidecar
+    assert os.path.exists(os.path.join(CACHE_DIR, "text.bin"))
+    assert not os.path.exists(os.path.join(CACHE_DIR, "text.bin.meta"))
+    vs.stop()
+
+    # fresh process: cold reference, then erase + restore + identical resend reuses it
+    vs = make_manual_vision_server()
+    vs.start()
+    res = vs.make_request("POST", "/completion", data={
+        "prompt": prompt_a, "n_predict": 8, "temperature": 0,
+        "cache_prompt": True, "id_slot": 0,
+    })
+    assert res.status_code == 200
+    content_ref = res.body["content"]
+    assert res.body["timings"]["cache_n"] == 0
+
+    # erase (also previously 501 under --mmproj) empties the slot
+    res = vs.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+
+    res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "text.bin"})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    res = vs.make_request("POST", "/completion", data={
+        "prompt": prompt_a, "n_predict": 8, "temperature": 0,
+        "cache_prompt": True, "id_slot": 0,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] >= n_saved - 8  # restored state actually reused
+    assert res.body["content"] == content_ref
+    vs.stop()
+
+
+def test_manual_media_save_restore_continues():
+    """Manual SAVE of a media slot writes a v2 .meta sidecar; a fresh process manually
+    RESTORES it (stub rehydration) and the identical request reuses the restored
+    cells INCLUDING the image's — the image is never re-encoded — with the answer
+    identical to a cold run."""
+    vs = make_manual_vision_server()
+    vs.start()
+    prompt_n_full, cache_n_cold, _ = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
+    assert cache_n_cold == 0
+    assert prompt_n_full > 200  # sanity: the image cells dominate the prompt
+
+    res = vs.make_request("POST", "/slots/0?action=save", data={"filename": "media.bin"})
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    assert n_saved == prompt_n_full  # prompt-only snapshot
+    vs.stop()
+
+    # the sidecar is a v2 meta whose single record tiles the image's NULL cells
+    version, toks, media = parse_meta(os.path.join(CACHE_DIR, "media.bin.meta"))
+    assert version == 2
+    assert len(toks) == n_saved
+    assert len(media) == 1 and media[0]["is_audio"] == 0
+    n_img = media[0]["n_tokens"]
+    assert n_img > 0
+    assert sum(1 for t in toks if t == LLAMA_TOKEN_NULL) == n_img
+
+    # fresh process: cold reference first, then erase + restore + identical resend
+    vs = make_manual_vision_server()
+    vs.start()
+    _, _, content_ref = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+
+    res = vs.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+    res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    prompt_n_warm, cache_n_warm, content_warm = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    assert content_warm == content_ref
+    assert cache_n_warm >= media[0]["start_idx"] + n_img  # every image cell came from the restore
+    assert prompt_n_warm <= 8                             # the image was NOT re-processed
+    vs.stop()
+
+
+def test_manual_media_restore_stub_never_encoded():
+    """After a manual media restore the slot's image chunks are identity-only stubs: a
+    follow-up with a DIFFERENT image id-mismatches them, so they are dropped (never
+    encoded) and the request re-processes its own image — answers stay identical to
+    no-cache runs for both the different and the original image."""
+    ref = make_manual_vision_server()
+    ref.start()
+    _, _, content_ref_b = raw_media_request(ref, MEDIA_PROMPT, [IMG2_B64])
+    ref.stop()
+
+    vs = make_manual_vision_server()
+    vs.start()
+    _, _, content_ref_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
+    res = vs.make_request("POST", "/slots/0?action=save", data={"filename": "media.bin"})
+    assert res.status_code == 200
+    vs.stop()
+
+    vs = make_manual_vision_server()
+    vs.start()
+    res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"})
+    assert res.status_code == 200
+
+    # different image bytes => different id => the stub never matches nor encodes
+    _, _, content_b = raw_media_request(vs, MEDIA_PROMPT, [IMG2_B64])
+    assert content_b == content_ref_b
+
+    # and the original image request still answers exactly like its cold run
+    ref = make_manual_vision_server()
+    ref.start()
+    _, _, content_ref_a8 = raw_media_request(ref, MEDIA_PROMPT, [IMG_B64])
+    ref.stop()
+    _, _, content_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    assert content_a == content_ref_a8
+    vs.stop()
+
+
+def test_manual_media_restore_refuses_without_meta():
+    """A media state file without its .meta sidecar cannot be rehydrated: the manual
+    restore refuses with an explicit error AND leaves the slot cleared-but-usable."""
+    vs = make_manual_vision_server()
+    vs.start()
+    prompt_n_full, _, _ = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
+    res = vs.make_request("POST", "/slots/0?action=save", data={"filename": "media.bin"})
+    assert res.status_code == 200
+    vs.stop()
+
+    os.remove(os.path.join(CACHE_DIR, "media.bin.meta"))
+
+    vs = make_manual_vision_server()
+    vs.start()
+    res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"})
+    assert res.status_code != 200
+    assert "sidecar" in str(res.body)
+
+    # the refused restore dropped the loaded state entirely: the slot cold-serves
+    prompt_n, cache_n, content = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    assert cache_n == 0
+    assert prompt_n == prompt_n_full
+    vs.stop()
