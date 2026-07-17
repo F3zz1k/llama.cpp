@@ -1,6 +1,8 @@
+import glob
 import hashlib
 import os
 import shutil
+import struct
 
 import pytest
 from utils import *
@@ -138,3 +140,112 @@ def test_missing_meta_is_transient_not_rejected():
     # the lookup-miss rescan must now index the completed unit and restore from it
     assert prompt_n_warm <= prompt_n_cold - 256
     assert res.body["content"] == content_cold
+
+
+# deterministic 32x32 PNG generated once and frozen (no network, no fixture file): the
+# mtmd bitmap id is the FNV-1a hash of these exact bytes, so the id in the .meta below
+# is stable across runs
+IMG_DATA_URI = "data:image/png;base64," + (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAhElEQVR42rXCkVYFAAAFwcUwDMPFMAzDMAzD"
+    "8GEYhmEYhmEYhmEYhtntK3bOMEyzI9Ps2DQ7Mc1OTTNNszPT7Nw0uzDNLk2zK9Ps2jS7Mc1uTbM70+xgmt2b"
+    "Zg+m2aNp9mSaPZtmL6bZq2n2Zpq9m2YfptmnafZlmn2bZj+m2a9p9mf6H5c0jFuX69A9AAAAAElFTkSuQmCC"
+)
+
+SLOT_META_MAGIC = 0x544D4B4C  # "LKMT", LE
+# byte offset of tok_count in a .meta sidecar: magic(4) + version(4) + fp fields(96)
+SLOT_META_TOKS_OFF = 104
+LLAMA_TOKEN_NULL = -1
+
+
+def parse_meta(path: str):
+    """Parse a .meta sidecar (v1 or v2) per the slot_meta_write layout; asserts exact EOF."""
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, version = struct.unpack_from("<II", data, 0)
+    assert magic == SLOT_META_MAGIC
+    tok_count = struct.unpack_from("<I", data, SLOT_META_TOKS_OFF)[0]
+    off = SLOT_META_TOKS_OFF + 4 + 8  # skip tok_count + chain_hash
+    toks = list(struct.unpack_from(f"<{tok_count}i", data, off))
+    off += 4 * tok_count
+    media = []
+    if version == 2:
+        fp_mmproj = struct.unpack_from("<Q", data, off)[0]
+        assert fp_mmproj != 0
+        off += 8
+        n_media = struct.unpack_from("<I", data, off)[0]
+        off += 4
+        for _ in range(n_media):
+            start_idx, n_tokens, n_pos, nx, ny, is_audio, id_len = struct.unpack_from("<7I", data, off)
+            off += 28
+            assert id_len > 0
+            media.append({
+                "start_idx": start_idx, "n_tokens": n_tokens, "n_pos": n_pos,
+                "nx": nx, "ny": ny, "is_audio": is_audio,
+                "id": data[off:off + id_len],
+            })
+            off += id_len
+    assert off == len(data), f"trailing bytes in {path}"
+    return version, toks, media
+
+
+def test_vision_save_writes_v2_unit():
+    """A media turn on a vision server persists a v2 unit (cell-aligned tokens + identity
+    records tiling the NULL cells); a text-only turn on the same server stays a
+    byte-layout v1 unit (invariant 0)."""
+    vserver = ServerPreset.tinygemma3()
+    vserver.slot_save_path = CACHE_DIR
+    vserver.slot_save_auto = True
+    # small hash block so the pre-image text prefix spans chunk-safe boundaries
+    vserver.slot_save_block = 16
+    vserver.start()
+
+    # pin each turn to its own slot: the prefix-similarity slot picker would otherwise route
+    # the second request onto the first one's slot (shared chat-template preamble) and
+    # overwrite its still-unsaved KV — both prompts must survive to the shutdown flush
+    res = vserver.make_request("POST", "/chat/completions", data={
+        "temperature": 0,
+        "max_tokens": 4,
+        "id_slot": 0,
+        "messages": [
+            {"role": "user", "content": [
+                # >= 1 block of plain text BEFORE the image: those boundaries stay chunk-safe
+                {"type": "text", "text": "Please describe the picture in as much detail as you possibly can. " * 4},
+                {"type": "image_url", "image_url": {"url": IMG_DATA_URI}},
+            ]},
+        ],
+    })
+    assert res.status_code == 200
+
+    res = vserver.make_request("POST", "/chat/completions", data={
+        "temperature": 0,
+        "max_tokens": 4,
+        "id_slot": 1,
+        "messages": [
+            {"role": "user", "content": "Tell me a very long story about a dog named Spot. " * 2},
+        ],
+    })
+    assert res.status_code == 200
+
+    # graceful stop -> auto_save_slots_at_shutdown flushes both slots to the store
+    vserver.stop()
+
+    metas = {p: parse_meta(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))}
+    v1 = [m for m in metas.values() if m[0] == 1]
+    v2 = [m for m in metas.values() if m[0] == 2]
+    # the text-only turn on the vision server must NOT have become a v2 unit
+    assert len(v1) >= 1
+    for _, toks, media in v1:
+        assert media == []
+        assert all(t != LLAMA_TOKEN_NULL for t in toks)
+    # the media turn produced a v2 unit whose records exactly tile the NULL cells
+    assert len(v2) >= 1
+    for _, toks, media in v2:
+        assert len(media) >= 1
+        n_null = sum(1 for t in toks if t == LLAMA_TOKEN_NULL)
+        assert n_null == sum(r["n_tokens"] for r in media)
+        for r in media:
+            assert r["is_audio"] == 0
+            assert r["n_tokens"] > 0 and r["n_pos"] > 0
+            cells = toks[r["start_idx"]:r["start_idx"] + r["n_tokens"]]
+            assert len(cells) == r["n_tokens"]
+            assert all(t == LLAMA_TOKEN_NULL for t in cells)

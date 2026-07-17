@@ -1924,6 +1924,9 @@ private:
     }
 
     // AUTO-SAVE: persist a slot's KV before it is discarded, keyed by its token-prefix block hash.
+    // Text-only prompts publish v1 .meta sidecars byte-identical to the pre-media format; media
+    // prompts publish v2 sidecars carrying per-chunk identity records (the KV state file already
+    // holds the embeddings, so identity metadata is all the disk side needs).
     // Skips redundant writes (an equal-or-longer snapshot already covers this prefix), writes the
     // state + .logits + .meta as a 3-file unit (atomically, .meta LAST so a torn write is never
     // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
@@ -1934,12 +1937,9 @@ private:
         }
         // exclusions reuse the existing guards. NOTE: an idle slot has already been reset(), so
         // `slot.task` is null here — the just-finished task survives as `slot.task_prev`. Use it for
-        // the generative check (COMPLETION/INFILL only). Gate on the PER-REQUEST `has_media()` (not
-        // the server-wide has_mtmd/mctx) so an --mmproj server still persists its text-only turns;
-        // a turn carrying an image (has_media()==true) is skipped — exactly correct, since token-ids
-        // alone cannot identify image content.
+        // the generative check (COMPLETION/INFILL only).
         const auto & wtask = slot.task ? slot.task : slot.task_prev;
-        if (!wtask || !wtask->need_sampling() || slot.prompt.tokens.has_media()) {
+        if (!wtask || !wtask->need_sampling()) {
             return;
         }
         // The fingerprint captures the GLOBAL LoRA set; refuse to persist a snapshot taken under a
@@ -1948,17 +1948,54 @@ private:
         if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
             return;
         }
-        // get_text_tokens() (not get_tokens()): media-safe accessor that never trips the
-        // get_tokens() GGML_ASSERT(!has_mtmd) under mmproj. For this no-media prompt (has_media()
-        // false, guarded above) it equals the full token-id prefix, so the persisted token stream
-        // and the block-hash key are byte-identical to what a text-only server would write.
-        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        // media branch, gated on the PER-REQUEST has_media() (not the server-wide has_mtmd/mctx)
+        // so an --mmproj server still persists its text-only turns as byte-identical v1 units.
+        const bool prompt_has_media = slot.prompt.tokens.has_media();
+        std::vector<server_media_record> media;
+        if (prompt_has_media) {
+            // FULL-seq-rm gate: a FULL snapshot only ever restores when a request extends the
+            // WHOLE snapshot, and no re-request extends a prompt+generation artifact (renders
+            // diverge at or before the prior prompt's end), so once generation has appended
+            // tokens the state is unrestorable — refuse to burn a multi-GB unit on it. Prompt-
+            // prefix states (mid/post-prefill, e.g. the shutdown flush) still save: they are
+            // exactly the restorable class for FULL models. Text saves keep base behaviour.
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                slot.prompt.tokens.size() > (size_t) wtask->n_tokens()) {
+                return;
+            }
+            try {
+                media = slot.prompt.tokens.extract_media_records();
+            } catch (const std::exception & e) {
+                // identity-less chunk (e.g. a placeholder bitmap): it can never be re-verified
+                // against a future request, so the snapshot must not be persisted (invariant 4)
+                SLT_WRN(slot, "auto-save: skipped, %s\n", e.what());
+                return;
+            }
+        }
+        // Text prompts: get_text_tokens() (not get_tokens()) — media-safe accessor that never
+        // trips the get_tokens() GGML_ASSERT(!has_mtmd) under mmproj. For a no-media prompt it
+        // equals the full token-id prefix, so the persisted token stream and the block-hash key
+        // are byte-identical to what a text-only server would write.
+        // Media prompts: get_cell_tokens() — the cell-aligned list (media cells
+        // LLAMA_TOKEN_NULL) whose length equals the KV cell count llama_state_seq_save_file
+        // persists; `media` tiles its NULL cells exactly.
+        const llama_tokens toks = prompt_has_media ? slot.prompt.tokens.get_cell_tokens()
+                                                   : slot.prompt.tokens.get_text_tokens();
+        if (!media.empty()) {
+            // chunk-completeness tripwire: process_mtmd_chunk() only ever appends whole chunks
+            // to prompt.tokens (and keep_first() refuses mid-chunk cuts), so a prompt cannot
+            // end inside a media chunk. The records must tile the cell list they are stored
+            // with — slot_meta_read rejects the unit otherwise.
+            GGML_ASSERT((size_t) media.back().start_idx + media.back().n_tokens <= toks.size());
+        }
         if ((int) toks.size() < params_base.slot_save_block) {
             return; // < 1 block: not worth a multi-GB write
         }
-        // no media records: this save path persists text-only prompts (has_media() guarded
-        // above), so every block boundary is chunk-safe and the chain is the pre-media one
-        const auto bhs = auto_block_hashes(toks, {}, params_base.slot_save_block,
+        // media-aware chain: text cells contribute their token ids (bit-identical to the
+        // pre-media chain for a text-only prompt), media cells their record identity; only
+        // chunk-safe block boundaries are emitted, so a media prompt with no safe boundary
+        // yields an empty chain and is skipped below.
+        const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj);
         if (bhs.empty()) {
             return;
@@ -1969,6 +2006,24 @@ private:
             auto it = auto_idx.by_boundary.find(full_hash);
             if (it != auto_idx.by_boundary.end() && it->second.n_tokens >= toks.size()) {
                 return; // an equal-or-longer snapshot for this exact prefix already exists
+            }
+        }
+
+        // capacity pre-flight (statvfs via std::filesystem::space): refuse to START a multi-GB
+        // write the filesystem cannot hold — on btrfs an ENOSPC mid-write can flip the whole
+        // filesystem read-only, a far worse failure than a skipped opportunistic save. Exact
+        // state size + the token array, with 10% slack covering the file header and the
+        // .logits/.meta sidecars. An unanswerable space query skips too (conservative;
+        // invariant 4: a skipped save never affects generation).
+        {
+            const size_t sz_state = llama_state_seq_get_size(ctx_tgt, slot.id);
+            const size_t sz_need  = sz_state + toks.size() * sizeof(llama_token);
+            std::error_code sec;
+            const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
+            if (sec || sinfo.available < sz_need + sz_need / 10) {
+                SLT_DBG(slot, "auto-save: skipped, insufficient free space (need %zu bytes + 10%% slack, available %zu)\n",
+                        sz_need, sec ? 0 : (size_t) sinfo.available);
+                return;
             }
         }
 
@@ -2002,8 +2057,10 @@ private:
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
         }
-        // 3) meta sidecar on the temp path (tokens + fingerprint). Written but renamed LAST.
-        if (!slot_meta_write(tmp, cur_fp, toks, full_hash)) {
+        // 3) meta sidecar on the temp path (tokens + fingerprint + media identity records; a
+        //    text-only prompt's empty `media` keeps the sidecar byte-identical v1). Written but
+        //    renamed LAST.
+        if (!slot_meta_write(tmp, cur_fp, toks, full_hash, media)) {
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
@@ -2036,7 +2093,12 @@ private:
             return; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
 
-        SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", toks.size(), fname.c_str());
+        if (media.empty()) {
+            SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", toks.size(), fname.c_str());
+        } else {
+            SLT_INF(slot, "auto-save: persisted %zu cells incl. %zu media chunks to %s\n",
+                    toks.size(), media.size(), fname.c_str());
+        }
 
         // index insert (every boundary -> this snapshot), then bounded-LRU + reconcile.
         {
@@ -2086,6 +2148,14 @@ private:
     // skips the reprefill (both attention and recurrent). auto_save_slot_if_useful's own dedup +
     // LRU bound the only residual (a recurrent mid-generation snapshot a shorter re-request can't
     // rewind into — a safe, evictable write).
+    //
+    // Deadline-boxed: each slot's flush is a potentially multi-GB write, and the process is
+    // typically inside a supervisor's stop window (systemd SIGKILLs at TimeoutStopSec) — an
+    // unbounded flush loop trades a clean exit for evictable cache units. The deadline is
+    // checked BETWEEN slots (an in-flight write is never aborted), so the worst case is
+    // deadline + one write; README documents sizing TimeoutStopSec against
+    // slot_save_max_mb x n_slots.
+    static constexpr int64_t AUTO_SAVE_SHUTDOWN_DEADLINE_MS = 60 * 1000;
     void auto_save_slots_at_shutdown() {
         if (!auto_cache_enabled()) {
             return; // off by default
@@ -2093,8 +2163,14 @@ private:
         if (sleeping) {
             return; // sleep entry destroy()'d ctx_tgt; the warm KV is already gone
         }
-        for (auto & slot : slots) {
-            auto_save_slot_if_useful(slot);
+        const int64_t t_deadline_ms = ggml_time_ms() + AUTO_SAVE_SHUTDOWN_DEADLINE_MS;
+        for (size_t i = 0; i < slots.size(); i++) {
+            if (ggml_time_ms() >= t_deadline_ms) {
+                SRV_WRN("auto-save: shutdown flush deadline (%" PRId64 " ms) exceeded, skipping %zu remaining slots\n",
+                        AUTO_SAVE_SHUTDOWN_DEADLINE_MS, slots.size() - i);
+                break;
+            }
+            auto_save_slot_if_useful(slots[i]);
         }
     }
 
@@ -3582,7 +3658,7 @@ private:
                                 // Auto-save (write path): persist this idle slot's KV to disk before
                                 // the in-memory cache drops it. Gated so the whole call frame is elided
                                 // when the feature is OFF; the callee re-checks all correctness guards
-                                // (fingerprint, need_sampling, has_media, LoRA, >=1 block).
+                                // (fingerprint, need_sampling, LoRA, media identity, >=1 block).
                                 if (auto_cache_enabled()) {
                                     auto_save_slot_if_useful(slot);
                                 }
