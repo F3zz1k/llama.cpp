@@ -1703,16 +1703,26 @@ private:
         auto_index_drop_missing_locked();
     }
 
-    // Longest-prefix lookup over the request tokens. Returns the candidate whose boundary hash is
-    // the DEEPEST match with a fingerprint equal to the live one. Verification (byte-compare of the
-    // candidate's persisted tokens) is mandatory and done by the caller (invariant 2). O(#blocks).
-    std::optional<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+    // Longest-prefix lookup over the request's cell-aligned tokens. Returns the candidate whose
+    // boundary hash is the DEEPEST match with a fingerprint equal to the live one. Verification
+    // (byte-compare of the candidate's persisted cells + per-record media identity) is mandatory
+    // and done by the caller (invariant 2). O(#blocks).
+    std::optional<auto_cache_entry> auto_index_lookup(const server_tokens & req) {
         if (!auto_cache_enabled()) {
             return std::nullopt; // off by default
         }
-        // no media records: the lookup path is text-only requests today, so every block
-        // boundary is chunk-safe and the chain is the pre-media one
-        const auto bhs = auto_block_hashes(req, {}, params_base.slot_save_block,
+        // request-side identity records (empty for a text-only request, whose chain is then
+        // bit-identical to the pre-media one). An identity-less chunk (e.g. a placeholder
+        // bitmap) can never be verified against any snapshot, so such a request does not
+        // look up at all — mirrors the save-side refusal.
+        std::vector<server_media_record> media;
+        try {
+            media = req.extract_media_records();
+        } catch (const std::exception & e) {
+            SRV_WRN("auto-restore: lookup refused, %s\n", e.what());
+            return std::nullopt;
+        }
+        const auto bhs = auto_block_hashes(req.get_cell_tokens(), media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         // Cross-process visibility: cheaply pick up snapshots a peer process created since our last
@@ -1826,13 +1836,26 @@ private:
         return true;
     }
 
-    // AUTO-RESTORE wrapper: byte-verify the candidate's persisted tokens against the request prefix
-    // (invariant 2), confirm the fingerprint (invariant 3), then restore. Returns the verified prefix length
-    // actually restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
-    // `req` is the full request token-ID array; `n_keep_mem` is the in-memory match to beat.
+    // Drop a just-restored snapshot entirely: empty the slot's KV seq and prompt/restore state so
+    // the caller falls back to a clean cold prefill (invariant 4). Canonical post-restore bail-out
+    // for auto_restore_into_slot — every abort after do_slot_restore succeeded goes through here.
+    void auto_restore_drop(server_slot & slot) {
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+        slot.prompt.tokens.clear();
+        slot.prompt.checkpoints.clear();
+        slot.just_restored = false;
+        slot.restored_logits.clear();
+    }
+
+    // AUTO-RESTORE wrapper: byte-verify the candidate's persisted cells against the request prefix
+    // and its media records against the request's live chunks (invariant 2), confirm the
+    // fingerprint (invariant 3), then restore. Returns the verified prefix length actually
+    // restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
+    // `req` is the full request; `n_keep_mem` is the in-memory match to beat.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
-                               const llama_tokens & req, int n_keep_mem) {
-        // read the small .meta sidecar (tokens + fp) — never opens the multi-GB state file (invariant 5).
+                               const server_tokens & req, int n_keep_mem) {
+        // read the small .meta sidecar (tokens + fp + media records) — never opens the multi-GB
+        // state file (invariant 5).
         model_fp disk_fp;
         llama_tokens disk_toks;
         std::vector<server_media_record> disk_media;
@@ -1842,19 +1865,51 @@ private:
         if (!(disk_fp == cur_fp)) {
             return 0; // invariant 3
         }
-        if (!disk_media.empty()) {
-            // media (v2) units restore only with per-record identity verification and a
-            // request-driven chunk rebuild; until those are wired, refuse (invariant 4 —
-            // fall back to a normal prefill). Reachable: the scan indexes v2 units at
-            // their chunk-safe boundaries, so a text request sharing a media snapshot's
-            // pre-image prefix can land here — it prefills normally instead.
+        // request-side identity: cell-aligned tokens plus media records (empty on a text-only
+        // request). The extraction throws on an identity-less chunk (e.g. a placeholder
+        // bitmap) — unverifiable, so the request simply does not restore (invariant 4).
+        const llama_tokens & req_cells = req.get_cell_tokens();
+        std::vector<server_media_record> req_media;
+        try {
+            req_media = req.extract_media_records();
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "auto-restore: refused, %s\n", e.what());
             return 0;
         }
-        // byte-verify: longest common prefix of the persisted tokens and the request (invariant 2).
-        const size_t lim = std::min(disk_toks.size(), req.size());
+        // byte-verify: longest common prefix of the persisted cells and the request cells
+        // (invariant 2). Media cells are LLAMA_TOKEN_NULL on both sides and pass this compare
+        // blindly — their content identity is verified per record next.
+        const size_t lim = std::min(disk_toks.size(), req_cells.size());
         size_t v = 0;
-        while (v < lim && disk_toks[v] == req[v]) {
+        while (v < lim && disk_toks[v] == req_cells[v]) {
             ++v;
+        }
+        // per-record verification: every disk record starting inside the LCP must match a
+        // request record at EXACTLY its start index — id, shape and type. Iterating the
+        // records (never "the next chunk after") verifies each image of an adjacent pair
+        // separately; a missing request record or an unequal field is a hard mismatch that
+        // truncates the LCP to that record's start — same text + a different image reuses
+        // exactly the pre-image prefix. Both sides are ordered by start_idx, and verified
+        // records align the chunk boundaries inside the LCP, so the truncated v can only
+        // fall on a text cell or a chunk start (chunk-safe by construction).
+        for (const auto & rec : disk_media) {
+            if ((size_t) rec.start_idx >= v) {
+                break; // this and all later records start outside the verified prefix
+            }
+            const auto it = std::lower_bound(req_media.begin(), req_media.end(), rec.start_idx,
+                [](const server_media_record & r, uint32_t s) { return r.start_idx < s; });
+            const bool match = it != req_media.end()      &&
+                               it->start_idx == rec.start_idx &&
+                               it->id        == rec.id        &&
+                               it->n_tokens  == rec.n_tokens  &&
+                               it->n_pos     == rec.n_pos     &&
+                               it->nx        == rec.nx        &&
+                               it->ny        == rec.ny        &&
+                               it->is_audio  == rec.is_audio;
+            if (!match) {
+                v = rec.start_idx;
+                break;
+            }
         }
         // Only WHOLE-block prefixes are valid reuse lengths (hash boundaries).
         const int B = params_base.slot_save_block;
@@ -1883,8 +1938,7 @@ private:
                 n_keep_disk = (int) (v - (v % (size_t) B));
                 // shared chunk-boundary rule (same predicate the hash sites emit boundaries
                 // with): a reuse length may not split a media chunk, so step down block by
-                // block until the cut is chunk-safe. No-op while disk_media is empty (the
-                // media refusal above), but keeps the clamp and the hash sites from drifting.
+                // block until the cut is chunk-safe.
                 while (n_keep_disk > 0 &&
                        !boundary_is_chunk_safe(disk_toks, disk_media, (size_t) n_keep_disk)) {
                     n_keep_disk -= B;
@@ -1908,6 +1962,65 @@ private:
         if (!do_slot_restore(slot, cand.state_path)) {
             // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
             return 0;
+        }
+        if (!disk_media.empty()) {
+            // do_slot_restore filled prompt.tokens with the RAW disk cells: for a media unit
+            // those contain LLAMA_TOKEN_NULL cells with no live chunks behind them, which no
+            // downstream consumer can traverse. Rebuild the prompt from the REQUEST instead:
+            // the verified prefix [0, v) is cell-identical to the snapshot's, and the
+            // request's clone carries the live chunks (with pixels) for exactly those cells
+            // — the persisted embeddings are already inside the loaded KV state, so no
+            // pixel ever needs to come from disk. v is chunk-safe (see the per-record
+            // verification above), so keep_first cannot cut mid-image.
+            bool rebuilt_ok = false;
+            try {
+                server_tokens rebuilt = req.clone();
+                rebuilt.keep_first(v);
+                slot.prompt.tokens = std::move(rebuilt);
+                rebuilt_ok = slot.prompt.tokens.validate(ctx_tgt);
+            } catch (const std::exception & e) {
+                SLT_WRN(slot, "auto-restore: prompt rebuild failed, %s\n", e.what());
+            }
+            if (!rebuilt_ok) {
+                // safety-clear tripwire: a NULL cell without a live chunk (or an unsafe cut)
+                // is impossible by construction here — if it happens anyway, drop the
+                // restored state entirely and fall back to a clean cold prefill rather than
+                // let a later find_chunk() throw mid-decode (invariant 4).
+                SLT_WRN(slot, "%s", "auto-restore: rebuilt prompt failed validation; clearing restored state\n");
+                auto_restore_drop(slot);
+                return 0;
+            }
+        }
+        // SWA models (PART seq_rm, n_swa > 0): the downstream checkpoint search refuses any
+        // checkpoint whose pos_max exceeds the request's pos_next, and a fresh process has no
+        // checkpoints at all — without one it forces a full re-process, silently discarding the
+        // restore. Trim the restored seq to the verified prefix NOW (the snapshot may extend past
+        // the request, e.g. by generated tokens) and reconstruct a checkpoint at that boundary,
+        // mirroring the FULL branch inside do_slot_restore (which never needs the trim: FULL only
+        // restores whole-snapshot extend-matches). Non-SWA attention models skip the checkpoint
+        // machinery entirely and need none of this.
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0) {
+            if (v < disk_toks.size()) {
+                if (disk_media.empty()) {
+                    slot.prompt.tokens.keep_first(v); // media prompts were already rebuilt to exactly v cells
+                }
+                const llama_pos p0 = slot.prompt.tokens.pos_next();
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1);
+            }
+            const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+            const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (ckpt_pos_min < 0) {
+                // the trim emptied the SWA cache: the request diverges more than the SWA window
+                // before the snapshot end, so the loaded window holds no position at or below the
+                // verified prefix (for an iswa memory, seq_pos_min reports the SWA cache). Keeping
+                // the restore would report n_past = v > 0 over an empty window and trip the
+                // downstream pos_min==-1 GGML_ABORT — drop it and cold-prefill instead (invariant 4).
+                SLT_WRN(slot, "%s", "auto-restore: verified prefix is outside the snapshot's SWA window; clearing restored state\n");
+                auto_restore_drop(slot);
+                return 0;
+            }
+            slot.prompt.checkpoints.clear();
+            create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
         }
         // do_slot_restore loaded the snapshot. For FULL models n_keep_disk == snapshot length (gated
         // above), so the existing regenerate / suffix-reuse path takes over with no partial
@@ -4462,23 +4575,19 @@ private:
                                 // If the in-memory match (n_past) is POOR and the disk index holds a snapshot
                                 // whose persisted tokens are a verified, fingerprint-matching, longer prefix of
                                 // this request, restore it INTO the slot and RECOMPUTE n_past so all downstream
-                                // machinery runs unchanged — agnostic to HOW the tokens arrived. Gated on the
-                                // PER-REQUEST has_media() (not the server-wide has_mtmd) so an --mmproj server
-                                // still caches its text-only turns: a no-media prompt has no NULL placeholders,
-                                // so get_text_tokens() equals the full token-id prefix and does not trip the
-                                // get_tokens() GGML_ASSERT(!has_mtmd); a turn carrying an image (and every turn
-                                // after it) is skipped. auto_restore_into_slot byte-verifies tokens + fingerprint
-                                // and falls back to a normal prefill on any mismatch/failure (invariants 2/3/4).
-                                // media-prefix caching intentionally unsupported: token-ids cannot identify image content.
+                                // machinery runs unchanged — agnostic to HOW the tokens arrived. Media requests
+                                // look up exactly like text ones: the chain hashes fold each chunk's identity
+                                // record, and auto_restore_into_slot byte-verifies the cells PLUS every media
+                                // record (id/shape/type) before any multi-GB load, falling back to a normal
+                                // prefill on any mismatch/failure (invariants 2/3/4). (An earlier revision
+                                // gated this block on !slot.prompt.tokens.has_media() — which tested the
+                                // slot's STALE PREVIOUS prompt, not the request; no request property replaces
+                                // it, media requests are simply first-class now.)
                                 if (auto_cache_enabled()
                                         && slot.task->need_sampling()        // generative only (not embed/rerank)
-                                        && !slot.prompt.tokens.has_media()   // no media in THIS request
                                         && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
                                         && are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures global LoRA (invariant 3)
-                                    // get_text_tokens() (not get_tokens()): media-safe accessor that never asserts
-                                    // under has_mtmd and, for this no-media prompt, equals the full token-id prefix.
-                                    const llama_tokens req = input_tokens.get_text_tokens();
-                                    if (auto cand = auto_index_lookup(req)) {
+                                    if (auto cand = auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -4490,7 +4599,7 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        auto_restore_into_slot(slot, *cand, req, (int) n_past);
+                                        auto_restore_into_slot(slot, *cand, input_tokens, (int) n_past);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                     }
                                 }
@@ -4589,10 +4698,14 @@ private:
                             //   - if we have the saved next-token logits: emit the first token with NO decode,
                             //     keeping the full restored state, then continue normal autoregression;
                             //   - otherwise: fall back to a SAFE clear-then-reprefill (never crash).
-                            // Gated so it is unreachable for non-recurrent models, with-suffix requests,
-                            // non-generative slots, and multimodal (already excluded by check_no_mtmd at
-                            // save/restore). With-suffix restore reuse is left entirely to the unchanged
-                            // relaxed-predicate path below.
+                            // Gated so it is unreachable for non-recurrent models, with-suffix requests
+                            // and non-generative slots. Media prompts DO reach it: the auto path was never
+                            // behind check_no_mtmd (that guards only the manual /slots endpoints), and a
+                            // byte-identical media resend on a FULL-seq_rm model restores its whole
+                            // snapshot and lands exactly here. The body is media-safe by construction:
+                            // init_sampler skips LLAMA_TOKEN_NULL cells, and the speculative begin feeds
+                            // get_text_tokens() (the media-safe accessor), never get_tokens(). With-suffix
+                            // restore reuse is left entirely to the unchanged relaxed-predicate path below.
                             // NOTE: cache_prompt==false sets n_past=0 above, so this gate (which
                             // requires n_past == task->n_tokens()) is naturally not entered for a
                             // no-cache request; that case safely takes the normal full-clear +
@@ -4813,6 +4926,14 @@ private:
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
+                            // if the prompt ends with a media chunk, the decrement lands strictly inside
+                            // it and keep_first(n_past) below would throw (latent upstream crash: reachable
+                            // whenever a fully cached prompt ends with an image — a whole-snapshot disk
+                            // restore hits it routinely). Clamp down to the enclosing chunk's start so the
+                            // chunk is re-decoded whole, which also satisfies the >=1-token requirement.
+                            while (n_past > 0 && !slot.prompt.tokens.boundary_is_chunk_safe((size_t) n_past)) {
+                                n_past--;
+                            }
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 

@@ -249,3 +249,216 @@ def test_vision_save_writes_v2_unit():
             cells = toks[r["start_idx"]:r["start_idx"] + r["n_tokens"]]
             assert len(cells) == r["n_tokens"]
             assert all(t == LLAMA_TOKEN_NULL for t in cells)
+
+
+# two more frozen deterministic 32x32 PNGs (generated once, committed as bytes): distinct
+# raw bytes => distinct mtmd bitmap ids, same pixel grid => same cell count per image
+IMG2_DATA_URI = "data:image/png;base64," + (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAhUlEQVR42u3NoRrBYACG0b9Ns0ajTaNZ8zba"
+    "NJo1Go1Go9FotGnTtkazRqPRaDQa17Hn+c4NHGN+ZD7YL/IPijdKFyon3CPsaUQ0Q9oB/preksGc0ZTJmNmQ"
+    "RZ9Vl02HbYudR1znUCOpci5zdbgXeOZ4Z/laGAUKFChQoECBAgUKFKQl+AOBhvw9aGnVvAAAAABJRU5ErkJg"
+    "gg=="
+)
+IMG3_DATA_URI = "data:image/png;base64," + (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAO0lEQVR42mP4/58BjhgY/sMRtcQZRi0gaAEt"
+    "DEUVH7WAkPhoMh3NB6MWjOaD0XwwasFoPhjNB6MWgBEAy7P6TA6KJSQAAAAASUVORK5CYII="
+)
+
+# >= 3 hash blocks of 16 before the first image, so pre-image reuse spans real boundaries
+VISION_TEXT_PRE  = "Please describe the picture in as much detail as you possibly can. " * 4
+# >= 2 blocks between the two images of the adjacent test, so the block+chunk-safe clamp
+# can land between them and reuse provably extends past the first image
+VISION_TEXT_MID  = "Now compare it carefully against this second picture here. " * 3
+
+
+def make_vision_server(auto: bool) -> ServerProcess:
+    vs = ServerPreset.tinygemma3()
+    # single slot: both images of the adjacent test must fit one sequence (n_ctx is split
+    # across slots), and geometry must be identical between the saving and restoring runs
+    # (fp_n_ctx is part of the snapshot fingerprint)
+    vs.n_slots = 1
+    vs.n_ctx = 1024
+    vs.temperature = 0.0
+    if auto:
+        vs.slot_save_path = CACHE_DIR
+        vs.slot_save_auto = True
+        vs.slot_save_block = 16
+    return vs
+
+
+def vision_request(vs: ServerProcess, contents: list):
+    parts = []
+    for c in contents:
+        if c.startswith("data:image/"):
+            parts.append({"type": "image_url", "image_url": {"url": c}})
+        else:
+            parts.append({"type": "text", "text": c})
+    res = vs.make_request("POST", "/chat/completions", data={
+        "temperature": 0,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": parts}],
+    })
+    assert res.status_code == 200
+    timings = res.body["timings"]
+    content = res.body["choices"][0]["message"]["content"]
+    return timings["prompt_n"], timings["cache_n"], content
+
+
+def read_v2_metas():
+    """Parse all v2 .meta units in CACHE_DIR; returns [(path, toks, media), ...]."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))):
+        version, toks, media = parse_meta(p)
+        if version == 2:
+            out.append((p, toks, media))
+    return out
+
+
+def test_vision_full_reuse():
+    """A media prompt saved at shutdown restores across a full server restart: the
+    byte-identical resend reuses (nearly) the whole prompt from disk and the greedy
+    answer is unchanged."""
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_cold, cache_n_cold, content_cold = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+    assert cache_n_cold == 0
+    assert prompt_n_cold > 200  # sanity: the image cells dominate the prompt
+    vs.stop()  # shutdown flush publishes the v2 unit
+
+    assert len(read_v2_metas()) == 1
+
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_warm, cache_n_warm, content_warm = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+    vs.stop()
+    # the whole request is a verified prefix of the snapshot; only the [TAG_PROMPT_LOGITS]
+    # tail token (plus at most a partial block) is re-decoded
+    assert prompt_n_warm <= 16
+    assert cache_n_warm >= prompt_n_cold - 16
+    assert content_warm == content_cold
+
+
+def test_vision_prefix_reuse_different_image():
+    """Same text + a DIFFERENT image: per-record verification truncates reuse to the
+    pre-image prefix — the image itself is re-encoded and re-decoded, and the answer
+    matches a cold run of the new image."""
+    # cold reference for the image-B request, on a server with no cache at all
+    ref = make_vision_server(auto=False)
+    ref.start()
+    _, _, content_b_ref = vision_request(ref, [VISION_TEXT_PRE, IMG2_DATA_URI])
+    ref.stop()
+
+    # save an image-A unit
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_cold, _, _ = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+    vs.stop()
+    metas = read_v2_metas()
+    assert len(metas) == 1
+    (rec,) = metas[0][2]  # exactly one media record: the image-A chunk
+    s1 = rec["start_idx"]
+
+    # byte-identical text, different image bytes => reuse exactly the pre-image prefix
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_warm, cache_n_warm, content_warm = vision_request(vs, [VISION_TEXT_PRE, IMG2_DATA_URI])
+    vs.stop()
+    assert cache_n_warm >= 16       # at least one whole block restored from disk
+    assert cache_n_warm <= s1       # and never a single cell of the mismatched image
+    assert prompt_n_warm >= prompt_n_cold - s1  # the new image was fully re-processed
+    assert content_warm == content_b_ref
+
+
+def test_adjacent_images_second_mismatch():
+    """Two images in one prompt; on resend the SECOND differs: per-record iteration
+    verifies each image separately, so reuse extends past the first image's cells and
+    truncates exactly at the second's record."""
+    ref = make_vision_server(auto=False)
+    ref.start()
+    _, _, content_ac_ref = vision_request(
+        ref, [VISION_TEXT_PRE, IMG_DATA_URI, VISION_TEXT_MID, IMG3_DATA_URI])
+    ref.stop()
+
+    vs = make_vision_server(auto=True)
+    vs.start()
+    vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI, VISION_TEXT_MID, IMG2_DATA_URI])
+    vs.stop()
+    metas = read_v2_metas()
+    assert len(metas) == 1
+    rec1, rec2 = metas[0][2]  # ordered by start_idx: image A, image B
+    end1 = rec1["start_idx"] + rec1["n_tokens"]
+    s2 = rec2["start_idx"]
+    assert s2 - end1 >= 32  # the mid text really spans blocks (test-shape sanity)
+
+    # image A unchanged, image B -> C: the first record verifies, the second mismatches
+    vs = make_vision_server(auto=True)
+    vs.start()
+    _, cache_n_warm, content_warm = vision_request(
+        vs, [VISION_TEXT_PRE, IMG_DATA_URI, VISION_TEXT_MID, IMG3_DATA_URI])
+    vs.stop()
+    assert cache_n_warm > end1  # reuse extends PAST the first image (it was verified)
+    assert cache_n_warm <= s2   # and truncates at the mismatched second record
+    assert content_warm == content_ac_ref
+
+
+def test_corrupt_v2_meta_fallback():
+    """Corrupt v2 sidecars degrade cleanly: a torn/invalid meta is skipped (full
+    prefill), a wrong id hard-mismatches (pre-image reuse only) — never a crash, and
+    the answer never changes."""
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_cold, _, content_cold = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+    vs.stop()
+    metas = read_v2_metas()
+    assert len(metas) == 1
+    meta_path, toks, media = metas[0]
+    s1 = media[0]["start_idx"]
+    bin_path = meta_path[:-len(".meta")]
+    with open(meta_path, "rb") as f:
+        pristine_meta = f.read()
+    with open(bin_path, "rb") as f:
+        pristine_bin = f.read()
+    # offset of the first media record (and of its id) in the v2 layout
+    rec_off = SLOT_META_TOKS_OFF + 4 + 8 + 4 * len(toks) + 8 + 4
+    id_off = rec_off + 28
+
+    def corrupt_truncated(data: bytes) -> bytes:
+        return data[:-10]
+
+    def corrupt_tiling(data: bytes) -> bytes:
+        # first record's start_idx += 1: records no longer tile the NULL cells
+        (start_idx,) = struct.unpack_from("<I", data, rec_off)
+        out = bytearray(data)
+        struct.pack_into("<I", out, rec_off, start_idx + 1)
+        return bytes(out)
+
+    def corrupt_id(data: bytes) -> bytes:
+        # structurally valid meta whose image id no longer matches the request
+        out = bytearray(data)
+        out[id_off] ^= 0x01
+        return bytes(out)
+
+    for corrupt, full_prefill in [
+        (corrupt_truncated, True),
+        (corrupt_tiling, True),
+        (corrupt_id, False),
+    ]:
+        shutil.rmtree(CACHE_DIR)
+        os.makedirs(CACHE_DIR)
+        with open(bin_path, "wb") as f:
+            f.write(pristine_bin)
+        with open(meta_path, "wb") as f:
+            f.write(corrupt(pristine_meta))
+        vs = make_vision_server(auto=True)
+        vs.start()
+        prompt_n, cache_n, content = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+        vs.stop()
+        assert content == content_cold, corrupt.__name__
+        if full_prefill:
+            # unparseable unit: skipped and remembered, clean cold prefill
+            assert cache_n == 0 and prompt_n == prompt_n_cold, corrupt.__name__
+        else:
+            # parseable unit with a foreign id: hard mismatch truncates to the
+            # pre-image prefix — reuse stops before the image, which is re-processed
+            assert 16 <= cache_n <= s1, corrupt.__name__
+            assert prompt_n >= prompt_n_cold - s1, corrupt.__name__
