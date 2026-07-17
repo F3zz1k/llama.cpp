@@ -520,43 +520,14 @@ static void slot_save_enforce_limits(const std::string & dir,
 // ---------------------------------------------------------------------------
 
 // The .meta sidecar format layer (model_fp, SLOT_META_* constants, slot_meta_write/
-// slot_meta_read) lives in server-common.{h,cpp} so the parser of untrusted on-disk
-// bytes links into a standalone fuzz/unit test (tests/test-slot-meta.cpp). Everything
+// slot_meta_read) and the block chain hashing layer (auto_hash_mix/auto_block_hashes
+// — index keys and filenames, media-aware) live in server-common.{h,cpp} so the
+// parser of untrusted on-disk bytes and the hash algorithm link into standalone
+// unit tests (tests/test-slot-meta.cpp, tests/test-auto-hash.cpp). Everything
 // below is the cache logic proper and stays private to this translation unit.
-
-// 64-bit chained block hash over token IDs. Each token folds via FNV-1a then a
-// splitmix avalanche; block k's output seeds block k+1, so the hash at every block
-// boundary commits to the ENTIRE prefix [0, (k+1)*B). Collision resistance is only
-// a candidate-narrowing accelerator: we NEVER trust it alone (invariant 2) — the
-// caller byte-verifies tokens before any restore. Block boundaries are the only
-// resumable prefix lengths (vLLM-APC / SGLang-radix granularity).
-static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
-    h ^= (uint64_t) (uint32_t) tok;
-    h *= 0x100000001b3ULL;                                  // FNV-1a 64-bit prime
-    h ^= h >> 29; h *= 0xbf58476d1ce4e5b9ULL; h ^= h >> 32; // splitmix64 finalize
-    return h;
-}
-
-// Returns, for each block boundary b in [1 .. n/B], the cumulative chain hash
-// committing to tokens[0 .. b*B). out[k] = hash of prefix length (k+1)*B. The
-// chain is salted with `salt` (the model fingerprint hash) so two different models
-// can never produce the same boundary hash for identical tokens. A trailing
-// partial block is NOT a boundary (only whole-block prefixes are index keys).
-static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B, uint64_t salt) {
-    std::vector<uint64_t> out;
-    if (B <= 0) {
-        return out;
-    }
-    out.reserve(toks.size() / (size_t) B);
-    uint64_t h = 0xcbf29ce484222325ULL ^ salt; // FNV offset basis, fingerprint-salted
-    for (size_t i = 0; i < toks.size(); ++i) {
-        h = auto_hash_mix(h, toks[i]);
-        if ((i + 1) % (size_t) B == 0) {
-            out.push_back(h);
-        }
-    }
-    return out;
-}
+// Block boundaries are the only resumable prefix lengths (vLLM-APC / SGLang-radix
+// granularity); we NEVER trust a hash alone (invariant 2) — the caller byte-verifies
+// tokens before any restore.
 
 // Identity hash of an mmproj GGUF file from its header only (no tensor data read,
 // ~ms even for a multi-GB file): FNV-1a/splitmix chain over every KV pair (key +
@@ -1683,13 +1654,12 @@ private:
             if (!(fp == cur_fp)) {
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
             }
-            if (!media.empty()) {
-                // media (v2) units need the media-aware chain hash to be indexed; until that is
-                // wired, leave them unindexed (NOT rejected: they are valid units, and the
-                // rehash will pick them up). Nothing writes v2 sidecars yet, so no unit is lost.
-                continue;
-            }
-            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
+            // rehash from the sidecar's cells + media records (media empty on v1 => the
+            // text-only chain, bit-identical to what the writer keyed the file with). Only
+            // chunk-safe boundaries are emitted — including a media unit's pure-text
+            // pre-image boundaries, so a text request can reuse a media snapshot's prefix.
+            const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
+                                               cur_fp.fp_model, cur_fp.fp_mmproj);
             auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
@@ -1740,7 +1710,10 @@ private:
         if (!auto_cache_enabled()) {
             return std::nullopt; // off by default
         }
-        const auto bhs = auto_block_hashes(req, params_base.slot_save_block, cur_fp.fp_model);
+        // no media records: the lookup path is text-only requests today, so every block
+        // boundary is chunk-safe and the chain is the pre-media one
+        const auto bhs = auto_block_hashes(req, {}, params_base.slot_save_block,
+                                           cur_fp.fp_model, cur_fp.fp_mmproj);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         // Cross-process visibility: cheaply pick up snapshots a peer process created since our last
         // scan (throttled dir-mtime check). Then search; on a MISS, force a re-scan and search again
@@ -1872,8 +1845,9 @@ private:
         if (!disk_media.empty()) {
             // media (v2) units restore only with per-record identity verification and a
             // request-driven chunk rebuild; until those are wired, refuse (invariant 4 —
-            // fall back to a normal prefill). Unreachable today: media units are never
-            // indexed, so no candidate can point at one.
+            // fall back to a normal prefill). Reachable: the scan indexes v2 units at
+            // their chunk-safe boundaries, so a text request sharing a media snapshot's
+            // pre-image prefix can land here — it prefills normally instead.
             return 0;
         }
         // byte-verify: longest common prefix of the persisted tokens and the request (invariant 2).
@@ -1907,6 +1881,14 @@ private:
                 n_keep_disk = (int) disk_toks.size();
             } else {
                 n_keep_disk = (int) (v - (v % (size_t) B));
+                // shared chunk-boundary rule (same predicate the hash sites emit boundaries
+                // with): a reuse length may not split a media chunk, so step down block by
+                // block until the cut is chunk-safe. No-op while disk_media is empty (the
+                // media refusal above), but keeps the clamp and the hash sites from drifting.
+                while (n_keep_disk > 0 &&
+                       !boundary_is_chunk_safe(disk_toks, disk_media, (size_t) n_keep_disk)) {
+                    n_keep_disk -= B;
+                }
             }
         }
         if (n_keep_disk <= 0) {
@@ -1974,7 +1956,10 @@ private:
         if ((int) toks.size() < params_base.slot_save_block) {
             return; // < 1 block: not worth a multi-GB write
         }
-        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
+        // no media records: this save path persists text-only prompts (has_media() guarded
+        // above), so every block boundary is chunk-safe and the chain is the pre-media one
+        const auto bhs = auto_block_hashes(toks, {}, params_base.slot_save_block,
+                                           cur_fp.fp_model, cur_fp.fp_mmproj);
         if (bhs.empty()) {
             return;
         }

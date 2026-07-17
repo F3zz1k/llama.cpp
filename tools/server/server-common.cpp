@@ -896,6 +896,69 @@ bool slot_meta_read(const std::string & state_filepath,
 }
 
 //
+// auto disk cache block chain hashing
+//
+
+// splitmix64 finalizer: avalanche a media cell's contribution before it enters the
+// chain, so structured inputs (small slice offsets, similar ids) spread over all
+// 64 bits and cannot resemble a plain token-ID fold.
+static inline uint64_t auto_hash_splitmix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
+                                        const std::vector<server_media_record> & media,
+                                        int B,
+                                        uint64_t salt,
+                                        uint64_t fp_mmproj) {
+    std::vector<uint64_t> out;
+    if (B <= 0) {
+        return out;
+    }
+    out.reserve(cells.size() / (size_t) B);
+    size_t   ri        = 0; // index of the record covering the current NULL run
+    bool     ri_seeded = false;
+    uint64_t rec_seed  = 0; // cell-independent part of the record's contribution
+    uint64_t h = 0xcbf29ce484222325ULL ^ salt; // FNV offset basis, fingerprint-salted
+    for (size_t i = 0; i < cells.size(); ++i) {
+        if (cells[i] == LLAMA_TOKEN_NULL) {
+            // advance to the covering record (records are ordered and tile the NULL cells)
+            while (ri < media.size() && i >= (size_t) media[ri].start_idx + media[ri].n_tokens) {
+                ++ri;
+                ri_seeded = false;
+            }
+            GGML_ASSERT(ri < media.size() && i >= media[ri].start_idx && "NULL cell not covered by a media record");
+            const server_media_record & rec = media[ri];
+            if (!ri_seeded) {
+                // fnv64 over the id bytes, then fold in the chunk shape/type and the
+                // projector identity (see the header comment for why each factor is there)
+                uint64_t id_h = 0xcbf29ce484222325ULL;
+                for (const unsigned char c : rec.id) {
+                    id_h ^= (uint64_t) c;
+                    id_h *= 0x100000001b3ULL;
+                }
+                uint64_t shape = 0;
+                shape = auto_hash_mix(shape, (int32_t) rec.n_tokens);
+                shape = auto_hash_mix(shape, (int32_t) rec.n_pos);
+                shape = auto_hash_mix(shape, (int32_t) rec.is_audio);
+                rec_seed  = id_h ^ shape ^ fp_mmproj;
+                ri_seeded = true;
+            }
+            h = auto_hash_mix64(h, auto_hash_splitmix64(rec_seed ^ (uint64_t) (i - rec.start_idx)));
+        } else {
+            h = auto_hash_mix(h, cells[i]);
+        }
+        if ((i + 1) % (size_t) B == 0 && boundary_is_chunk_safe(cells, media, i + 1)) {
+            out.push_back(h);
+        }
+    }
+    return out;
+}
+
+//
 // tokenizer and input processing utils
 //
 

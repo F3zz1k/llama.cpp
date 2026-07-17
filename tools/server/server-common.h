@@ -386,6 +386,58 @@ bool slot_meta_read(const std::string & state_filepath,
                     llama_tokens & toks_out,
                     std::vector<server_media_record> & media_out);
 
+//
+// auto disk cache block chain hashing
+//
+// The identity layer of the automatic disk prompt/KV cache: chain hashes are the
+// index keys AND the on-disk filenames, so — like the .meta parser above — the
+// algorithm is defined here and locked by a standalone unit test
+// (tests/test-auto-hash.cpp). Collision resistance is only a candidate-narrowing
+// accelerator: consumers NEVER trust a hash alone — tokens (and media records) are
+// byte-verified before any restore.
+//
+
+// 64-bit chained hash primitive: fold a 64-bit value via the FNV-1a prime, then a
+// splitmix avalanche. Every cache identity (block chain, fingerprints) folds
+// through this one primitive.
+static inline uint64_t auto_hash_mix64(uint64_t h, uint64_t v) {
+    h ^= v;
+    h *= 0x100000001b3ULL;                                  // FNV-1a 64-bit prime
+    h ^= h >> 29; h *= 0xbf58476d1ce4e5b9ULL; h ^= h >> 32; // splitmix64 finalize
+    return h;
+}
+
+// token-ID convenience overload (zero-extended: bit-identical to the pre-media chain)
+static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
+    return auto_hash_mix64(h, (uint64_t) (uint32_t) tok);
+}
+
+// Returns the cumulative chain hash at every CHUNK-SAFE block boundary of a
+// cell-aligned prompt. Each cell folds into the chain in order — a text token as
+// its ID, a media (LLAMA_TOKEN_NULL) cell as a per-cell contribution derived from
+// its covering record: splitmix64(fnv64(id) ^ (i - start_idx) ^
+// mix(n_tokens, n_pos, is_audio) ^ fp_mmproj). Folding the chunk shape/type means
+// an audio chunk can never impersonate an image chunk with the same id; folding
+// fp_mmproj means a projector swap changes media boundary hashes without touching
+// text boundaries; the per-cell offset disambiguates llava-uhd slices sharing one
+// bitmap id. The chain is salted with `salt` (the model fingerprint hash — for ALL
+// prompts, so a media prompt's pure-text prefix boundaries hash identically to a
+// text-only prompt's and text<->media prefix reuse works both ways).
+//
+// Only chunk-safe boundaries are emitted (boundary_is_chunk_safe: block-aligned
+// AND not strictly inside a chunk) — this is the SINGLE site enforcing the
+// boundary rule, so save-time insert, scan rehash and lookup cannot drift. A
+// trailing partial block is never a boundary. For a text-only prompt (media
+// empty) every block boundary is chunk-safe and out[k] commits to tokens
+// [0, (k+1)*B) — bit-identical to the pre-media algorithm, same filenames, same
+// index keys. `media` must be ordered by start_idx and tile the NULL cells
+// exactly, as extract_media_records / slot_meta_read produce them.
+std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
+                                        const std::vector<server_media_record> & media,
+                                        int B,
+                                        uint64_t salt,
+                                        uint64_t fp_mmproj);
+
 
 //
 // tokenizer and input processing utils
