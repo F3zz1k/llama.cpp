@@ -123,6 +123,20 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // server_tokens
 //
 
+// identity metadata for one media (image/audio) chunk of a prompt. This is what the
+// auto disk cache persists per chunk: enough to re-verify a chunk against a future
+// request's live chunks, without storing any pixel/sample data (the KV state file
+// already holds the embeddings; the request itself carries the pixels).
+struct server_media_record {
+    uint32_t    start_idx = 0; // index of the chunk's first cell in the token list
+    uint32_t    n_tokens  = 0; // number of cells (LLAMA_TOKEN_NULL entries) the chunk occupies
+    uint32_t    n_pos     = 0; // number of positions the chunk occupies (M-RoPE: != n_tokens)
+    uint32_t    nx        = 0; // token grid width (image); n_tokens for audio
+    uint32_t    ny        = 0; // token grid height (image); 1 for audio
+    uint32_t    is_audio  = 0; // 1 if the chunk is audio, 0 if image
+    std::string id;            // mtmd bitmap id: FNV-1a of the raw uploaded bytes (never empty)
+};
+
 /**
  * server_tokens is a helper to manage the input tokens and image for the server.
  * it is made this way to simplify the logic of KV cache management.
@@ -198,6 +212,24 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_tokens() const;
 
+    // cell-aligned token list where every media cell is LLAMA_TOKEN_NULL; unlike
+    // get_tokens() this is valid for any prompt (per-request, no server-wide mtmd
+    // assert). The list's length equals the prompt's KV cell count, which is what
+    // llama_state_seq_save_file persists — used by the auto disk cache.
+    const llama_tokens & get_cell_tokens() const;
+
+    // identity records for every media chunk, ordered by start_idx (see
+    // server_media_record). Throws if any chunk has an empty id: identity-less
+    // chunks (e.g. placeholder bitmaps) can never be re-verified, so they must
+    // not be persisted or matched by the auto disk cache.
+    std::vector<server_media_record> extract_media_records() const;
+
+    // true if splitting the token list at idx does not fall strictly inside a media
+    // chunk: a text token, a chunk start, or one-past-the-end are all safe. Shared
+    // by the auto disk cache's boundary checks (save-time index insert, scan rehash
+    // via the server_media_record overload below, lookup clamp) so they cannot drift.
+    bool boundary_is_chunk_safe(size_t idx) const;
+
     llama_tokens get_text_tokens() const;
 
     // per-request media signal (has_mtmd is server-wide and wrong here): true if this
@@ -230,6 +262,12 @@ public:
 
     server_tokens clone() const;
 };
+
+// same predicate as server_tokens::boundary_is_chunk_safe, for the scan-time shape of
+// the data: a cell-aligned token list plus media records read back from a snapshot's
+// .meta sidecar (no live chunks exist there). records must be ordered by start_idx,
+// as extract_media_records produces them.
+bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server_media_record> & records, size_t idx);
 
 
 //

@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <algorithm>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -408,6 +409,59 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
+const llama_tokens & server_tokens::get_cell_tokens() const {
+    return tokens;
+}
+
+std::vector<server_media_record> server_tokens::extract_media_records() const {
+    std::vector<server_media_record> records;
+    records.reserve(map_idx_to_media.size());
+    for (const auto & it : map_idx_to_media) {
+        const auto * chunk = it.second.get();
+        const auto   type  = mtmd_input_chunk_get_type(chunk);
+        GGML_ASSERT(type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO);
+        const char * id = mtmd_input_chunk_get_id(chunk);
+        if (id == nullptr || id[0] == '\0') {
+            // identity-less chunks (e.g. placeholder bitmaps) can never be re-verified
+            throw std::runtime_error("media chunk has an empty id");
+        }
+        server_media_record rec;
+        rec.start_idx = (uint32_t) it.first;
+        rec.n_tokens  = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+        rec.n_pos     = (uint32_t) mtmd_input_chunk_get_n_pos(chunk);
+        rec.id        = id;
+        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            const auto * img = mtmd_input_chunk_get_tokens_image(chunk);
+            // the raw token-grid shape is wanted here as an extra identity factor; the
+            // deprecation points at mtmd_image_tokens_get_decoder_pos(), which can only
+            // reconstruct the grid for M-RoPE layouts
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            rec.nx = (uint32_t) mtmd_image_tokens_get_nx(img);
+            rec.ny = (uint32_t) mtmd_image_tokens_get_ny(img);
+#pragma GCC diagnostic pop
+        } else {
+            // audio has no 2D token grid; mirror the non-M-RoPE image convention
+            rec.nx       = rec.n_tokens;
+            rec.ny       = 1;
+            rec.is_audio = 1;
+        }
+        records.push_back(std::move(rec));
+    }
+    return records;
+}
+
+bool server_tokens::boundary_is_chunk_safe(size_t idx) const {
+    GGML_ASSERT(idx <= tokens.size());
+    if (idx == tokens.size() || tokens[idx] != LLAMA_TOKEN_NULL) {
+        return true; // one-past-the-end, or the cell at the split is a text token
+    }
+    // idx is a media cell: the split is safe only if a chunk starts exactly here.
+    // The preceding cell's chunk membership is not evidence — adjacent chunks make
+    // "previous cell is NULL" compatible with both safe and unsafe splits.
+    return map_idx_to_media.find(idx) != map_idx_to_media.end();
+}
+
 llama_tokens server_tokens::get_text_tokens() const {
     llama_tokens res;
     res.reserve(tokens.size());
@@ -558,6 +612,18 @@ server_tokens server_tokens::clone() const {
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
     }
     return res;
+}
+
+bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server_media_record> & records, size_t idx) {
+    GGML_ASSERT(idx <= cells.size());
+    if (idx == cells.size() || cells[idx] != LLAMA_TOKEN_NULL) {
+        return true; // one-past-the-end, or the cell at the split is a text token
+    }
+    // idx is a media cell: the split is safe only if a record starts exactly here
+    // (records are ordered by start_idx, so binary-search)
+    const auto it = std::lower_bound(records.begin(), records.end(), idx,
+        [](const server_media_record & r, size_t v) { return r.start_idx < v; });
+    return it != records.end() && it->start_idx == idx;
 }
 
 //
