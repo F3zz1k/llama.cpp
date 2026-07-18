@@ -363,8 +363,14 @@ static void slot_save_enforce_limits(const std::string & dir,
 
         for (const std::string & p : all_files) {
             std::error_code fec;
-            // in-flight temp files are never counted or evicted (a concurrent save owns them)
-            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".tmp") == 0) {
+            // in-flight temp files are never counted or evicted (a concurrent save owns them). A
+            // save streams its state to "<fname>.<pid>.<nonce>.tmp", then renames the ".logits"/
+            // ".meta" sidecar temps to their final names AFTER renaming that state temp to <fname>;
+            // in that publish window the sidecar temps ("…tmp.logits"/"…tmp.meta") have no base
+            // file, so they must be matched here rather than reaped as orphaned sidecars below.
+            if ((p.size() >= 4  && p.compare(p.size() - 4,  4,  ".tmp")        == 0) ||
+                (p.size() >= 11 && p.compare(p.size() - 11, 11, ".tmp.logits") == 0) ||
+                (p.size() >= 9  && p.compare(p.size() - 9,  9,  ".tmp.meta")   == 0)) {
                 continue;
             }
             // a "<X>.logits" file is a sidecar ONLY when its state file "<X>" is also present;
