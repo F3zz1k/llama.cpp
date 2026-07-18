@@ -2221,9 +2221,13 @@ private:
         return earliest;
     }
 
-    // Flush every idle slot whose idle deadline has passed. Runs on the main-loop thread from the
-    // queue's idle wait (no task in flight, so all slots are quiescent); auto_save_slot_if_useful
-    // carries every correctness gate and its dedup makes a repeat flush free.
+    // Flush ONE idle slot whose idle deadline has passed, then return. Runs on the main-loop thread
+    // from the queue's idle wait (no task in flight, so all slots are quiescent). Flushing a single
+    // slot per wakeup keeps a request that lands mid-flush from stalling behind more than one
+    // (potentially multi-GB) write: the queue loop re-checks for queued tasks between wakeups, and
+    // any remaining due slots are flushed on immediately-following wakeups (their deadline has already
+    // passed, so the wait returns at once). auto_save_slot_if_useful carries every correctness gate
+    // and its dedup makes a repeat flush free.
     void auto_idle_flush() {
         if (!auto_idle_flush_enabled()) {
             return;
@@ -2239,6 +2243,7 @@ private:
             }
             auto_save_slot_if_useful(slot);
             slot.auto_idle_flushed = true; // one attempt per idle period; a reclaim/next task re-arms it
+            return;                        // at most one flush per wakeup, then back to service tasks
         }
     }
 

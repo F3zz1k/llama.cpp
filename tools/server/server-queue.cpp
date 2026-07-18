@@ -174,8 +174,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // go back to process new tasks or terminate
             }
 
-            // no tasks, check for sleeping state
-            if (should_sleep()) {
+            // Absolute deadline of the earliest slot still due for an idle flush (-1 if none / the
+            // feature is off). Entering the sleeping state destroys the context and discards any
+            // unflushed KV, so a pending flush must run first: while one is pending we take the timed
+            // idle path below (bounded by that deadline) rather than the untimed sleep wait, and only
+            // sleep once every due slot has been persisted.
+            const int64_t idle_deadline = callback_idle_deadline ? callback_idle_deadline() : -1;
+
+            // no tasks and nothing left to flush: check for sleeping state
+            if (idle_deadline < 0 && should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
                 callback_sleeping_state(true);
@@ -195,25 +202,24 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
             } else {
-                // wait for new tasks or timeout for checking sleeping condition. The idle-delay
-                // flush only ever SHORTENS this wait toward the earliest slot's flush deadline (a
-                // single timed wakeup, bound by that deadline) — never lengthens it — so a server
-                // not using the feature keeps the exact same idle cadence.
+                // wait for new tasks or timeout for checking the sleeping/idle-flush conditions. The
+                // idle-delay flush only ever SHORTENS this wait toward the earliest slot's flush
+                // deadline (a single timed wakeup, bound by that deadline) — never lengthens it — so a
+                // server not using the feature keeps the exact same idle cadence.
                 const auto pred = [&]{ return (!queue_tasks.empty() || !running); };
                 int64_t timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(max_wait_time).count();
-                if (callback_idle_deadline) {
-                    const int64_t deadline = callback_idle_deadline();
-                    if (deadline >= 0) {
-                        timeout_ms = std::min(timeout_ms, std::max<int64_t>(0, deadline - ggml_time_ms()));
-                    }
+                if (idle_deadline >= 0) {
+                    timeout_ms = std::min(timeout_ms, std::max<int64_t>(0, idle_deadline - ggml_time_ms()));
                 }
                 bool res = condition_tasks.wait_for(lock, std::chrono::milliseconds(timeout_ms), pred);
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // Timed out: run any due idle flushes on this (main loop) thread, off the request hot
-                // path, then loop again to re-check the sleeping condition. Release the queue mutex
-                // first — the flush is a potentially multi-GB write and must not block task posters.
+                // Timed out: flush at most ONE due idle slot on this (main loop) thread, off the
+                // request hot path, then loop again to re-check for queued tasks. Servicing one write
+                // per wakeup keeps a request that lands mid-flush from stalling behind multiple
+                // (potentially multi-GB) writes. Release the queue mutex first — the flush must not
+                // block task posters.
                 if (callback_idle_flush) {
                     lock.unlock();
                     callback_idle_flush();

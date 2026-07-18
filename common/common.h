@@ -694,6 +694,7 @@ struct common_params {
     // request's state survives a crash and becomes visible to peer instances without waiting for
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).
     int32_t slot_save_idle_seconds = 60;
+    bool    slot_save_idle_seconds_set = false; // true once --slot-save-idle-seconds is given explicitly
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
