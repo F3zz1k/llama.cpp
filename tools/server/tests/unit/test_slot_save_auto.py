@@ -486,6 +486,51 @@ def test_vision_full_reuse():
     assert content_warm == content_cold
 
 
+def test_vision_zero_reprefill_faithfulness():
+    """Byte-identical resend of a WHOLE media snapshot, verifying the zero-re-prefill
+    contract is FAITHFULNESS, not bit-identity.
+
+    When the resend covers the entire snapshot, the first generated token is produced by
+    a single decode into the restored KV rather than by a prefill batch. On a FULL-seq-rm
+    SYCL/flash-attn backend those two paths reduce in a different order, so the greedy run
+    can pick a different first token at a near-tie (rig-observed on qwen3.6-27b: it swapped
+    one near-synonym then stayed coherent) — the KV round-trips faithfully but the
+    continuation is not guaranteed bit-identical to an uninterrupted cold run, exactly like
+    upstream /slots. This is the CPU counterpart of rigtest's scen_restore1: on CPU decode
+    and prefill are deterministic so identity does hold, but the contract asserted here is
+    the weaker faithfulness one (restore fired, whole snapshot reused, a coherent answer)."""
+    # cold reference from a server with no cache at all (cross-process determinism control)
+    ref = make_vision_server(auto=False)
+    ref.start()
+    _, cache_n_ref, content_cold = vision_request(ref, [VISION_TEXT_PRE, IMG_DATA_URI])
+    ref.stop()
+    assert cache_n_ref == 0
+    assert len(content_cold) > 0
+
+    # save a whole-prompt media snapshot at shutdown
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_cold, _, _ = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+    vs.stop()
+    assert len(read_v2_metas()) == 1
+
+    # byte-identical resend: the whole request is a verified prefix of the snapshot
+    vs = make_vision_server(auto=True)
+    vs.start()
+    prompt_n_warm, cache_n_warm, content_warm = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI])
+    vs.stop()
+    # faithfulness signal 1: auto-restore fired and reused essentially the whole snapshot,
+    # so this really is the (near) zero-re-prefill path and not a partial-prefix reuse
+    assert prompt_n_warm <= 16
+    assert cache_n_warm >= prompt_n_cold - 16
+    # faithfulness signal 2: a coherent, non-empty continuation. Bit-identity is NOT the
+    # contract (see docstring) — but CPU decode == prefill deterministically, so here the
+    # answer additionally matches the cold reference; a near-tie first-token drift on a
+    # SYCL backend would still be faithful.
+    assert len(content_warm) > 0
+    assert content_warm == content_cold
+
+
 def test_vision_prefix_reuse_different_image():
     """Same text + a DIFFERENT image: per-record verification truncates reuse to the
     pre-image prefix — the image itself is re-encoded and re-decoded, and the answer
