@@ -781,6 +781,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.slot_save_block <= 0) {
         throw std::invalid_argument("--slot-save-block must be > 0");
     }
+    // the minimum-snapshot-size floor is validated unconditionally: a negative value is never
+    // meaningful (0 falls back to the block-size floor), so reject it even with the master switch off.
+    if (params.slot_save_min_tokens < 0) {
+        throw std::invalid_argument("--slot-save-min-tokens must be >= 0");
+    }
     // idle-delay flush is inert without the master switch (auto_idle_flush_enabled() gates on
     // auto_cache_enabled()); reject an explicit --slot-save-idle-seconds without --slot-save-auto
     // rather than silently ignoring it. The default (unset) is left alone so plain servers still run.
@@ -3351,6 +3356,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_save_block = value;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-min-tokens"}, "N",
+        string_format("minimum snapshot size (tokens) worth persisting to the auto disk cache; "
+                      "smaller prefixes are skipped as not worth the write. The effective floor is "
+                      "max(--slot-save-block, this) (default: %d)", params.slot_save_min_tokens),
+        [](common_params & params, int value) {
+            params.slot_save_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-idle-seconds"}, "N",
         string_format("flush a slot's warm KV to the auto disk cache after N seconds of idleness, "

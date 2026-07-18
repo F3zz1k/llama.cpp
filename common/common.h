@@ -690,6 +690,10 @@ struct common_params {
     // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
     bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
+    // minimum snapshot size (in cells/tokens) worth persisting: a trivially small prefix saves
+    // little prefill against the state-file write + later restore, so it is skipped. The effective
+    // floor is max(slot_save_block, slot_save_min_tokens) — a snapshot must always cover >= 1 block.
+    int32_t slot_save_min_tokens = 1024;
     // idle-delay flush: persist a slot's warm KV after this many seconds of idleness, so a lone
     // request's state survives a crash and becomes visible to peer instances without waiting for
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).

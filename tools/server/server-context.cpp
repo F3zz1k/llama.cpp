@@ -2042,8 +2042,12 @@ private:
         // false, guarded above) it equals the full token-id prefix, so the persisted token stream
         // and the block-hash key are byte-identical to what a text-only server would write.
         const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
-        if ((int) toks.size() < params_base.slot_save_block) {
-            return; // < 1 block: not worth a multi-GB write
+        // effective floor = max(block, min-tokens): a snapshot must cover >= 1 block AND clear the
+        // configured minimum-size threshold. A trivially small prefix saves little prefill against
+        // the state-file write + later restore, so it is skipped.
+        const int save_floor = std::max(params_base.slot_save_block, params_base.slot_save_min_tokens);
+        if ((int) toks.size() < save_floor) {
+            return; // below the floor: not worth a multi-GB write
         }
         const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
         if (bhs.empty()) {
