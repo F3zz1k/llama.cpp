@@ -791,6 +791,24 @@ private:
     }
 };
 
+// select the decoder position type (and, for XD-RoPE, the image-index dim-3 slot) for an
+// image chunk from the vision projector. shared by the encode path and the stub constructor
+// so a projector needing special position handling is picked up by both — updating only one
+// would silently desync the two geometries (the stub self-check compares n_tokens/n_pos, so a
+// same-count/different-layout mismatch would pass unnoticed).
+static void mtmd_image_tokens_assign_pos_type(const mtmd_context * ctx,
+                                              mtmd_image_tokens *  image_tokens,
+                                              uint32_t             image_idx) {
+    image_tokens->pos = ctx->pos_type;
+    // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row, and uses
+    // XD-RoPE (dim-3 = image index). Override the position type so that n_tokens() and
+    // mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
+    if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
+        image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
+        image_tokens->image_idx = image_idx;
+    }
+}
+
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
@@ -1201,13 +1219,8 @@ struct mtmd_tokenizer {
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
                 }
-                image_tokens->pos = ctx->pos_type;
-                // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
-                // and uses XD-RoPE (dim-3 = image index). Override the position type so that
-                // n_tokens() and mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
-                if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
-                    image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
-                    image_tokens->image_idx = n_images_added;
+                mtmd_image_tokens_assign_pos_type(ctx, image_tokens.get(), n_images_added);
+                if (image_tokens->pos == MTMD_POS_TYPE_HUNYUANVL) {
                     GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
                 }
 
@@ -1877,6 +1890,68 @@ void mtmd_input_chunk_free(mtmd_input_chunk * chunk) {
     }
 }
 
+bool mtmd_input_chunk_is_placeholder(const mtmd_input_chunk * chunk) {
+    return chunk->is_placeholder();
+}
+
+mtmd_input_chunk * mtmd_input_chunk_init_stub(mtmd_context * ctx,
+                                              bool          is_audio,
+                                              const char *  id,
+                                              uint32_t      n_tokens,
+                                              llama_pos     n_pos,
+                                              uint32_t      nx,
+                                              uint32_t      ny) {
+    if (id == nullptr || id[0] == '\0' || n_tokens == 0) {
+        return nullptr;
+    }
+    mtmd_input_chunk * chunk = nullptr;
+    if (is_audio) {
+        if (!ctx->ctx_a) {
+            return nullptr;
+        }
+        mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+        audio_tokens->n_tokens = n_tokens;
+        audio_tokens->id       = id;
+        audio_tokens->batch_f32.is_audio = true;
+        audio_tokens->batch_f32.entries.emplace_back(); // one placeholder entry (empty buf)
+        chunk = new mtmd_input_chunk{
+            MTMD_INPUT_CHUNK_TYPE_AUDIO,
+            {}, // text tokens
+            nullptr,
+            std::move(audio_tokens),
+        };
+    } else {
+        if (!ctx->ctx_v) {
+            return nullptr;
+        }
+        mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+        image_tokens->nx  = nx;
+        image_tokens->ny  = ny;
+        // the XD-RoPE image index is not persisted in the stub record, so a HunyuanVL stub
+        // reproduces geometry (n_tokens/n_pos) but not its absolute dim-3 slot; that projector
+        // is not part of the restore-tested fleet (see mtmd.h stub-init contract)
+        mtmd_image_tokens_assign_pos_type(ctx, image_tokens.get(), /* image_idx */ 0);
+        image_tokens->id = id;
+        // one placeholder entry (empty buf): nz = 1, so n_tokens() derives from nx/ny alone;
+        // multi-frame (video) geometry is not reproducible this way and fails the check below
+        image_tokens->batch_f32.entries.emplace_back();
+        chunk = new mtmd_input_chunk{
+            MTMD_INPUT_CHUNK_TYPE_IMAGE,
+            {}, // text tokens
+            std::move(image_tokens),
+            nullptr,
+        };
+    }
+    // the chunk must reproduce the requested geometry exactly — position bookkeeping built
+    // on a stub with a different token/position count would silently corrupt the KV cache
+    if (mtmd_input_chunk_get_n_tokens(chunk) != (size_t) n_tokens ||
+        mtmd_input_chunk_get_n_pos(chunk) != n_pos) {
+        mtmd_input_chunk_free(chunk);
+        return nullptr;
+    }
+    return chunk;
+}
+
 // mtmd_image_tokens
 
 size_t mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens) {
@@ -1889,6 +1964,11 @@ size_t mtmd_image_tokens_get_nx(const mtmd_image_tokens * image_tokens) {
 
 size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
+}
+
+void mtmd_image_tokens_get_grid(const mtmd_image_tokens * image_tokens, uint32_t * nx, uint32_t * ny) {
+    *nx = image_tokens->nx;
+    *ny = image_tokens->ny;
 }
 
 mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {

@@ -334,6 +334,54 @@ The server includes a set of built-in tools that enable the LLM to access the lo
 
 To use this feature, start the server with `--tools all`. You can also enable only specific tools by passing a comma-separated list: `--tools name1,name2,...`. Run `--help` for the full list of available tool names.
 
+## Automatic disk prompt cache (`--slot-save-auto`)
+
+With `--slot-save-path DIR --slot-save-auto`, the server transparently persists each slot's prompt KV state to disk (when the slot is reassigned, flushed while idle, or on graceful shutdown) and restores the longest verified matching snapshot when a later request shares its prefix — across requests, restarts, and multiple server processes sharing one directory. Clients need no changes; reuse shows up as a collapsed `prompt_n` in `/completion` timings. The feature is off by default and, when off, changes nothing.
+
+Each snapshot is a file unit named `auto-<fingerprint>-<chainhash>-<ntokens>`: the `.bin` llama state file, an optional `.logits` sidecar, and a small `.meta` sidecar carrying the identity data used for verification (fingerprint, token IDs, and — for multimodal snapshots — per-media-chunk identity records). Files are written to per-writer-unique temp names and atomically renamed, `.meta` last, so a torn or half-published unit is never indexed. Usage examples live in [`README-FORK.md`](../../README-FORK.md); design write-ups in [`docs/kv-cache/`](../../docs/kv-cache/).
+
+### Multimodal prompts (images and audio)
+
+On a server started with `--mmproj`, the cache is fully multimodal:
+
+- **Text-only prompts are cached exactly as on a text-only server.** Their snapshots use the version-1 `.meta` format, byte-for-byte identical to the pre-multimodal format, so old and new builds interoperate on text snapshots indefinitely (a snapshot written by an older build still indexes and restores — the scan verifies identity from the `.meta`, not the file name). The snapshot *file name* carries a fingerprint of the full runtime identity — model, plus cache type, context size, rope/YaRN and projector settings — so instances differing in any of those never write over each other's units in a shared cache directory.
+- **Prompts containing images or audio are cached too, storing metadata only.** The media embeddings are already inside the `.bin` state file; the version-2 `.meta` sidecar adds ~100 bytes of *identity* per media chunk — a 64-bit FNV-1a hash of the raw uploaded bytes, the chunk's token and position counts, its token-grid geometry, and its type (image/audio). No pixels, samples, or embeddings are stored beyond the state file itself.
+- **Reuse requires a byte-identical re-upload** of each media file (typical multi-turn clients resend attachments unchanged). A request with the same text but a different image reuses exactly the prefix before that image; with adjacent images, each is verified independently, so a mismatch in the second still reuses through the end of the first.
+- Media chunks without an identity (e.g. placeholder bitmaps) are never saved and never matched.
+- The projector file gets its own fingerprint (`fp_mmproj`, a header-only GGUF hash computed at load, logged at startup and reported in `/props`). Swapping or requantizing the mmproj refuses media restores while text snapshots keep working.
+
+### Verification invariants
+
+The cache is written around invariants that hold on every path:
+
+1. **Never trust a hash or a file name.** The block-hash index only narrows candidates; before any restore, the snapshot's persisted token IDs are byte-compared against the request, and every media record inside the matched prefix is compared against the request's live media chunks (identity hash, token/position counts, geometry, type). Any mismatch truncates or refuses the reuse.
+2. **All identity verification happens before any multi-GB I/O.** The `.meta` sidecar (a few KB) is fully parsed and verified — magic, version, fingerprint equality, token byte-compare, media-record checks — before the state file is opened at all.
+3. **Media records must exactly tile the media cells.** In a version-2 `.meta`, the records must cover exactly the `LLAMA_TOKEN_NULL` cells of the persisted token array — ordered, disjoint, in-bounds, nothing uncovered and nothing over text. Any violation (including a version-1 file containing media cells) rejects the file, and the server falls back to a normal prefill. Unknown or unparsable `.meta` versions are skipped and remembered by file name, so rescans never re-read them.
+4. **64-bit media identity is a documented residual risk, deliberately accepted.** Two different images whose raw bytes collide under FNV-1a *and* match in token count, position count, and grid geometry could impersonate each other. This is the same trust model the in-memory prompt cache applies to token IDs; text cells are still byte-compared exactly.
+5. **Failure means prefill, never a wrong answer.** Corrupt units, torn writes, fingerprint mismatches, out-of-space, or any restore failure degrade to normal prompt processing.
+
+### Restore semantics: whole-snapshot vs partial prefix
+
+What "matching prefix" means depends on the model's memory type:
+
+- **Recurrent and hybrid models** (Mamba-class, gated-delta hybrids such as Qwen3.6, Jamba — anything whose memory refuses partial sequence removal): a state cannot be partially rewound, so a snapshot restores **only when the request extends the whole snapshot** — a byte-for-byte prefix of the incoming request. Mid-prefill and shutdown/idle-flush states are reliably restorable this way, and so is a completed turn (a prompt+generation snapshot) whenever the client re-sends the conversation as a stable extending prefix — agentic tools that re-render history to byte-identical tokens are the multi-turn image case. A media prompt is saved on exactly the same terms as a text one, so a template that re-renders prior turns differently (e.g. dropping an empty reasoning block) simply diverges before the snapshot's end and cold-prefills; the mismatch is a cache miss, never a wrong restore.
+- **Plain attention models**: a request may diverge inside a snapshot; the verified prefix is reused, clamped down to a whole hash block that does not split a media chunk, and the divergent tail is re-processed.
+- **SWA attention models** (sliding-window, e.g. Gemma 3 class): partial-prefix reuse works, but the restored cache only holds roughly the last `n_swa` positions of the snapshot. A request that diverges further before the snapshot's end than the window covers drops the restore and prefills cold (logged, never a crash).
+
+The restored KV state round-trips faithfully, but a *fully* restored prompt — one the request re-sends byte-for-byte so that nothing is re-prefilled — is not guaranteed to continue bit-identically to an uninterrupted run. With no re-prefill the first new token is sampled from a single decode into the loaded state, whereas a cold run computes that position inside a prefill batch; on some backends (notably flash-attention on SYCL) those two paths reduce in a different order and can pick a different token at a near-tie, after which generation stays coherent. This matches upstream `/slots`, which likewise makes no bit-identity promise. Any request that re-prefills even a few tokens past the reused prefix — the common case, since real reuse *extends* a prefix — is deterministic and bit-identical.
+
+### Manual `/slots` save/restore with multimodal
+
+The manual `/slots/{id}?action=save|restore` endpoints gate per slot, not per server: a text-only slot on an `--mmproj` server saves and restores exactly as on a text-only server. A slot whose prompt contains media saves its state plus a version-2 `.meta` sidecar; restoring it rebuilds the prompt's media chunks as *stubs* from those identity records (the embeddings come from the state file, so no pixels are needed). A stub is never re-encoded: any follow-up that would require re-processing a stubbed image (e.g. a divergence before it) drops the stub and re-processes from the request's own data. Restoring a media state file without its `.meta` sidecar fails with an explicit error.
+
+### Operational notes
+
+- **Disk capacity:** before each save the server queries free space and skips the write unless the exact state size plus 10% slack fits — on filesystems such as btrfs an ENOSPC mid-write can be much worse than a skipped cache write. Size `--slot-save-max-mb` to your budget; the store directory is treated as dedicated.
+- **Idle-delay flush (`--slot-save-idle-seconds`, default 60):** the reassign and shutdown flushes only fire when the *next* task arrives or the process exits, so without this a lone request's KV stays crash-volatile and invisible to peer instances until more traffic lands. With it, a slot idle for that many seconds is flushed on the main loop thread — off the request hot path, via a single timed wakeup bound to the earliest slot's deadline (no busy poll, works with sleeping disabled). At most one slot is flushed per wakeup, and the loop re-checks for queued work between flushes, so an incoming request never waits behind more than one write. The flush also deduplicates against what is already on disk, so it is at most one write per slot per idle period. When both this and `--sleep-idle-seconds` are set, a pending flush is completed before the server sleeps (sleeping unloads the KV cache), even if the sleep threshold is the shorter of the two. Set `-1` for the legacy write-on-reassign/shutdown-only behaviour.
+- **Shutdown flush and `TimeoutStopSec`:** on graceful shutdown every slot's warm KV is flushed to disk, bounded by a 60-second deadline checked *between* slots — an in-flight write is never aborted, so the worst case is the deadline plus one full snapshot write. Under a service supervisor, size the stop timeout (systemd `TimeoutStopSec`) above 60 s plus the time to write your largest snapshot (roughly `--slot-save-max-mb` at your disk's sequential write speed).
+- **Migration and mixed fleets:** version-1 text snapshots written by older builds keep their file names, index keys, and restorability unchanged, and new text snapshots remain version-1 — old and new binaries interoperate on them indefinitely. Media (version-2) units are skipped by older binaries and evicted normally by their LRU; nothing breaks — but older binaries re-read every version-2 `.meta` on each rescan, so when several instances share one cache directory, **roll the whole fleet in one window**.
+- **Do not point pre-March-2026 builds at these directories:** state files saved from an `--mmproj` server with an M-RoPE model contain per-cell position records introduced upstream (#20132/#20273) without a state-format version bump; builds predating them misparse such files.
+
 ## Build
 
 `llama-server` is built alongside everything else from the root of the project
@@ -1079,6 +1127,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+On a server started with `--mmproj`, this gates per slot: a text-only slot saves exactly as on a text-only server, while a slot whose prompt contains media additionally writes a `.meta` identity sidecar (see [Manual `/slots` save/restore with multimodal](#manual-slots-saverestore-with-multimodal)).
+
 **Response format**
 
 ```json
@@ -1098,6 +1148,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 *Options:*
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+
+Restoring a media snapshot rebuilds its media chunks from the `.meta` sidecar saved next to the state file; a media state file without a valid sidecar is refused with an explicit error (see [Manual `/slots` save/restore with multimodal](#manual-slots-saverestore-with-multimodal)).
 
 **Response format**
 
