@@ -93,7 +93,7 @@ if (auto cand = auto_index_lookup(req)) {
 
 ## 7. Auto-save (write path) + the `cache_idle_slots` gap
 
-`auto_save_slot_if_useful` persists a slot's state when its KV is about to be discarded: deduped (skip if an equal-or-longer snapshot exists), `< 1 block` skipped, written off the generation hot path. It is hooked at **two** sites:
+`auto_save_slot_if_useful` persists a slot's state when its KV is about to be discarded: deduped (skip if an equal-or-longer snapshot exists), too-small prefixes skipped, written off the generation hot path. The size floor is `max(--slot-save-block, --slot-save-min-tokens)` (min-tokens defaults to 1024) — a snapshot smaller than that costs more to write and reload than the prefill it would save. It is hooked at **two** sites:
 1. `slot_save_and_clear` (the idle-flush path, under `cache_idle_slots`);
 2. `get_available_slot` when `update_cache` is set **and** `!cache_idle_slots`.
 

@@ -88,6 +88,8 @@ upstream.
 | `--slot-save-path PATH` | (off) | Directory to store KV snapshots. *(Upstream flag — required by everything below.)* |
 | `--slot-save-auto` | off | Turn on the **automatic** disk cache: the server saves/restores KV by itself, transparently, for every request. Requires `--slot-save-path`. |
 | `--slot-save-block N` | 256 | Reuse granularity, in tokens. A prompt can be reused up to the nearest multiple of `N`. Smaller = finer reuse but more index entries. Leave at default unless you know you need otherwise. |
+| `--slot-save-min-tokens N` | 1024 | Don't cache a prefix shorter than this — a tiny snapshot isn't worth its write and restore cost. The effective floor is `max(--slot-save-block, N)`. No effect without `--slot-save-auto`. |
+| `--slot-save-idle-seconds N` | 60 | Also flush an idle slot to disk after `N` seconds of inactivity, not only when the slot is reused — so a single request survives a restart or is picked up by another instance without waiting for more traffic. `-1` disables. Requires `--slot-save-auto`. |
 | `--slot-save-max-count N` | 0 (unlimited) | Bound the **`--slot-save-auto` cache** to at most `N` snapshots; oldest are deleted first. `0` = unlimited. No effect without `--slot-save-auto`. |
 | `--slot-save-max-mb N` | 0 (unlimited) | Bound the **`--slot-save-auto` cache** to `N` MiB total; oldest deleted first. `0` = unlimited. A single snapshot larger than this is refused (not allowed to wipe the rest). No effect without `--slot-save-auto`. |
 
@@ -276,7 +278,8 @@ DIR=~/kvcache/test ; mkdir -p $DIR
 ./build/bin/llama-server -m MODEL.gguf -ngl 999 -c 32768 -fa on \
   --slot-save-path $DIR --slot-save-auto --port 8081 &
 
-# 2) Send a long-ish prompt to A (>256 tokens so it's worth caching), then a different
+# 2) Send a long-ish prompt to A (over --slot-save-min-tokens, default 1024, so it's worth
+#    caching), then a different
 #    prompt so A's slot is reused and the first one gets saved to disk.
 curl -s http://localhost:8081/completion \
   -d '{"prompt":"<a few hundred tokens of context here ...>","n_predict":1}' >/dev/null
