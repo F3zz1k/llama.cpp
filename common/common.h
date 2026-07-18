@@ -688,6 +688,10 @@ struct common_params {
     // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
     bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
+    // idle-delay flush: persist a slot's warm KV after this many seconds of idleness, so a lone
+    // request's state survives a crash and becomes visible to peer instances without waiting for
+    // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).
+    int32_t slot_save_idle_seconds = 60;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
