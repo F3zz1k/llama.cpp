@@ -320,11 +320,13 @@ struct slot_save_unit {
 // reject the save rather than evict everything else. Operates strictly within `dir`; uses only
 // the error_code std::filesystem overloads so it never throws across the server loop.
 //
-// IMPORTANT: when a cap is set, --slot-save-path is treated as a server-owned store — any regular
-// file in it (other than recognized "<X>.logits" sidecars and "*.tmp" temporaries) is an eviction
-// candidate. Point --slot-save-max-count/-mb at a DEDICATED directory; do not mix unrelated files
-// into the slot-save directory. (With no caps set — the default unless explicitly enabled — nothing
-// is ever deleted and the directory is left exactly as before.)
+// IMPORTANT: this runs ONLY for the opt-in --slot-save-auto cache (callers gate on
+// auto_cache_enabled()); a plain manual --slot-save-path save never reaches it and never deletes
+// anything. When a cap is set on the auto cache, --slot-save-path is treated as a server-owned
+// store — any regular file in it (other than recognized "<X>.logits" sidecars and "*.tmp"
+// temporaries) is an eviction candidate. Point --slot-save-max-count/-mb at a DEDICATED directory;
+// do not mix unrelated files into the auto-cache directory. (With no caps set — the default —
+// nothing is ever deleted and the directory is left exactly as before.)
 // `just_written` is the exact filepath string the server built as `slot_save_path + filename`;
 // directory_iterator(dir) over that same `slot_save_path` yields identically-spelled path strings
 // on POSIX (the production target), so raw string equality correctly identifies the just-saved
@@ -2125,7 +2127,12 @@ private:
             }
             auto_idx.indexed_files.insert(fname); // remember our own write so a refresh won't re-open it
         }
-        if (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0) {
+        // Eviction is opt-in and scoped to the auto cache. This hook already runs only under
+        // auto_cache_enabled(), but the gate is stated at the call site too so the invariant
+        // (a bounded, self-reaping store belongs to --slot-save-auto, never plain --slot-save-path)
+        // is local to every enforce_limits caller.
+        if (auto_cache_enabled() &&
+            (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
             bool oversized = false;
             slot_save_enforce_limits(params_base.slot_save_path,
                                      params_base.slot_save_max_count,
@@ -3876,7 +3883,9 @@ private:
 
                     // enforce the bounded slot-save store (LRU by mtime). If this single
                     // snapshot exceeds the byte cap, reject the save instead of evicting everything.
-                    if (nwrite > 0 &&
+                    // Eviction is opt-in: it runs ONLY when --slot-save-auto owns this directory as a
+                    // server-managed cache. A plain manual --slot-save-path save never deletes files.
+                    if (nwrite > 0 && auto_cache_enabled() &&
                         (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
                         bool oversized = false;
                         slot_save_enforce_limits(params_base.slot_save_path,

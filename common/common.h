@@ -680,9 +680,11 @@ struct common_params {
 
     std::string slot_save_path;
     // bounded slot-save store (LRU eviction by mtime; a state file + its .logits sidecar are
-    // evicted together as one unit). Defaults are finite & sane; 0 means "unlimited" (only if set).
-    int32_t slot_save_max_count = 64;                                // max snapshots in slot_save_path (0 = unlimited)
-    int64_t slot_save_max_bytes = (int64_t) 32 * 1024 * 1024 * 1024; // 32 GiB cap (0 = unlimited)
+    // evicted together as one unit). Default 0 = unlimited: plain --slot-save-path never deletes
+    // anything (upstream behaviour). Eviction is opt-in and only runs when --slot-save-auto is set,
+    // i.e. when --slot-save-path is a server-owned auto-cache directory (see auto_cache_enabled()).
+    int32_t slot_save_max_count = 0;  // max snapshots in slot_save_path (0 = unlimited)
+    int64_t slot_save_max_bytes = 0;  // total byte cap of the store (0 = unlimited)
     // --- auto disk prompt/KV cache (opt-in, default OFF; see tools/server "auto disk cache") ---
     // master switch for the transparent cross-process prompt/KV cache. Requires slot_save_path.
     // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.

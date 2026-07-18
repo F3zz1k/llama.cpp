@@ -3295,7 +3295,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
-        "path to save slot kv cache (default: disabled)",
+        "path to save slot kv cache to (default: disabled); this flag alone never deletes files. "
+        "eviction/bounded-store behaviour applies only under --slot-save-auto",
         [](common_params & params, const std::string & value) {
             params.slot_save_path = value;
             if (!fs_is_directory(params.slot_save_path)) {
@@ -3309,7 +3310,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-max-count"}, "N",
-        string_format("max number of slot-save snapshots kept in --slot-save-path (treated as a dedicated dir); oldest are evicted (default: %d, 0 = unlimited)", params.slot_save_max_count),
+        string_format("max number of snapshots kept in the --slot-save-auto cache (treated as a dedicated dir); oldest are evicted; no effect without --slot-save-auto (default: %d, 0 = unlimited)", params.slot_save_max_count),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--slot-save-max-count must be >= 0 (0 = unlimited)");
@@ -3319,7 +3320,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SLOT_SAVE_MAX_COUNT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-max-mb"}, "N",
-        string_format("max total size (MiB) of the --slot-save-path store; oldest snapshots are evicted (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
+        string_format("max total size (MiB) of the --slot-save-auto cache store; oldest snapshots are evicted; no effect without --slot-save-auto (default: %d, 0 = unlimited)", (int) (params.slot_save_max_bytes / (1024 * 1024))),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--slot-save-max-mb must be >= 0 (0 = unlimited)");
