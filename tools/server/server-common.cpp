@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <algorithm>
+#include <filesystem>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -408,6 +410,59 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
+const llama_tokens & server_tokens::get_cell_tokens() const {
+    return tokens;
+}
+
+std::vector<server_media_record> server_tokens::extract_media_records() const {
+    std::vector<server_media_record> records;
+    records.reserve(map_idx_to_media.size());
+    for (const auto & it : map_idx_to_media) {
+        const auto * chunk = it.second.get();
+        const auto   type  = mtmd_input_chunk_get_type(chunk);
+        GGML_ASSERT(type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO);
+        const char * id = mtmd_input_chunk_get_id(chunk);
+        if (id == nullptr || id[0] == '\0') {
+            // identity-less chunks (e.g. placeholder bitmaps) can never be re-verified
+            throw std::runtime_error("media chunk has an empty id");
+        }
+        server_media_record rec;
+        rec.start_idx = (uint32_t) it.first;
+        rec.n_tokens  = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+        rec.n_pos     = (uint32_t) mtmd_input_chunk_get_n_pos(chunk);
+        rec.id        = id;
+        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            const auto * img = mtmd_input_chunk_get_tokens_image(chunk);
+            // the raw token-grid shape is wanted here as an extra identity factor; the
+            // deprecation points at mtmd_image_tokens_get_decoder_pos(), which can only
+            // reconstruct the grid for M-RoPE layouts
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            rec.nx = (uint32_t) mtmd_image_tokens_get_nx(img);
+            rec.ny = (uint32_t) mtmd_image_tokens_get_ny(img);
+#pragma GCC diagnostic pop
+        } else {
+            // audio has no 2D token grid; mirror the non-M-RoPE image convention
+            rec.nx       = rec.n_tokens;
+            rec.ny       = 1;
+            rec.is_audio = 1;
+        }
+        records.push_back(std::move(rec));
+    }
+    return records;
+}
+
+bool server_tokens::boundary_is_chunk_safe(size_t idx) const {
+    GGML_ASSERT(idx <= tokens.size());
+    if (idx == tokens.size() || tokens[idx] != LLAMA_TOKEN_NULL) {
+        return true; // one-past-the-end, or the cell at the split is a text token
+    }
+    // idx is a media cell: the split is safe only if a chunk starts exactly here.
+    // The preceding cell's chunk membership is not evidence — adjacent chunks make
+    // "previous cell is NULL" compatible with both safe and unsafe splits.
+    return map_idx_to_media.find(idx) != map_idx_to_media.end();
+}
+
 llama_tokens server_tokens::get_text_tokens() const {
     llama_tokens res;
     res.reserve(tokens.size());
@@ -558,6 +613,349 @@ server_tokens server_tokens::clone() const {
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
     }
     return res;
+}
+
+bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server_media_record> & records, size_t idx) {
+    GGML_ASSERT(idx <= cells.size());
+    if (idx == cells.size() || cells[idx] != LLAMA_TOKEN_NULL) {
+        return true; // one-past-the-end, or the cell at the split is a text token
+    }
+    // idx is a media cell: the split is safe only if a record starts exactly here
+    // (records are ordered by start_idx, so binary-search)
+    const auto it = std::lower_bound(records.begin(), records.end(), idx,
+        [](const server_media_record & r, size_t v) { return r.start_idx < v; });
+    return it != records.end() && it->start_idx == idx;
+}
+
+//
+// auto disk cache .meta sidecar
+//
+
+std::string slot_meta_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".meta";
+}
+
+bool slot_meta_write(const std::string & state_filepath,
+                     const model_fp & fp,
+                     const llama_tokens & toks,
+                     uint64_t chain_hash,
+                     const std::vector<server_media_record> & media) {
+    // caps mirror the reader's: an over-cap or identity-less record would produce a
+    // sidecar our own slot_meta_read rejects, so refuse to write it in the first place.
+    if (media.size() > SLOT_META_MEDIA_MAX) {
+        return false;
+    }
+    for (const auto & rec : media) {
+        if (rec.id.empty() || rec.id.size() > SLOT_META_ID_MAX) {
+            return false;
+        }
+    }
+    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
+    const std::string tmp     = sidecar + ".tmp";
+
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return false;
+    }
+    auto put_u32 = [&](uint32_t v) {
+        const unsigned char b[4] = {
+            (unsigned char)( v        & 0xFF),
+            (unsigned char)((v >> 8)  & 0xFF),
+            (unsigned char)((v >> 16) & 0xFF),
+            (unsigned char)((v >> 24) & 0xFF),
+        };
+        f.write((const char *) b, 4);
+    };
+    auto put_u64 = [&](uint64_t v) {
+        put_u32((uint32_t)(v & 0xFFFFFFFFu));
+        put_u32((uint32_t)(v >> 32));
+    };
+    put_u32(SLOT_META_MAGIC);
+    put_u32(media.empty() ? SLOT_META_VERSION : SLOT_META_VERSION_MEDIA);
+    put_u64(fp.fp_model);
+    put_u32(fp.fp_n_vocab);
+    put_u32(fp.fp_n_ctx_train);
+    put_u32(fp.fp_n_embd);
+    put_u32(fp.fp_n_layer);
+    put_u32(fp.fp_rope_type);
+    put_u32(fp.fp_cache_k);
+    put_u32(fp.fp_cache_v);
+    put_u32(fp.fp_n_ctx);
+    put_u32(fp.fp_kv_full);
+    put_u32(fp.fp_block);
+    put_u64(fp.fp_rope_scale);
+    // rope_freq_base + YaRN fingerprint fields
+    put_u64(fp.fp_rope_base);
+    put_u32(fp.fp_yarn_ext);
+    put_u32(fp.fp_yarn_attn);
+    put_u32(fp.fp_yarn_beta_fast);
+    put_u32(fp.fp_yarn_beta_slow);
+    put_u32(fp.fp_yarn_orig_ctx);
+    put_u64(fp.fp_lora);
+    // mmproj deployment-shape bit — refuses cross-shape restores.
+    put_u32(fp.fp_mmproj_loaded);
+    put_u32((uint32_t) toks.size());
+    put_u64(chain_hash);
+    // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
+    // contract is native-LE, matching slot_logits_write's float payload).
+    f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
+    // v2: appended media identity section (absent from text-only sidecars, which
+    // stay byte-identical to v1).
+    if (!media.empty()) {
+        put_u64(fp.fp_mmproj);
+        put_u32((uint32_t) media.size());
+        for (const auto & rec : media) {
+            put_u32(rec.start_idx);
+            put_u32(rec.n_tokens);
+            put_u32(rec.n_pos);
+            put_u32(rec.nx);
+            put_u32(rec.ny);
+            put_u32(rec.is_audio);
+            put_u32((uint32_t) rec.id.size());
+            f.write(rec.id.data(), (std::streamsize) rec.id.size());
+        }
+    }
+    f.flush();
+    if (!f.good()) {
+        f.close();
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    f.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp, sidecar, ec); // atomic replace
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
+bool slot_meta_read(const std::string & state_filepath,
+                    uint64_t cur_fp_mmproj,
+                    model_fp & fp_out,
+                    llama_tokens & toks_out,
+                    std::vector<server_media_record> & media_out) {
+    fp_out = model_fp{};
+    toks_out.clear();
+    media_out.clear();
+    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
+    std::ifstream f(sidecar, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    auto get_u32 = [&](uint32_t & v) -> bool {
+        unsigned char b[4];
+        f.read((char *) b, 4);
+        if (f.gcount() != 4) {
+            return false;
+        }
+        v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+        return true;
+    };
+    auto get_u64 = [&](uint64_t & v) -> bool {
+        uint32_t lo = 0, hi = 0;
+        if (!get_u32(lo) || !get_u32(hi)) {
+            return false;
+        }
+        v = (uint64_t) lo | ((uint64_t) hi << 32);
+        return true;
+    };
+    uint32_t magic = 0, version = 0;
+    if (!get_u32(magic) || !get_u32(version)) {
+        return false;
+    }
+    if (magic != SLOT_META_MAGIC ||
+        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA)) {
+        return false;
+    }
+    model_fp fp;
+    uint32_t tok_count = 0;
+    uint64_t chain_hash = 0;
+    if (!get_u64(fp.fp_model)         || !get_u32(fp.fp_n_vocab)       || !get_u32(fp.fp_n_ctx_train) ||
+        !get_u32(fp.fp_n_embd)        || !get_u32(fp.fp_n_layer)       || !get_u32(fp.fp_rope_type)   ||
+        !get_u32(fp.fp_cache_k)       || !get_u32(fp.fp_cache_v)       || !get_u32(fp.fp_n_ctx)       ||
+        !get_u32(fp.fp_kv_full)       || !get_u32(fp.fp_block)         || !get_u64(fp.fp_rope_scale)  ||
+        // rope_freq_base + YaRN — must be read in the same order slot_meta_write emits.
+        !get_u64(fp.fp_rope_base)     || !get_u32(fp.fp_yarn_ext)      || !get_u32(fp.fp_yarn_attn)   ||
+        !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
+        // mmproj deployment-shape bit — read in the same order slot_meta_write emits.
+        !get_u64(fp.fp_lora)          || !get_u32(fp.fp_mmproj_loaded) ||
+        !get_u32(tok_count)           || !get_u64(chain_hash)) {
+        return false;
+    }
+    (void) chain_hash;
+    // sanity-bound the count so a corrupt header cannot make us allocate gigabytes.
+    if (tok_count > (1u << 28)) {
+        return false;
+    }
+    toks_out.resize(tok_count);
+    const std::streamsize want = (std::streamsize) tok_count * (std::streamsize) sizeof(int32_t);
+    f.read((char *) toks_out.data(), want);
+    if (f.gcount() != want) {
+        toks_out.clear();
+        return false;
+    }
+    if (version == SLOT_META_VERSION) {
+        // v1 is text-only BY CONSTRUCTION: no v1 writer ever emits a NULL (media)
+        // cell, so any NULL here means a corrupt or relabelled media sidecar (e.g. a
+        // v2 file whose version byte flipped). Enforce that premise — the fp_mmproj
+        // backfill below is only sound for genuinely text-only KV, and accepting NULL
+        // cells as v1 would silently drop the media identity records they stand for.
+        for (const llama_token tok : toks_out) {
+            if (tok == LLAMA_TOKEN_NULL) {
+                toks_out.clear();
+                return false;
+            }
+        }
+        // a v1 sidecar ends exactly after the token array — trailing bytes mean a
+        // relabelled/corrupt file, and the backfill below must never apply to one.
+        if (f.peek() != std::char_traits<char>::eof()) {
+            toks_out.clear();
+            return false;
+        }
+        // v1 predates fp_mmproj and is always text-only, so its KV is
+        // projector-independent: backfill the live value so the fingerprint compare
+        // cannot refuse a pre-v2 snapshot on an --mmproj server.
+        fp.fp_mmproj = cur_fp_mmproj;
+        fp_out = fp;
+        return true;
+    }
+    // v2: appended media identity section. Every violation below rejects the whole
+    // file (invariant 4: fall back to a normal prefill, never trust a corrupt unit).
+    auto fail = [&]() {
+        toks_out.clear();
+        return false;
+    };
+    if (!get_u64(fp.fp_mmproj)) {
+        return fail();
+    }
+    uint32_t n_media = 0;
+    if (!get_u32(n_media) || n_media == 0 || n_media > SLOT_META_MEDIA_MAX) {
+        return fail(); // a media sidecar with no records is never written
+    }
+    std::vector<server_media_record> media;
+    media.reserve(n_media);
+    uint64_t next_free = 0; // first cell index not claimed by a previous record
+    uint64_t n_covered = 0; // total cells claimed by records
+    for (uint32_t r = 0; r < n_media; ++r) {
+        server_media_record rec;
+        uint32_t id_len = 0;
+        if (!get_u32(rec.start_idx) || !get_u32(rec.n_tokens) || !get_u32(rec.n_pos) ||
+            !get_u32(rec.nx)        || !get_u32(rec.ny)       || !get_u32(rec.is_audio) ||
+            !get_u32(id_len)) {
+            return fail();
+        }
+        // empty ids are refused at save time (an identity-less chunk can never be
+        // re-verified), so they are equally invalid here.
+        if (id_len == 0 || id_len > SLOT_META_ID_MAX) {
+            return fail();
+        }
+        rec.id.resize(id_len);
+        f.read(&rec.id[0], (std::streamsize) id_len);
+        if (f.gcount() != (std::streamsize) id_len) {
+            return fail();
+        }
+        // records must be non-empty, ordered by start_idx, disjoint (adjacent is
+        // fine) and in-bounds; 64-bit arithmetic so start_idx + n_tokens cannot wrap.
+        if (rec.n_tokens == 0 ||
+            (uint64_t) rec.start_idx < next_free ||
+            (uint64_t) rec.start_idx + rec.n_tokens > tok_count) {
+            return fail();
+        }
+        // tiling invariant, half 1: every record cell is a media (NULL) cell.
+        for (uint32_t i = rec.start_idx; i < rec.start_idx + rec.n_tokens; ++i) {
+            if (toks_out[i] != LLAMA_TOKEN_NULL) {
+                return fail();
+            }
+        }
+        next_free  = (uint64_t) rec.start_idx + rec.n_tokens;
+        n_covered += rec.n_tokens;
+        media.push_back(std::move(rec));
+    }
+    // tiling invariant, half 2: every NULL cell is covered by exactly one record.
+    // Records are disjoint and cover only NULL cells (checked above), so covering
+    // ALL of them is equivalent to the counts matching.
+    uint64_t n_null = 0;
+    for (const llama_token tok : toks_out) {
+        if (tok == LLAMA_TOKEN_NULL) {
+            ++n_null;
+        }
+    }
+    if (n_covered != n_null) {
+        return fail();
+    }
+    // a v2 sidecar ends exactly here — trailing bytes mean a layout we don't know.
+    if (f.peek() != std::char_traits<char>::eof()) {
+        return fail();
+    }
+    fp_out    = fp;
+    media_out = std::move(media);
+    return true;
+}
+
+//
+// auto disk cache block chain hashing
+//
+
+// splitmix64 finalizer: avalanche a media cell's contribution before it enters the
+// chain, so structured inputs (small slice offsets, similar ids) spread over all
+// 64 bits and cannot resemble a plain token-ID fold.
+static inline uint64_t auto_hash_splitmix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
+                                        const std::vector<server_media_record> & media,
+                                        int B,
+                                        uint64_t salt,
+                                        uint64_t fp_mmproj) {
+    std::vector<uint64_t> out;
+    if (B <= 0) {
+        return out;
+    }
+    out.reserve(cells.size() / (size_t) B);
+    size_t   ri        = 0; // index of the record covering the current NULL run
+    bool     ri_seeded = false;
+    uint64_t rec_seed  = 0; // cell-independent part of the record's contribution
+    uint64_t h = 0xcbf29ce484222325ULL ^ salt; // FNV offset basis, fingerprint-salted
+    for (size_t i = 0; i < cells.size(); ++i) {
+        if (cells[i] == LLAMA_TOKEN_NULL) {
+            // advance to the covering record (records are ordered and tile the NULL cells)
+            while (ri < media.size() && i >= (size_t) media[ri].start_idx + media[ri].n_tokens) {
+                ++ri;
+                ri_seeded = false;
+            }
+            GGML_ASSERT(ri < media.size() && i >= media[ri].start_idx && "NULL cell not covered by a media record");
+            const server_media_record & rec = media[ri];
+            if (!ri_seeded) {
+                // fnv64 over the id bytes, then fold in the chunk shape/type and the
+                // projector identity (see the header comment for why each factor is there)
+                uint64_t id_h = 0xcbf29ce484222325ULL;
+                for (const unsigned char c : rec.id) {
+                    id_h ^= (uint64_t) c;
+                    id_h *= 0x100000001b3ULL;
+                }
+                uint64_t shape = 0;
+                shape = auto_hash_mix(shape, (int32_t) rec.n_tokens);
+                shape = auto_hash_mix(shape, (int32_t) rec.n_pos);
+                shape = auto_hash_mix(shape, (int32_t) rec.is_audio);
+                rec_seed  = id_h ^ shape ^ fp_mmproj;
+                ri_seeded = true;
+            }
+            h = auto_hash_mix64(h, auto_hash_splitmix64(rec_seed ^ (uint64_t) (i - rec.start_idx)));
+        } else {
+            h = auto_hash_mix(h, cells[i]);
+        }
+        if ((i + 1) % (size_t) B == 0 && boundary_is_chunk_safe(cells, media, i + 1)) {
+            out.push_back(h);
+        }
+    }
+    return out;
 }
 
 //

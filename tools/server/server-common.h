@@ -123,6 +123,20 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // server_tokens
 //
 
+// identity metadata for one media (image/audio) chunk of a prompt. This is what the
+// auto disk cache persists per chunk: enough to re-verify a chunk against a future
+// request's live chunks, without storing any pixel/sample data (the KV state file
+// already holds the embeddings; the request itself carries the pixels).
+struct server_media_record {
+    uint32_t    start_idx = 0; // index of the chunk's first cell in the token list
+    uint32_t    n_tokens  = 0; // number of cells (LLAMA_TOKEN_NULL entries) the chunk occupies
+    uint32_t    n_pos     = 0; // number of positions the chunk occupies (M-RoPE: != n_tokens)
+    uint32_t    nx        = 0; // token grid width (image); n_tokens for audio
+    uint32_t    ny        = 0; // token grid height (image); 1 for audio
+    uint32_t    is_audio  = 0; // 1 if the chunk is audio, 0 if image
+    std::string id;            // mtmd bitmap id: FNV-1a of the raw uploaded bytes (never empty)
+};
+
 /**
  * server_tokens is a helper to manage the input tokens and image for the server.
  * it is made this way to simplify the logic of KV cache management.
@@ -198,6 +212,24 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_tokens() const;
 
+    // cell-aligned token list where every media cell is LLAMA_TOKEN_NULL; unlike
+    // get_tokens() this is valid for any prompt (per-request, no server-wide mtmd
+    // assert). The list's length equals the prompt's KV cell count, which is what
+    // llama_state_seq_save_file persists — used by the auto disk cache.
+    const llama_tokens & get_cell_tokens() const;
+
+    // identity records for every media chunk, ordered by start_idx (see
+    // server_media_record). Throws if any chunk has an empty id: identity-less
+    // chunks (e.g. placeholder bitmaps) can never be re-verified, so they must
+    // not be persisted or matched by the auto disk cache.
+    std::vector<server_media_record> extract_media_records() const;
+
+    // true if splitting the token list at idx does not fall strictly inside a media
+    // chunk: a text token, a chunk start, or one-past-the-end are all safe. Shared
+    // by the auto disk cache's boundary checks (save-time index insert, scan rehash
+    // via the server_media_record overload below, lookup clamp) so they cannot drift.
+    bool boundary_is_chunk_safe(size_t idx) const;
+
     llama_tokens get_text_tokens() const;
 
     // per-request media signal (has_mtmd is server-wide and wrong here): true if this
@@ -230,6 +262,181 @@ public:
 
     server_tokens clone() const;
 };
+
+// same predicate as server_tokens::boundary_is_chunk_safe, for the scan-time shape of
+// the data: a cell-aligned token list plus media records read back from a snapshot's
+// .meta sidecar (no live chunks exist there). records must be ordered by start_idx,
+// as extract_media_records produces them.
+bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server_media_record> & records, size_t idx);
+
+
+//
+// auto disk cache .meta sidecar (fingerprint + tokens + media identity records)
+//
+// The format layer of the automatic disk prompt/KV cache (--slot-save-auto; the
+// cache logic itself lives in server-context.cpp). It is defined here so the
+// parser — which reads untrusted on-disk bytes — links into a standalone
+// fuzz/unit test (tests/test-slot-meta.cpp).
+//
+
+static constexpr uint32_t SLOT_META_MAGIC         = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
+static constexpr uint32_t SLOT_META_VERSION       = 1u;          // text-only snapshot (layout byte-frozen)
+static constexpr uint32_t SLOT_META_VERSION_MEDIA = 2u;          // v1 layout + appended media-record section
+static constexpr uint32_t SLOT_META_MEDIA_MAX     = 4096u;       // cap: media records per snapshot
+static constexpr uint32_t SLOT_META_ID_MAX        = 256u;        // cap: bytes per media-record id (0 invalid)
+
+// Model/quant/context fingerprint that MUST match for a restore to be sound. All
+// fields are stable inference-affecting identity captured once at model load and
+// compared by exact equality (pure-CPU int compares). The blob produced by
+// llama_state_seq_save_file is only safe to load into a context with identical KV
+// geometry — a Q4_0-KV blob loaded into an F16 ctx, or a different rope/yarn scale
+// (positions are baked into the saved state), silently corrupts — so cache_type_k/v
+// and rope_scale are NOT optional.
+struct model_fp {
+    uint64_t fp_model      = 0; // hash of llama_model_desc + size + n_params (+ n_embd/n_layer)
+    uint32_t fp_n_vocab    = 0;
+    uint32_t fp_n_ctx_train= 0;
+    uint32_t fp_n_embd     = 0;
+    uint32_t fp_n_layer    = 0;
+    uint32_t fp_rope_type  = 0;
+    uint32_t fp_cache_k    = 0; // ggml_type of K cache (enum int)
+    uint32_t fp_cache_v    = 0; // ggml_type of V cache (enum int)
+    uint32_t fp_n_ctx      = 0; // effective per-seq n_ctx
+    uint32_t fp_kv_full    = 0; // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0
+    uint32_t fp_block      = 0; // slot_save_block this snapshot was hashed with
+    uint64_t fp_rope_scale = 0; // bit-pattern of effective rope_freq_scale (position-critical)
+    // rope_freq_base and ALL YaRN params also bake positions into the saved KV state exactly as
+    // rope_freq_scale does — a same-model run differing only in --rope-freq-base or any --yarn-*
+    // flag would otherwise pass the fingerprint and silently restore positionally-corrupt state.
+    // All are bit-cast (float->u32) into identity; yarn_orig_ctx is an int. "0/negative = use
+    // model-trained value" is normalized in auto_compute_fingerprint so equal effective configs match.
+    uint64_t fp_rope_base       = 0; // bit-pattern of effective rope_freq_base
+    uint32_t fp_yarn_ext        = 0; // bit-pattern of yarn_ext_factor
+    uint32_t fp_yarn_attn       = 0; // bit-pattern of yarn_attn_factor
+    uint32_t fp_yarn_beta_fast  = 0; // bit-pattern of yarn_beta_fast
+    uint32_t fp_yarn_beta_slow  = 0; // bit-pattern of yarn_beta_slow
+    uint32_t fp_yarn_orig_ctx   = 0; // yarn_orig_ctx (int)
+    uint64_t fp_lora       = 0; // hash of active LoRA-set ids+scales (0 if none)
+    // refuse cross-shape restores: 1 if the server was launched with --mmproj (mctx != nullptr),
+    // else 0. The auto-cache only ever persists text-only prefixes, but mmproj-aware rope (M-RoPE)
+    // and projector wiring CAN alter the text KV layout, so we conservatively REFUSE to cross-load
+    // a text-only-server snapshot into an mmproj server (or vice-versa) — they get disjoint stores.
+    // Removing this bit later would require proving the text KV layout is identical across the two
+    // deployment shapes.
+    uint32_t fp_mmproj_loaded   = 0;
+    // gguf-header hash of the loaded --mmproj file (0 on a text-only server); see
+    // mmproj_header_fingerprint. Catches projector swap, requantization and dimension
+    // changes that the fp_mmproj_loaded 0/1 bit cannot. Persisted only in v2 (media)
+    // sidecars: text KV is projector-independent, so slot_meta_read backfills it from
+    // the live value on v1 (v1 => text-only) and the compare below only ever bites
+    // for media snapshots — existing v1 snapshots on an --mmproj server keep matching.
+    uint64_t fp_mmproj          = 0;
+
+    // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
+    // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
+    // with a different block size cannot be longest-prefix-matched against the current index.
+    bool operator==(const model_fp & o) const {
+        return fp_model == o.fp_model && fp_n_vocab == o.fp_n_vocab &&
+               fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
+               fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
+               fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
+               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
+               fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
+               fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
+               fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
+               fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
+               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
+               fp_mmproj == o.fp_mmproj;
+    }
+};
+
+// the .meta sidecar path for an auto snapshot's state file. The sidecar is the tiny
+// tokens+fingerprint(+media) twin this feature adds so the startup scan / pre-restore
+// verify reads only a small file, never the multi-GB state.
+std::string slot_meta_sidecar_path(const std::string & state_filepath);
+
+// Best-effort atomic write of the .meta sidecar (LE, temp+rename — the exact idiom
+// of slot_logits_write). v1 (media empty, layout byte-frozen): magic/version,
+// fingerprint fields, tok_count, chain_hash, then int32 tokens[tok_count]. v2 (media
+// records present): the full v1 layout, then fp_mmproj, n_media and the records
+// (start_idx/n_tokens/n_pos/nx/ny/is_audio/id_len/id each). For v2 `toks` must be
+// the cell-aligned list (media cells LLAMA_TOKEN_NULL, see get_cell_tokens) and the
+// records must tile its NULL cells exactly, as extract_media_records produces them —
+// slot_meta_read rejects anything else. Returns true on success. Never throws.
+bool slot_meta_write(const std::string & state_filepath,
+                     const model_fp & fp,
+                     const llama_tokens & toks,
+                     uint64_t chain_hash,
+                     const std::vector<server_media_record> & media = {});
+
+// Read a .meta sidecar (version-aware: v1 and v2). Returns true and fills the
+// outputs iff a valid sidecar exists; any short read / bad magic / unknown version /
+// cap or media-tiling violation => false with outputs cleared. Never throws. On v1,
+// fp_out.fp_mmproj is backfilled from `cur_fp_mmproj` (sound: v1 => text-only =>
+// projector-independent KV), so the fingerprint compare cannot refuse pre-v2
+// snapshots on an --mmproj server. To keep that backfill sound, a v1 sidecar
+// containing any LLAMA_TOKEN_NULL cell — or any bytes past the token array — is
+// rejected: no v1 writer ever emits either, so both can only be a corrupt or
+// relabelled media sidecar trying to bypass fp_mmproj. Note: `chain_hash` is
+// recorded for debuggability but the authority for reuse is always the
+// byte-compared tokens.
+bool slot_meta_read(const std::string & state_filepath,
+                    uint64_t cur_fp_mmproj,
+                    model_fp & fp_out,
+                    llama_tokens & toks_out,
+                    std::vector<server_media_record> & media_out);
+
+//
+// auto disk cache block chain hashing
+//
+// The identity layer of the automatic disk prompt/KV cache: chain hashes are the
+// index keys AND the on-disk filenames, so — like the .meta parser above — the
+// algorithm is defined here and locked by a standalone unit test
+// (tests/test-auto-hash.cpp). Collision resistance is only a candidate-narrowing
+// accelerator: consumers NEVER trust a hash alone — tokens (and media records) are
+// byte-verified before any restore.
+//
+
+// 64-bit chained hash primitive: fold a 64-bit value via the FNV-1a prime, then a
+// splitmix avalanche. Every cache identity (block chain, fingerprints) folds
+// through this one primitive.
+static inline uint64_t auto_hash_mix64(uint64_t h, uint64_t v) {
+    h ^= v;
+    h *= 0x100000001b3ULL;                                  // FNV-1a 64-bit prime
+    h ^= h >> 29; h *= 0xbf58476d1ce4e5b9ULL; h ^= h >> 32; // splitmix64 finalize
+    return h;
+}
+
+// token-ID convenience overload (zero-extended: bit-identical to the pre-media chain)
+static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
+    return auto_hash_mix64(h, (uint64_t) (uint32_t) tok);
+}
+
+// Returns the cumulative chain hash at every CHUNK-SAFE block boundary of a
+// cell-aligned prompt. Each cell folds into the chain in order — a text token as
+// its ID, a media (LLAMA_TOKEN_NULL) cell as a per-cell contribution derived from
+// its covering record: splitmix64(fnv64(id) ^ (i - start_idx) ^
+// mix(n_tokens, n_pos, is_audio) ^ fp_mmproj). Folding the chunk shape/type means
+// an audio chunk can never impersonate an image chunk with the same id; folding
+// fp_mmproj means a projector swap changes media boundary hashes without touching
+// text boundaries; the per-cell offset disambiguates llava-uhd slices sharing one
+// bitmap id. The chain is salted with `salt` (the model fingerprint hash — for ALL
+// prompts, so a media prompt's pure-text prefix boundaries hash identically to a
+// text-only prompt's and text<->media prefix reuse works both ways).
+//
+// Only chunk-safe boundaries are emitted (boundary_is_chunk_safe: block-aligned
+// AND not strictly inside a chunk) — this is the SINGLE site enforcing the
+// boundary rule, so save-time insert, scan rehash and lookup cannot drift. A
+// trailing partial block is never a boundary. For a text-only prompt (media
+// empty) every block boundary is chunk-safe and out[k] commits to tokens
+// [0, (k+1)*B) — bit-identical to the pre-media algorithm, same filenames, same
+// index keys. `media` must be ordered by start_idx and tile the NULL cells
+// exactly, as extract_media_records / slot_meta_read produce them.
+std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
+                                        const std::vector<server_media_record> & media,
+                                        int B,
+                                        uint64_t salt,
+                                        uint64_t fp_mmproj);
 
 
 //

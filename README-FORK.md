@@ -23,7 +23,9 @@ so you don't re-process a long prompt every time. But two important cases didn't
 This fork fixes both, and adds an **opt-in automatic disk cache** so a plain chat client
 gets cross-request and cross-process reuse with no extra work: when a long prompt arrives
 on a "cold" server (a fresh start, or a different instance), it is restored from disk in a
-fraction of a second instead of being re-processed for minutes.
+fraction of a second instead of being re-processed for minutes. The automatic cache is
+**fully multimodal**: prompts containing images (or audio) are saved and restored too, with
+each media chunk verified by a content hash of its raw uploaded bytes before any reuse.
 
 ### Why it matters (the practical payoff)
 
@@ -50,22 +52,26 @@ Plain **attention** models (Llama, Mistral, Qwen2.5, Gemma, etc.) already worked
 caching upstream; this fork doesn't change their behavior, and the auto-cache works for
 them too.
 
-**Multimodal:** a server started with `--mmproj` now caches the **text-only** turns of a
-session. A turn that includes an image is skipped (and so is the rest of that session),
-because image content can't be safely identified by tokens alone — see the TODO below.
+**Multimodal:** a server started with `--mmproj` now caches **everything** — text-only
+turns exactly as a text-only server would (byte-identical snapshot format), and turns
+containing images or audio as well. Media snapshots store only ~100 bytes of *identity*
+per media chunk (a content hash of the raw uploaded bytes plus the chunk's shape); the
+embeddings are already inside the saved KV state, and at restore time the request itself
+carries the live media. Reuse requires the client to re-upload each media file
+byte-identically — which is what normal multi-turn chat clients do. Same text with a
+*different* image reuses exactly the prefix before that image. See
+`docs/kv-cache/03-multimodal-cache.md`.
 
 ---
 
 ## TODO / not done yet
 
-- **Full image-token caching.** Today an image in the prompt disables caching for that
-  turn onward. Supporting image prefixes needs the image content folded into the cache key
-  (see `docs/kv-cache/02-auto-disk-cache.md`, "Multimodal").
 - **Code cleanup.** The auto-cache logic lives inline in the large `server-context.cpp`;
   it should be extracted into its own translation unit. The internal index mutex is
   currently uncontended (single-threaded) and only matters if saving is later threaded.
-- **Automated tests.** Validation so far is end-to-end on real models; the pure helpers
-  (hashing, fingerprint, file format) should get unit tests.
+- **A CI-sized M-RoPE vision fixture.** The pytest suite covers every cache code path with
+  tinygemma3 (a normal-position vision model); M-RoPE models (Qwen-VL class) are validated
+  on real hardware only. A tiny qwen2-vl GGUF would close that gap in CI.
 
 Full design write-ups (what changed, how it works, and why): see
 [`docs/kv-cache/`](docs/kv-cache/).
@@ -118,7 +124,7 @@ On startup you'll see a log line confirming it's on:
 auto disk prompt cache enabled: indexed 3 prefix boundaries from /home/you/kvcache/mymodel/ (block=256)
 ```
 
-### Multimodal (image-capable) server, caching text turns
+### Multimodal (image-capable) server
 
 Just add the auto-cache flags to your normal `--mmproj` command line — nothing special:
 
@@ -131,7 +137,13 @@ Just add the auto-cache flags to your normal `--mmproj` command line — nothing
   --slot-save-auto
 ```
 
-Text-only turns are cached; turns containing an image are skipped automatically.
+Text-only turns are cached in the exact same snapshot format a text-only server writes.
+Turns containing images (or audio) are cached too: on a resend of the same conversation
+(same text, byte-identical media re-upload) the whole prompt restores from disk; a resend
+with a *different* image reuses the prefix before that image and re-processes the rest.
+Swapping the `--mmproj` file invalidates media snapshots (each records a fingerprint of
+the projector it was encoded with, shown in `/props` as `fp_mmproj`) while text snapshots
+keep working.
 
 ### Manual save/restore (advanced, no `--slot-save-auto`)
 
@@ -145,7 +157,15 @@ curl http://localhost:8080/slots/0?action=save  -d '{"filename":"snap1.bin"}'
 curl http://localhost:8080/slots/0?action=restore -d '{"filename":"snap1.bin"}'
 ```
 
+On an `--mmproj` server these endpoints used to return 501 across the board; they now gate
+**per slot**. A text-only slot saves/restores exactly as before. A slot whose prompt
+contains media writes an extra `.meta` identity sidecar next to the state file, and a
+restore rebuilds the prompt's media chunks from it — see
+`docs/kv-cache/03-multimodal-cache.md` for the details and limits.
+
 ### Pinning a snapshot (permanent, never-evicted cache)
+
+*(From the `auto-disk-kvcache-pin` branch; included in `main-patched`.)*
 
 By default the auto-cache evicts least-recently-used snapshots once `--slot-save-max-count` /
 `--slot-save-max-mb` are exceeded. To keep one snapshot **forever** — e.g. a large fixed
@@ -171,11 +191,12 @@ an instance to it. (The marker is a plain file; no flag or restart needed.)
 - **`master`** — mirror of upstream `master`; every patch is cut from here.
 - **`kv-restore-reuse`** — recurrent/hybrid restore primitives (regenerate-from-logits + reusing a disk-restored slot).
 - **`auto-disk-kvcache`** — the above + the opt-in automatic cross-process disk cache (`--slot-save-auto`).
-- **`auto-disk-kvcache-pin`** — the above + these docs + the `.pin` eviction-exempt marker.
+- **`auto-disk-kvcache-pin`** — `auto-disk-kvcache` + the `.pin` eviction-exempt marker.
+- **`auto-disk-kvcache-mm`** — `auto-disk-kvcache` + full multimodal snapshots (image/audio prompts cached and verified by media identity records) + the per-slot manual `/slots` gate + the test suite.
 - **`l0-fattn-alloc`** — independent SYCL fix: route the flash-attention KV buffer through the Level-Zero device allocator so it isn't mirrored into host RAM under multi-GPU / P2P.
 - **`main-patched`** — the deployed integration: `master` + all the above merged.
 
-Each feature branch is a clean single-purpose delta off `master`, meant to be submittable upstream as its own PR.
+Each feature branch is a clean single-purpose delta, meant to be submittable upstream as its own PR (`kv-restore-reuse` and `l0-fattn-alloc` sit directly on `master`; `auto-disk-kvcache` stacks on `kv-restore-reuse`, and the `-pin` / `-mm` branches stack on `auto-disk-kvcache`).
 
 ## How to keep the fork up to date with upstream
 
@@ -186,11 +207,27 @@ git remote add upstream https://github.com/ggml-org/llama.cpp.git   # one-time
 git fetch upstream master && git branch -f master upstream/master
 # rebase each feature branch onto the new master (resolving conflicts — see below), then:
 git checkout -B main-patched master
-git merge --no-ff auto-disk-kvcache-pin l0-fattn-alloc
-git push --force-with-lease origin master main-patched kv-restore-reuse auto-disk-kvcache auto-disk-kvcache-pin l0-fattn-alloc
+git merge --no-ff auto-disk-kvcache-pin
+git merge --no-ff auto-disk-kvcache-mm
+git merge --no-ff l0-fattn-alloc
+git push --force-with-lease origin master main-patched kv-restore-reuse auto-disk-kvcache auto-disk-kvcache-pin auto-disk-kvcache-mm l0-fattn-alloc
 ```
 
-Conflicts land almost entirely in `tools/server/server-context.cpp` and are **not** trivial: upstream's server refactors relocate code, and a 3-way merge can silently mis-place a small hunk into the wrong decode loop (this has caused a segfault). Always build **and** exercise the disk save->restart->restore path afterward. `docs/kv-cache/` explains what each commit touches.
+Merge the branches **sequentially, in that order** — never as one multi-branch (octopus)
+merge, which cannot resolve any conflict. The `-pin` -> `-mm` merge always conflicts
+(**add/add**) on `README-FORK.md` and `docs/kv-cache/02-auto-disk-cache.md`: both branches
+carry these files with different content. Take the `-mm` copies, which document the `.pin`
+feature too — `git checkout --theirs README-FORK.md docs/kv-cache/02-auto-disk-cache.md`,
+then `git add` both and `git commit` to conclude the merge.
+(`docs/kv-cache/01-primitives-recurrent-restore.md` is identical on both branches and
+resolves itself, and the two branches' `tools/server/server-context.cpp` edits touch
+different regions and auto-merge.)
+
+Conflicts against **upstream** land almost entirely in `tools/server/server-context.cpp`
+and are **not** trivial: upstream's server refactors relocate code, and a 3-way merge can
+silently mis-place a small hunk into the wrong decode loop (this has caused a segfault).
+Always build **and** exercise the disk save->restart->restore path afterward.
+`docs/kv-cache/` explains what each commit touches.
 
 ---
 
@@ -205,12 +242,22 @@ cmake --build build --target llama-server -j
 
 ### Quick built-in checks
 
-The patches don't add a custom test target, but the standard suite should pass and is the
-fastest way to confirm nothing regressed:
+The fork adds unit tests for its pure helpers — the `.meta` sidecar parser (including a
+fuzz mode over mutated inputs), the media-aware block chain hashing, and the
+`server_tokens` cell accessors — which run as part of the standard suite:
 
 ```bash
-ctest --test-dir build --output-on-failure     # runs llama.cpp's unit tests
+ctest --test-dir build --output-on-failure     # unit tests incl. test-slot-meta / test-auto-hash / test-server-tokens
 ./build/bin/llama-server --help | grep slot-save   # confirms the new flags are present
+```
+
+The server-level behaviour (save/restore across restarts and processes, multimodal reuse
+and mismatch truncation, torn/corrupt-unit fallback, manual `/slots`) is covered by
+pytest — see `tools/server/tests`:
+
+```bash
+cd tools/server/tests
+./tests.sh unit/test_slot_save_auto.py
 ```
 
 ### End-to-end test: 2 live instances (save on one, restore on the other)
@@ -261,4 +308,6 @@ whole prompt.
 ## Where to read more
 
 - [`docs/kv-cache/01-primitives-recurrent-restore.md`](docs/kv-cache/01-primitives-recurrent-restore.md) — the recurrent-model restore/regenerate fixes
-- [`docs/kv-cache/02-auto-disk-cache.md`](docs/kv-cache/02-auto-disk-cache.md) — the automatic disk cache (indexing, fingerprinting, cross-process, multimodal)
+- [`docs/kv-cache/02-auto-disk-cache.md`](docs/kv-cache/02-auto-disk-cache.md) — the automatic disk cache (indexing, fingerprinting, cross-process)
+- [`docs/kv-cache/03-multimodal-cache.md`](docs/kv-cache/03-multimodal-cache.md) — multimodal snapshots (media identity records, the v2 `.meta` format, verification order, manual `/slots` rehydration)
+- the "Automatic disk prompt cache" section of [`tools/server/README.md`](tools/server/README.md) — user-facing invariants, restore semantics and operational notes

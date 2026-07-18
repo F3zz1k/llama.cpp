@@ -1877,6 +1877,68 @@ void mtmd_input_chunk_free(mtmd_input_chunk * chunk) {
     }
 }
 
+bool mtmd_input_chunk_is_placeholder(const mtmd_input_chunk * chunk) {
+    return chunk->is_placeholder();
+}
+
+mtmd_input_chunk * mtmd_input_chunk_init_stub(mtmd_context * ctx,
+                                              bool          is_audio,
+                                              const char *  id,
+                                              uint32_t      n_tokens,
+                                              llama_pos     n_pos,
+                                              uint32_t      nx,
+                                              uint32_t      ny) {
+    if (id == nullptr || id[0] == '\0' || n_tokens == 0) {
+        return nullptr;
+    }
+    mtmd_input_chunk * chunk = nullptr;
+    if (is_audio) {
+        if (!ctx->ctx_a) {
+            return nullptr;
+        }
+        mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+        audio_tokens->n_tokens = n_tokens;
+        audio_tokens->id       = id;
+        audio_tokens->batch_f32.is_audio = true;
+        audio_tokens->batch_f32.entries.emplace_back(); // one placeholder entry (empty buf)
+        chunk = new mtmd_input_chunk{
+            MTMD_INPUT_CHUNK_TYPE_AUDIO,
+            {}, // text tokens
+            nullptr,
+            std::move(audio_tokens),
+        };
+    } else {
+        if (!ctx->ctx_v) {
+            return nullptr;
+        }
+        mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+        image_tokens->nx  = nx;
+        image_tokens->ny  = ny;
+        image_tokens->pos = ctx->pos_type;
+        if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
+            image_tokens->pos = MTMD_POS_TYPE_HUNYUANVL;
+        }
+        image_tokens->id = id;
+        // one placeholder entry (empty buf): nz = 1, so n_tokens() derives from nx/ny alone;
+        // multi-frame (video) geometry is not reproducible this way and fails the check below
+        image_tokens->batch_f32.entries.emplace_back();
+        chunk = new mtmd_input_chunk{
+            MTMD_INPUT_CHUNK_TYPE_IMAGE,
+            {}, // text tokens
+            std::move(image_tokens),
+            nullptr,
+        };
+    }
+    // the chunk must reproduce the requested geometry exactly — position bookkeeping built
+    // on a stub with a different token/position count would silently corrupt the KV cache
+    if (mtmd_input_chunk_get_n_tokens(chunk) != (size_t) n_tokens ||
+        mtmd_input_chunk_get_n_pos(chunk) != n_pos) {
+        mtmd_input_chunk_free(chunk);
+        return nullptr;
+    }
+    return chunk;
+}
+
 // mtmd_image_tokens
 
 size_t mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens) {
