@@ -210,7 +210,12 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
-| `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--slot-save-path PATH` | path to save slot kv cache to (default: disabled); this flag alone never deletes files. eviction/bounded-store behaviour applies only under --slot-save-auto |
+| `--slot-save-max-count N` | max number of snapshots kept in the --slot-save-auto cache (treated as a dedicated dir); oldest are evicted; no effect without --slot-save-auto (default: 0, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_COUNT) |
+| `--slot-save-max-mb N` | max total size (MiB) of the --slot-save-auto cache store; oldest snapshots are evicted; no effect without --slot-save-auto (default: 0, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_MB) |
+| `--slot-save-auto` | automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_AUTO) |
+| `--slot-save-block N` | token-ID hash block size for the auto disk cache index; reuse granularity is one block (default: 256)<br/>(env: LLAMA_ARG_SLOT_SAVE_BLOCK) |
+| `--slot-save-idle-seconds N` | flush a slot's warm KV to the auto disk cache after N seconds of idleness, so a lone request survives a crash and is visible to peer instances without further traffic; requires --slot-save-auto (default: 60, -1 = disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
