@@ -29,6 +29,12 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    // idle-delay flush (auto disk cache): callback_idle_deadline returns the absolute ggml_time_ms()
+    // deadline of the earliest slot due for a flush (-1 if none / feature off) so the idle wait can
+    // be bounded to it; callback_idle_flush runs the due flushes when that wait times out. Both run
+    // on the main (loop) thread and self-gate, so they are cheap no-ops when the feature is off.
+    std::function<int64_t(void)>        callback_idle_deadline;
+    std::function<void(void)>           callback_idle_flush;
 
 public:
     // Add a new task to the end of the queue
@@ -93,6 +99,13 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register the idle-delay flush callbacks (see the fields above). `deadline` bounds the idle
+    // wait; `flush` runs the due flushes on timeout. Both run on the main loop thread.
+    void on_idle_flush(std::function<int64_t(void)> deadline, std::function<void(void)> flush) {
+        callback_idle_deadline = std::move(deadline);
+        callback_idle_flush    = std::move(flush);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

@@ -195,14 +195,29 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
             } else {
-                // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || !running);
-                });
+                // wait for new tasks or timeout for checking sleeping condition. The idle-delay
+                // flush only ever SHORTENS this wait toward the earliest slot's flush deadline (a
+                // single timed wakeup, bound by that deadline) — never lengthens it — so a server
+                // not using the feature keeps the exact same idle cadence.
+                const auto pred = [&]{ return (!queue_tasks.empty() || !running); };
+                int64_t timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(max_wait_time).count();
+                if (callback_idle_deadline) {
+                    const int64_t deadline = callback_idle_deadline();
+                    if (deadline >= 0) {
+                        timeout_ms = std::min(timeout_ms, std::max<int64_t>(0, deadline - ggml_time_ms()));
+                    }
+                }
+                bool res = condition_tasks.wait_for(lock, std::chrono::milliseconds(timeout_ms), pred);
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // Timed out: run any due idle flushes on this (main loop) thread, off the request hot
+                // path, then loop again to re-check the sleeping condition. Release the queue mutex
+                // first — the flush is a potentially multi-GB write and must not block task posters.
+                if (callback_idle_flush) {
+                    lock.unlock();
+                    callback_idle_flush();
+                }
             }
         }
     }

@@ -3,6 +3,7 @@ import hashlib
 import os
 import shutil
 import struct
+import time
 
 import pytest
 from utils import *
@@ -923,3 +924,111 @@ def test_manual_media_restore_refuses_without_meta():
     assert cache_n == 0
     assert prompt_n == prompt_n_full
     vs.stop()
+
+
+# -- idle-delay flush (C9) -----------------------------------------------------------------
+# The two legacy save sites only fire on next-task-arrival (get_available_slot reclaim) or on
+# a graceful shutdown, so a lone request's warm KV stays crash-volatile and invisible to peer
+# instances until more traffic lands. --slot-save-idle-seconds closes that window: a slot idle
+# for N seconds is flushed like any other site (v2 for media), on the main-loop thread, with no
+# second request and no shutdown.
+
+IDLE_SECONDS = 3
+
+
+def _units_on_disk():
+    return sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta")))
+
+
+def _wait_for_unit(timeout_s: float):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        metas = _units_on_disk()
+        if metas:
+            return metas
+        time.sleep(0.25)
+    return _units_on_disk()
+
+
+def test_idle_flush_text():
+    """A single text completion, with no follow-up request and no shutdown, is flushed to the
+    auto disk cache after the idle delay: nothing is written while the slot is processing or at
+    completion (both legacy sites need a NEXT task), then the timed idle wake persists it while
+    the server keeps running, exactly once."""
+    global server
+    server.slot_save_path = CACHE_DIR
+    server.slot_save_auto = True
+    server.slot_save_block = 16
+    server.slot_save_idle_seconds = IDLE_SECONDS
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog. " * 8,
+        "n_predict": 8,
+        "temperature": 0,
+    })
+    assert res.status_code == 200
+    # the request itself (processing + completion) writes nothing
+    assert _units_on_disk() == []
+
+    metas = _wait_for_unit(IDLE_SECONDS + 10)
+    assert len(metas) == 1, "the idle slot must have been flushed to disk after the delay"
+    version, toks, media = parse_meta(metas[0])
+    assert version == 1 and media == []
+    assert all(t != LLAMA_TOKEN_NULL for t in toks)
+
+    # the slot stays idle but is not re-flushed into a second unit (one flush per idle period)
+    time.sleep(IDLE_SECONDS + 1)
+    assert _units_on_disk() == metas
+
+    server.stop()
+
+
+def test_idle_flush_media():
+    """The idle-delay flush persists a MEDIA slot as a v2 unit too (records tiling the NULL
+    cells), after the delay, with no follow-up request and no shutdown."""
+    vs = make_vision_server(auto=True)
+    vs.slot_save_idle_seconds = IDLE_SECONDS
+    vs.start()
+
+    prompt_n, _, _ = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI], id_slot=0)
+    assert prompt_n > 0
+    # nothing on disk yet: no second request, no shutdown
+    assert _units_on_disk() == []
+
+    metas = _wait_for_unit(IDLE_SECONDS + 10)
+    v2 = [parse_meta(p) for p in metas]
+    v2 = [m for m in v2 if m[0] == 2]
+    assert len(v2) == 1, "the idle media slot must have been flushed as a single v2 unit"
+    _, toks, media = v2[0]
+    assert len(media) >= 1
+    n_null = sum(1 for t in toks if t == LLAMA_TOKEN_NULL)
+    assert n_null == sum(r["n_tokens"] for r in media)
+
+    vs.stop()
+
+
+def test_idle_flush_disabled_legacy():
+    """--slot-save-idle-seconds -1 restores legacy behaviour: an idle slot is NOT flushed on a
+    timer; only the next-task / shutdown sites persist it."""
+    global server
+    server.slot_save_path = CACHE_DIR
+    server.slot_save_auto = True
+    server.slot_save_block = 16
+    server.slot_save_idle_seconds = -1
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "The quick brown fox jumps over the lazy dog. " * 8,
+        "n_predict": 8,
+        "temperature": 0,
+    })
+    assert res.status_code == 200
+
+    # well past what the default idle delay would be: still nothing (feature off)
+    time.sleep(IDLE_SECONDS + 2)
+    assert _units_on_disk() == []
+
+    # the shutdown flush still persists it (legacy path intact)
+    server.stop()
+    assert len(_units_on_disk()) == 1

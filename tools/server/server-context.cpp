@@ -682,6 +682,11 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // idle-delay flush: cleared each time the slot is released (a fresh idle period begins), set
+    // once its warm KV has been flushed to the auto disk cache, so the timed idle wake attempts the
+    // flush at most once per idle period (auto_save_slot_if_useful's dedup covers any re-attempt).
+    bool auto_idle_flushed = false;
+
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
@@ -1003,7 +1008,8 @@ struct server_slot {
             t_last_used        =  ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
-            state = SLOT_STATE_IDLE;
+            state             = SLOT_STATE_IDLE;
+            auto_idle_flushed = false; // fresh idle period: eligible for a timed idle flush again
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -2377,6 +2383,59 @@ private:
         }
     }
 
+    // AUTO-SAVE (idle-delay): the two other save sites (get_available_slot reclaim, shutdown) only
+    // fire on next-task-arrival or terminate, so a lone request's warm KV stays crash-volatile and
+    // invisible to peer instances until more traffic lands. This closes that window to <=N seconds:
+    // once a slot has been idle for slot_save_idle_seconds it is flushed like any other site (v2 for
+    // media), on the main-loop thread, off the request hot path. Driven by the queue's timed idle
+    // wait (auto_idle_next_deadline bounds the wait; auto_idle_flush runs the due flushes), so there
+    // is no busy poll and it works with sleeping disabled.
+    bool auto_idle_flush_enabled() const {
+        return auto_cache_enabled() && params_base.slot_save_idle_seconds >= 0;
+    }
+
+    // Absolute ggml_time_ms() deadline of the earliest slot due for an idle flush, or -1 if none is
+    // pending. Called by the queue loop to bound its idle wait. A slot with no prior task (never ran)
+    // or already flushed for its current idle period contributes nothing.
+    int64_t auto_idle_next_deadline() {
+        if (!auto_idle_flush_enabled()) {
+            return -1;
+        }
+        const int64_t idle_ms = (int64_t) params_base.slot_save_idle_seconds * 1000;
+        int64_t earliest = -1;
+        for (const auto & slot : slots) {
+            if (slot.is_processing() || slot.auto_idle_flushed || !slot.task_prev || slot.t_last_used < 0) {
+                continue;
+            }
+            const int64_t deadline = slot.t_last_used / 1000 + idle_ms; // t_last_used is microseconds
+            if (earliest < 0 || deadline < earliest) {
+                earliest = deadline;
+            }
+        }
+        return earliest;
+    }
+
+    // Flush every idle slot whose idle deadline has passed. Runs on the main-loop thread from the
+    // queue's idle wait (no task in flight, so all slots are quiescent); auto_save_slot_if_useful
+    // carries every correctness gate and its dedup makes a repeat flush free.
+    void auto_idle_flush() {
+        if (!auto_idle_flush_enabled()) {
+            return;
+        }
+        const int64_t now_ms  = ggml_time_ms();
+        const int64_t idle_ms = (int64_t) params_base.slot_save_idle_seconds * 1000;
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.auto_idle_flushed || !slot.task_prev || slot.t_last_used < 0) {
+                continue;
+            }
+            if (now_ms - slot.t_last_used / 1000 < idle_ms) {
+                continue; // not idle long enough yet
+            }
+            auto_save_slot_if_useful(slot);
+            slot.auto_idle_flushed = true; // one attempt per idle period; a reclaim/next task re-arms it
+        }
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -2855,6 +2914,9 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        queue_tasks.on_idle_flush(
+            [this]() { return auto_idle_next_deadline(); },
+            [this]() { auto_idle_flush(); });
 
         metrics.init();
 
