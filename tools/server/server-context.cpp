@@ -386,6 +386,12 @@ static void slot_save_enforce_limits(const std::string & dir,
                 present.count(p.substr(0, p.size() - 5))) {
                 continue;
             }
+            // a "<X>.pin" file marks "<X>" as PINNED (never evicted, excluded from caps). Like the
+            // other sidecars: skip it here when its state file is present; reaped below if orphaned.
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                present.count(p.substr(0, p.size() - 4))) {
+                continue;
+            }
             // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
             // accumulate (we never count them) and eat real on-disk space forever.
             if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
@@ -398,9 +404,22 @@ static void slot_save_enforce_limits(const std::string & dir,
                 std::filesystem::remove(p, fec);
                 continue;
             }
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                !present.count(p.substr(0, p.size() - 4))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
 
             slot_save_unit u;
             u.state_path = p;
+            // PINNED snapshots (a sibling "<state>.pin" marker) are never evicted and are excluded
+            // from the count/byte caps entirely — a reserved, persistent entry (e.g. a permanent
+            // doc / system-prompt prefix) that coexists with the normal LRU pool. Pin with
+            // `touch <snapshot>.pin`; unpin by removing it. The index/restore path is unchanged:
+            // a pinned snapshot is a normal auto-*.bin, still discovered and restored like any other.
+            if (present.count(p + ".pin")) {
+                continue;
+            }
             u.bytes = std::filesystem::file_size(p, fec);
             if (fec) {
                 continue;
