@@ -3343,6 +3343,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-idle-seconds"}, "N",
+        string_format("flush a slot's warm KV to the auto disk cache after N seconds of idleness, "
+                      "so a lone request survives a crash and is visible to peer instances without "
+                      "further traffic; requires --slot-save-auto (default: %d, -1 = disabled)", params.slot_save_idle_seconds),
+        [](common_params & params, int value) {
+            params.slot_save_idle_seconds = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
