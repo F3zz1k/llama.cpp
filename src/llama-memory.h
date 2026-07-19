@@ -124,6 +124,16 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // write only the cells whose position is in [p0, p1) (half-open); p0 < 0 => from the start,
+    // p1 < 0 => to the end (both < 0 => the whole sequence). The default writes the whole sequence,
+    // so a memory type that does not override this stays correct (just non-incremental). Bounded /
+    // recurrent state is always written whole. Override to serialise incremental attention deltas.
+    virtual void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const {
+        (void) p0;
+        (void) p1;
+        state_write(io, seq_id, flags);
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
