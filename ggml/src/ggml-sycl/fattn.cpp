@@ -19,6 +19,7 @@
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
+#include "fattn-tile-xmx.hpp"
 
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -98,12 +99,13 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_ONEDNN   = 150, // added enum for onednn==150
+    BEST_FATTN_KERNEL_XMX_Q    = 175, // native-q8 DPAS (XMX) FA; sibling of oneDNN, env-gated
     BEST_FATTN_KERNEL_TILE     = 200,
 };
 
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
 #ifndef SYCL_FLASH_ATTN
+    GGML_UNUSED(device);   // used by the XMX-Q predicate below; only unused in the no-FA build
     GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
 #endif// SYCL_FLASH_ATTN
@@ -197,6 +199,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
+    // Native-q8 DPAS (XMX) FA: keeps q8_0 KV in VRAM (no ~17 GiB f16 transient). Env-gated
+    // (GGML_SYCL_FA_XMX_Q, default off) and additive -- oneDNN above already declines q8_0 KV,
+    // so this only ever claims the q8_0 / D=128 / prefill case. Any miss falls through to VEC/TILE.
+    if (ggml_sycl_flash_attn_ext_xmx_q_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMX_Q;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
@@ -225,6 +234,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 #if GGML_SYCL_DNNL
             ggml_sycl_flash_attn_ext_onednn(ctx, dst);
 #endif
+            break;
+        case BEST_FATTN_KERNEL_XMX_Q:
+            ggml_sycl_flash_attn_ext_tile_xmx(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
