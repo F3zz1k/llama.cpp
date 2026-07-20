@@ -891,6 +891,10 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Do not clear the destination sequence before loading; append the loaded cells to the existing
+// sequence. Used to compose a base snapshot with incremental deltas loaded in position order.
+#define LLAMA_STATE_SEQ_FLAGS_NO_CLEAR 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -911,6 +915,31 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Save only the cells whose position is in [p0, p1) of the sequence (half-open range).
+    // p0 < 0 means from the start; p1 < 0 means to the end (both < 0 saves the whole sequence).
+    // Bounded state (recurrent / sliding-window) is always written whole regardless of the range.
+    // The resulting file has the same format as llama_state_seq_save_file and is loadable by
+    // llama_state_seq_load_file[_ext]; compose a base + deltas by loading them in position order
+    // with LLAMA_STATE_SEQ_FLAGS_NO_CLEAR.
+    LLAMA_API size_t llama_state_seq_save_file_range(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
+    // Like llama_state_seq_load_file but takes state-seq flags (e.g. NO_CLEAR to append a delta).
+    LLAMA_API size_t llama_state_seq_load_file_ext(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out);
 
     //
     // Decoding

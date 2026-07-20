@@ -264,12 +264,25 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
     kv_swa->state_write(io, seq_id, flags);
 }
 
+void llama_kv_cache_iswa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        // global (full-attention) layers are append-only: write only the [p0, p1) delta
+        kv_base->state_write_range(io, seq_id, p0, p1, flags);
+    }
+
+    // sliding-window layers keep only the last W positions (a bounded, sliding buffer), so write the
+    // whole current window like a recurrent state - a [p0, p1) delta would miss window cells before p0.
+    kv_swa->state_write(io, seq_id, flags);
+}
+
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         kv_base->state_read(io, seq_id, flags);
     }
 
-    kv_swa->state_read(io, seq_id, flags);
+    // the sliding-window layers hold only the last W positions and are written whole at each node, so the
+    // tip node's window must overwrite (never compose) - mask NO_CLEAR off so kv_swa always clears first.
+    kv_swa->state_read(io, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_NO_CLEAR);
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {

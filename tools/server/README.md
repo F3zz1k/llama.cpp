@@ -216,6 +216,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--slot-save-auto` | automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_AUTO) |
 | `--slot-save-block N` | token-ID hash block size for the auto disk cache index; reuse granularity is one block (default: 256)<br/>(env: LLAMA_ARG_SLOT_SAVE_BLOCK) |
 | `--slot-save-idle-seconds N` | flush a slot's warm KV to the auto disk cache after N seconds of idleness, so a lone request survives a crash and is visible to peer instances without further traffic; requires --slot-save-auto (default: 60, -1 = disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS) |
+| `--slot-save-incremental` | for the auto disk cache, save only the KV delta added since the last checkpoint instead of a complete snapshot each time (much less disk/PCIe write for a growing conversation); hybrid/SWA models still write their recurrent/sliding-window state whole. Requires --slot-save-auto (default: complete snapshots)<br/>(env: LLAMA_ARG_SLOT_SAVE_INCREMENTAL) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1175,6 +1176,34 @@ Restoring a media snapshot rebuilds its media chunks from the `.meta` sidecar sa
     "n_erased": 1745
 }
 ```
+
+### Auto disk prompt cache (`--slot-save-auto`)
+
+The three endpoints above save and restore a slot on demand. `--slot-save-auto` turns
+`--slot-save-path` into a transparent, self-managing disk prompt cache instead: the server
+automatically persists each slot's warm KV (on slot reclaim, after `--slot-save-idle-seconds` of
+idleness, and on graceful shutdown) and automatically restores the deepest matching prefix on a
+later request — across restarts and across peer instances sharing the directory. Snapshots are
+keyed by a rolling block hash of the prompt's token ids (`--slot-save-block`), guarded by a model
+fingerprint so a snapshot is never reused under a different model/geometry, and bounded by
+`--slot-save-max-count` / `--slot-save-max-mb` (least-recently-used eviction, scoped to the auto
+cache — plain `--slot-save-path` never deletes files). Each snapshot is a three-file unit published
+atomically: `<state>.bin` (the KV blob), an optional `<state>.bin.logits` sidecar, and a
+`<state>.bin.meta` sidecar carrying the token ids and fingerprint.
+
+`--slot-save-incremental` changes only how a *continuation* of an already-saved prompt is written.
+Without it, every turn re-saves the whole KV blob, so the prefix already on disk is re-copied off
+the device and rewritten each turn — expensive for a long, growing conversation. With it, a
+continuation is written as a **delta node** that stores only the KV cells appended since its
+parent snapshot, plus a small pointer to that parent; the shared prefix is written once and reused
+by every continuation and fork. Hybrid (recurrent) and sliding-window (SWA) models still write
+their bounded recurrent/window state whole in each node — only the unbounded, append-only
+full-attention prefix is delta'd. On restore the server walks the parent chain and loads the base
+plus each delta in position order to reconstruct the full prefix; the reconstructed continuation is
+token-identical to an uncached run. The first (parentless) save of a lineage stays a whole
+snapshot, and a context shift (which rewrites already-saved token positions) transparently rebases
+to a fresh whole snapshot. `--slot-save-incremental` requires `--slot-save-auto`. The on-disk
+format is documented in [`docs/kv-cache/incremental-disk-cache.md`](../../docs/kv-cache/incremental-disk-cache.md).
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

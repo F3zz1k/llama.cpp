@@ -29,6 +29,7 @@
 #include <exception>
 #include <fstream>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -313,7 +314,85 @@ struct slot_save_unit {
     std::string meta_path;    // "<state>.meta",   "" if none (auto disk cache)
     uintmax_t   bytes = 0;
     std::filesystem::file_time_type mtime;
+    // Tree-aware eviction (U5): a checkpoint node's identity, derived entirely from disk. A node is
+    // identified by the PAIR (`node_id`, `n_tokens`) — both parsed from the auto filename
+    // "auto-<fp>-<chain_hash>-<n_tokens>.bin": `node_id` is the middle-hex chain-hash and `n_tokens` is
+    // the trailing token count. This pair is what a child delta's parent link (`parent_id`, `range_lo`)
+    // resolves to — exactly the pair U4 restore feeds to auto_state_filename(parent_id, range_lo). Keying
+    // on the pair (not chain_hash alone) is essential: a continuation that does NOT cross a whole-block
+    // boundary shares its parent's chain-hash, so node_id ALONE would make the child collide with — and
+    // even self-reference — its parent. `node_id`/`n_tokens` are 0 for any file that is not an auto-*
+    // snapshot. `parent_id`/`range_lo`/`range_hi` come from the .meta (a v3 delta has parent_id != 0; a v1
+    // whole snapshot or a foreign/manual file is a parentless root). When every file is a v1 root the tree
+    // logic collapses to flat mtime LRU.
+    uint64_t    node_id   = 0;
+    uint32_t    n_tokens  = 0;
+    uint64_t    parent_id = 0;
+    uint32_t    range_lo  = 0;
+    uint32_t    range_hi  = 0;
+    bool        is_node   = false; // true => v3 delta node (parent_id != 0)
+    // PINNED (a sibling "<state>.pin" marker): never evicted and excluded from the count/byte caps,
+    // BUT still carried in the unit set so it counts as a live child of its parent — a pinned delta
+    // node's whole ancestor chain (each of which then has a live child) is protected from eviction,
+    // and its own .pin is never deleted. A pinned v1 root has no parent/children, so it behaves
+    // exactly as before: reserved, uncounted, unevictable.
+    bool        pinned    = false;
 };
+
+// Read only the delta-node section of a state file's .meta (parent_id + [range_lo, range_hi)). Thin
+// wrapper over slot_meta_read (defined further down, after model_fp) so slot_save_enforce_limits — which
+// lives above the fingerprint/meta machinery — can resolve the checkpoint tree without pulling model_fp
+// into scope. Returns false (and leaves the outputs as a parentless root) for a v1/foreign/absent meta.
+static bool slot_node_meta_probe(const std::string & state_filepath,
+                                 uint64_t & parent_id, uint32_t & range_lo, uint32_t & range_hi);
+
+// Parse a node's identity PAIR (chain_hash, n_tokens) from an auto-cache state filename
+// ("auto-<fp_model>-<chain_hash>-<n_tokens>.bin"): the middle 16-hex group is the chain-hash a child
+// delta stores as its parent_id, and the trailing decimal group is the token count a child delta stores
+// as its parent link's range_lo. The pair is the node's unique key on disk. Returns false (and leaves
+// both outputs 0) for any name that is not an auto snapshot — a foreign/manual file is then treated as
+// its own parentless root and always ages by plain mtime. n_tokens is clamped to uint32_t; the save side
+// bounds token counts far below 2^32 (slot_meta_read rejects tok_count > 2^28).
+static bool slot_save_parse_node_id(const std::string & state_path, uint64_t & node_id, uint32_t & n_tokens) {
+    node_id  = 0;
+    n_tokens = 0;
+    const size_t slash = state_path.find_last_of("/\\");
+    const std::string name = (slash == std::string::npos) ? state_path : state_path.substr(slash + 1);
+    // layout: "auto-" (5) + 16 hex fp + "-" + 16 hex chain_hash + "-" + digits + ".bin"
+    static const char pfx[] = "auto-";
+    const size_t pfx_len = 5, hex_len = 16;
+    if (name.size() < pfx_len + hex_len + 1 + hex_len + 1 ||
+        name.compare(0, pfx_len, pfx) != 0 ||
+        name[pfx_len + hex_len] != '-' ||
+        name[pfx_len + hex_len + 1 + hex_len] != '-') {
+        return false;
+    }
+    uint64_t id = 0;
+    for (size_t k = pfx_len + hex_len + 1; k < pfx_len + hex_len + 1 + hex_len; ++k) {
+        const char c = name[k];
+        uint64_t d;
+        if      (c >= '0' && c <= '9') { d = (uint64_t) (c - '0'); }
+        else if (c >= 'a' && c <= 'f') { d = (uint64_t) (c - 'a' + 10); }
+        else if (c >= 'A' && c <= 'F') { d = (uint64_t) (c - 'A' + 10); }
+        else { return false; }
+        id = (id << 4) | d;
+    }
+    // trailing decimal token count, terminated by '.' (the ".bin" extension). At least one digit.
+    size_t k = pfx_len + hex_len + 1 + hex_len + 1;
+    if (k >= name.size() || name[k] < '0' || name[k] > '9') {
+        return false;
+    }
+    uint64_t nt = 0;
+    for (; k < name.size() && name[k] >= '0' && name[k] <= '9'; ++k) {
+        nt = nt * 10 + (uint64_t) (name[k] - '0');
+        if (nt > 0xffffffffull) {
+            return false; // token count out of range for a real snapshot
+        }
+    }
+    node_id  = id;
+    n_tokens = (uint32_t) nt;
+    return true;
+}
 
 // Enforce --slot-save-max-count / --slot-save-max-bytes over `dir` using LRU-by-mtime eviction.
 // `just_written` is the state path that was just saved: it is never evicted, but if it ALONE
@@ -417,9 +496,11 @@ static void slot_save_enforce_limits(const std::string & dir,
             // doc / system-prompt prefix) that coexists with the normal LRU pool. Pin with
             // `touch <snapshot>.pin`; unpin by removing it. The index/restore path is unchanged:
             // a pinned snapshot is a normal auto-*.bin, still discovered and restored like any other.
-            if (present.count(p + ".pin")) {
-                continue;
-            }
+            // We DON'T skip it here (as the flat-LRU version did): it is carried into the unit set so
+            // the tree refcount below counts it as a live child of its parent, which protects a pinned
+            // v3 delta node's whole ancestor chain from eviction (a base whose only child is pinned
+            // must not be reaped). It is then excluded from the caps and never picked for eviction.
+            u.pinned = (present.count(p + ".pin") > 0);
             u.bytes = std::filesystem::file_size(p, fec);
             if (fec) {
                 continue;
@@ -444,6 +525,14 @@ static void slot_save_enforce_limits(const std::string & dir,
             if (fec) {
                 continue;
             }
+
+            // Tree identity for U5 eviction: the node's own key (chain_hash, n_tokens) from the filename,
+            // its parent link + range from the .meta. A file with no delta meta (v1 whole snapshot or a
+            // foreign file) stays a parentless root (parent_id 0), so the eviction below reduces to today's
+            // flat mtime LRU for it.
+            slot_save_parse_node_id(p, u.node_id, u.n_tokens);
+            slot_node_meta_probe(p, u.parent_id, u.range_lo, u.range_hi);
+            u.is_node = (u.parent_id != 0);
 
             if (p == just_written) {
                 this_unit_bytes = u.bytes;
@@ -473,24 +562,22 @@ static void slot_save_enforce_limits(const std::string & dir,
         return;
     }
 
-    std::sort(units.begin(), units.end(),
-              [](const slot_save_unit & a, const slot_save_unit & b) { return a.mtime < b.mtime; }); // oldest first
+    // ---- Tree-aware eviction (U5) --------------------------------------------------------------------
+    // The auto cache is a FOREST of checkpoint trees, reconstructed here purely from what is on disk (no
+    // in-RAM tree map). A v1 whole snapshot — or any foreign/manual file — is a parentless root; a v3
+    // delta node points at the parent whose KV prefix it extends (parent_id == the parent file's
+    // chain-hash == its filename's middle hex). Two rules make eviction tree-correct:
+    //   (a) NEVER evict a node that still has a child on disk — its delta .bin is meaningless without its
+    //       base — so we only ever evict LEAVES (child_count[node_id] == 0), oldest leaf first, which
+    //       peels a lineage tip-to-root.
+    //   (b) Age whole TREES by their most-recent node (tree_recency = MAX mtime in the tree) so a hot
+    //       lineage keeps its cold shared base; the least-recently-used tree is drained before a warmer
+    //       one is touched.
+    // When every file is a v1 root (child_count all zero, each its own tree), tree_recency[root] == the
+    // file's own mtime and every file is a leaf, so this reduces EXACTLY to today's flat mtime LRU
+    // (golden-safe for the incremental-OFF path). Recomputed from disk each pass => cross-process correct.
 
-    size_t    count = units.size();
-    uintmax_t total = 0;
-    for (const auto & u : units) {
-        total += u.bytes;
-    }
-    size_t idx = 0;
-
-    auto evict_oldest = [&]() -> bool {
-        while (idx < units.size() && units[idx].state_path == just_written) {
-            idx++; // never evict the snapshot we just wrote
-        }
-        if (idx >= units.size()) {
-            return false;
-        }
-        const auto & u = units[idx];
+    auto remove_unit_files = [&](const slot_save_unit & u) {
         std::filesystem::remove(u.state_path, ec);
         if (!u.sidecar_path.empty()) {
             std::filesystem::remove(u.sidecar_path, ec);
@@ -498,22 +585,173 @@ static void slot_save_enforce_limits(const std::string & dir,
         if (!u.meta_path.empty()) {
             std::filesystem::remove(u.meta_path, ec);
         }
-        total -= std::min(total, (uintmax_t) u.bytes);
+    };
+
+    // A node's on-disk identity is the PAIR (chain_hash, n_tokens): a continuation that does not cross a
+    // whole-block boundary shares its parent's chain_hash, so chain_hash ALONE would make the child
+    // collide with — indeed parent_id == node_id, self-reference — its parent, pinning the true tip as
+    // unevictable and defeating the caps. n_tokens (from the filename) disambiguates. The parent link is
+    // the pair (parent_id, range_lo) — exactly the pair U4 restore feeds to auto_state_filename.
+    using node_key = std::pair<uint64_t, uint32_t>; // (chain_hash, n_tokens)
+    const auto self_key   = [](const slot_save_unit & u) -> node_key { return { u.node_id,   u.n_tokens }; };
+    const auto parent_key = [](const slot_save_unit & u) -> node_key { return { u.parent_id, u.range_lo  }; };
+
+    // (chain_hash, n_tokens) -> index, for parent-link resolution. Auto filenames are unique per pair; a
+    // non-auto file has node_id 0 and is never a parent target.
+    std::map<node_key, size_t> node_by_key;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (units[i].node_id != 0) {
+            node_by_key[self_key(units[i])] = i;
+        }
+    }
+
+    std::vector<char> alive(units.size(), 1);
+
+    // Reap orphan deltas up front: a delta node whose base file is gone can never be restored (a base-less
+    // delta .bin would corrupt a compose-load), so it is dead weight — delete it regardless of the caps.
+    // Evicting one orphan can orphan its own children, so iterate to a fixed point. just_written is never
+    // touched (a freshly saved node had its parent verified present at save time).
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t i = 0; i < units.size(); ++i) {
+            // never reap a pinned node's files (its .pin is authoritative "keep"); it stays alive so
+            // its own children are not treated as orphaned either.
+            if (!alive[i] || units[i].parent_id == 0 || units[i].pinned ||
+                units[i].state_path == just_written) {
+                continue;
+            }
+            const auto it = node_by_key.find(parent_key(units[i]));
+            if (it == node_by_key.end() || !alive[it->second]) {
+                remove_unit_files(units[i]);
+                alive[i] = 0;
+                if (units[i].node_id != 0) {
+                    const auto self = node_by_key.find(self_key(units[i]));
+                    if (self != node_by_key.end() && self->second == i) {
+                        node_by_key.erase(self);
+                    }
+                }
+                changed = true;
+            }
+        }
+    }
+
+    // child_count[(chain_hash, n_tokens)] = live children of that node (a node is a LEAF iff
+    // child_count[self_key] == 0).
+    std::map<node_key, size_t> child_count;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (alive[i] && units[i].parent_id != 0) {
+            child_count[parent_key(units[i])]++;
+        }
+    }
+
+    // Root index per node (walk parent links to a parentless node) + tree_recency = MAX mtime over each
+    // tree. root_of[i] is always an alive index; a bounded hop count guards a corrupt cycle.
+    std::vector<size_t> root_of(units.size(), 0);
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (!alive[i]) {
+            continue;
+        }
+        size_t cur = i;
+        for (size_t hops = 0; hops <= units.size(); ++hops) {
+            if (units[cur].parent_id == 0) {
+                break; // parentless => this is the root
+            }
+            const auto it = node_by_key.find(parent_key(units[cur]));
+            if (it == node_by_key.end() || !alive[it->second] || it->second == cur) {
+                break; // post-reap this should not happen; treat cur as the root defensively
+            }
+            cur = it->second;
+        }
+        root_of[i] = cur;
+    }
+
+    std::unordered_map<size_t, std::filesystem::file_time_type> tree_recency;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (!alive[i]) {
+            continue;
+        }
+        const size_t r = root_of[i];
+        const auto it = tree_recency.find(r);
+        if (it == tree_recency.end() || it->second < units[i].mtime) {
+            tree_recency[r] = units[i].mtime;
+        }
+    }
+
+    // Pinned units are excluded from the caps entirely — they occupy the tree only so their ancestors
+    // stay refcount-protected — matching the flat-LRU pin semantics (a pinned unit was uncounted there).
+    size_t    count = 0;
+    uintmax_t total = 0;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (alive[i] && !units[i].pinned) {
+            count++;
+            total += units[i].bytes;
+        }
+    }
+
+    // Pick the evictable leaf with the smallest (tree_recency[root], mtime): the oldest tip of the
+    // least-recently-used tree. Returns units.size() when nothing is evictable (every remaining node has
+    // a live child, or all that is left is just_written).
+    auto pick_leaf = [&]() -> size_t {
+        size_t best = units.size();
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (!alive[i] || units[i].pinned || units[i].state_path == just_written) {
+                continue; // pinned units are never evicted
+            }
+            if (units[i].node_id != 0) {
+                const auto cc = child_count.find(self_key(units[i]));
+                if (cc != child_count.end() && cc->second > 0) {
+                    continue; // not a leaf: a delta still depends on it
+                }
+            }
+            if (best == units.size()) {
+                best = i;
+                continue;
+            }
+            const auto & ur = tree_recency[root_of[i]];
+            const auto & br = tree_recency[root_of[best]];
+            bool better;
+            if      (ur < br) { better = true; }
+            else if (br < ur) { better = false; }
+            else              { better = (units[i].mtime < units[best].mtime); }
+            if (better) {
+                best = i;
+            }
+        }
+        return best;
+    };
+
+    auto evict_leaf = [&]() -> bool {
+        const size_t i = pick_leaf();
+        if (i == units.size()) {
+            return false;
+        }
+        remove_unit_files(units[i]);
+        alive[i] = 0;
+        total -= std::min(total, (uintmax_t) units[i].bytes);
         count = (count > 0) ? count - 1 : 0;
-        idx++;
+        if (units[i].parent_id != 0) { // evicting a leaf may expose its parent as a new leaf
+            const auto it = child_count.find(parent_key(units[i]));
+            if (it != child_count.end() && it->second > 0) {
+                it->second--;
+            }
+        }
         return true;
     };
 
     if (max_count > 0) {
         while (count > (size_t) max_count) {
-            if (!evict_oldest()) {
+            if (!evict_leaf()) {
+                SRV_WRN("%s", "slot-save cache is over --slot-save-max-count but every remaining snapshot "
+                              "has a live child delta; leaving it above the limit\n");
                 break;
             }
         }
     }
     if (max_bytes > 0) {
         while (total > (uintmax_t) max_bytes) {
-            if (!evict_oldest()) {
+            if (!evict_leaf()) {
+                SRV_WRN("%s", "slot-save cache is over --slot-save-max-bytes but every remaining snapshot "
+                              "has a live child delta; leaving it above the limit\n");
                 break;
             }
         }
@@ -546,9 +784,9 @@ static void slot_save_enforce_limits(const std::string & dir,
 // in-memory prefix-reuse path; auto-restore fires only when in-memory reuse is poor.
 // ---------------------------------------------------------------------------
 
-// The .meta sidecar format layer (model_fp, SLOT_META_* constants, slot_meta_write/
-// slot_meta_read) and the block chain hashing layer (auto_hash_mix/auto_block_hashes
-// — index keys and filenames, media-aware) live in server-common.{h,cpp} so the
+// The .meta sidecar format layer (model_fp, SLOT_META_* constants incl. the v3 delta-node
+// version, slot_meta_write/slot_meta_read) and the block chain hashing layer (auto_hash_mix/
+// auto_block_hashes — index keys and filenames, media-aware) live in server-common.{h,cpp} so the
 // parser of untrusted on-disk bytes and the hash algorithm link into standalone
 // unit tests (tests/test-slot-meta.cpp, tests/test-auto-hash.cpp). Everything
 // below is the cache logic proper and stays private to this translation unit.
@@ -664,7 +902,12 @@ struct auto_cache_entry {
 // restart (no inotify/no background thread; one stat per gated check).
 struct auto_cache_index {
     std::mutex mtx;
-    std::unordered_map<uint64_t, auto_cache_entry> by_boundary;
+    // boundary-hash -> snapshots reaching that prefix length, longest first. Kept multi-valued so a
+    // longer (superset) snapshot never shadows a shorter exact-length one: a FULL/recurrent/hybrid/SWA
+    // model can only restore a snapshot that is a WHOLE prefix of the request, so when the request ends
+    // before the longer snapshot the shorter one is the ONLY usable candidate (auto_index_lookup picks
+    // model-appropriately). Incremental saving makes overlapping supersets the common case.
+    std::unordered_map<uint64_t, std::vector<auto_cache_entry>> by_boundary;
     std::unordered_set<std::string> indexed_files;    // state paths already scanned (incremental refresh)
     // state paths whose .meta failed to parse (corrupt, torn, or a version this binary does not
     // know). Units are immutable once atomically renamed, so a rejected file can never become
@@ -682,6 +925,31 @@ struct auto_cache_index {
 // path (a forced refresh on a lookup miss bypasses it). Sub-second so a peer's new snapshot is
 // visible within ~1 prefill of being written — effectively immediate from the user's view.
 static constexpr int AUTO_REFRESH_MIN_MS = 1000;
+
+// Multi-candidate index bounds. A boundary may be reached by several snapshots of different lengths
+// (incremental saving makes every save a superset of the previous). They are kept longest-first so a
+// longer snapshot never shadows a shorter exact-length one that a FULL model needs; the per-boundary
+// list is capped (dropping the shortest), and a lookup returns at most a few candidates for the caller
+// to try in order.
+static constexpr size_t AUTO_MAX_CANDIDATES_PER_BOUNDARY = 32;
+static constexpr size_t AUTO_MAX_RESTORE_ATTEMPTS        = 4;
+
+// Forward-declared above slot_save_enforce_limits: expose only the delta-node fields so eviction can
+// resolve the tree without model_fp in scope. Leaves the outputs as a parentless root ([0,0) with no
+// parent) for a v1/v2 whole snapshot, a foreign file, or any read failure (invariant 4 — never crash).
+// cur_fp_mmproj is irrelevant to the node fields (it only backfills a text-only fp_mmproj), so 0 is
+// passed; a throwaway media_out absorbs any v2 records.
+static bool slot_node_meta_probe(const std::string & state_filepath,
+                                 uint64_t & parent_id, uint32_t & range_lo, uint32_t & range_hi) {
+    parent_id = 0;
+    range_lo  = 0;
+    range_hi  = 0;
+    model_fp     fp;
+    llama_tokens toks;
+    std::vector<server_media_record> media;
+    return slot_meta_read(state_filepath, /*cur_fp_mmproj=*/0, fp, toks, media,
+                          &parent_id, &range_lo, &range_hi);
+}
 
 struct server_slot {
     int id;
@@ -1635,11 +1903,26 @@ private:
         return params_base.slot_save_path + std::string(buf);
     }
 
-    // Insert/keep-longer: an entry replaces an existing boundary only if it covers a longer prefix.
+    // Insert a snapshot at a boundary it reaches. Multiple snapshots are RETAINED per boundary
+    // (longest first, deduped by length) so a longer superset does NOT shadow a shorter exact-length
+    // snapshot — the shorter one is the only candidate a FULL model can restore when the request ends
+    // before the longer one (see auto_index_lookup). The list is capped; the shortest is dropped first
+    // (deep-context snapshots cost the most to lose and reconstruct).
     void auto_index_insert_locked(uint64_t boundary, const auto_cache_entry & e) {
-        auto it = auto_idx.by_boundary.find(boundary);
-        if (it == auto_idx.by_boundary.end() || it->second.n_tokens < e.n_tokens) {
-            auto_idx.by_boundary[boundary] = e;
+        auto & v = auto_idx.by_boundary[boundary];
+        for (auto & c : v) {
+            if (c.n_tokens == e.n_tokens) {
+                c.state_path = e.state_path; // same length/prefix: keep the newest file for this length
+                c.fp         = e.fp;
+                return;
+            }
+        }
+        // keep the vector sorted by descending n_tokens
+        auto pos = std::lower_bound(v.begin(), v.end(), e,
+            [](const auto_cache_entry & a, const auto_cache_entry & b) { return a.n_tokens > b.n_tokens; });
+        v.insert(pos, e);
+        if (v.size() > AUTO_MAX_CANDIDATES_PER_BOUNDARY) {
+            v.pop_back(); // over the cap: drop the shortest
         }
     }
 
@@ -1752,13 +2035,20 @@ private:
         auto_index_drop_missing_locked();
     }
 
-    // Longest-prefix lookup over the request's cell-aligned tokens. Returns the candidate whose
-    // boundary hash is the DEEPEST match with a fingerprint equal to the live one. Verification
-    // (byte-compare of the candidate's persisted cells + per-record media identity) is mandatory
-    // and done by the caller (invariant 2). O(#blocks).
-    std::optional<auto_cache_entry> auto_index_lookup(const server_tokens & req) {
+    // Longest-prefix lookup over the request's cell-aligned tokens. Returns candidate snapshots to
+    // try, BEST FIRST (deepest boundary first; within a boundary, longest first). For a
+    // FULL/recurrent/hybrid/SWA model, snapshots longer than the request are filtered out here — the
+    // whole snapshot must be a prefix of the request, so a longer one can never restore; PART models
+    // can rewind so all lengths are kept. The caller tries each in order until one restores (each
+    // rejected candidate costs only a small .meta read + byte-compare; the multi-GB state loads only
+    // once a candidate passes its gates) — this fall-through is what stops a longer superset from
+    // shadowing a shorter usable one at the same boundary. Verification (byte-compare of the
+    // candidate's persisted cells + per-record media identity) is mandatory and done by the caller
+    // (invariant 2). O(#blocks).
+    std::vector<auto_cache_entry> auto_index_lookup(const server_tokens & req) {
+        std::vector<auto_cache_entry> out;
         if (!auto_cache_enabled()) {
-            return std::nullopt; // off by default
+            return out; // off by default
         }
         // request-side identity records (empty for a text-only request, whose chain is then
         // bit-identical to the pre-media one). An identity-less chunk (e.g. a placeholder
@@ -1769,8 +2059,9 @@ private:
             media = req.extract_media_records();
         } catch (const std::exception & e) {
             SRV_WRN("auto-restore: lookup refused, %s\n", e.what());
-            return std::nullopt;
+            return out;
         }
+        const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
         const auto bhs = auto_block_hashes(req.get_cell_tokens(), media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -1781,21 +2072,37 @@ private:
         // window) is still found on this first request rather than only the next one.
         auto_index_refresh_locked(/*force=*/false);
         for (int attempt = 0; attempt < 2; ++attempt) {
+            out.clear();
+            std::unordered_set<std::string> seen;
             for (size_t k = bhs.size(); k-- > 0; ) { // longest boundary first
                 auto it = auto_idx.by_boundary.find(bhs[k]);
                 if (it == auto_idx.by_boundary.end()) {
                     continue;
                 }
-                if (!(it->second.fp == cur_fp)) {
-                    continue; // invariant 3
+                for (const auto_cache_entry & c : it->second) { // longest first within the boundary
+                    if (!(c.fp == cur_fp)) {
+                        continue; // invariant 3
+                    }
+                    if (full && c.n_tokens > req.size()) {
+                        continue; // a FULL snapshot longer than the request is never a whole prefix
+                    }
+                    if (!seen.insert(c.state_path).second) {
+                        continue; // the same snapshot reaches several boundaries
+                    }
+                    out.push_back(c);
+                    if (out.size() >= AUTO_MAX_RESTORE_ATTEMPTS) {
+                        return out;
+                    }
                 }
-                return it->second;
+            }
+            if (!out.empty()) {
+                return out;
             }
             if (attempt == 0) {
                 auto_index_refresh_locked(/*force=*/true); // miss -> rescan once before giving up
             }
         }
-        return std::nullopt;
+        return out;
     }
 
     // After an LRU eviction (which deletes files silently — ours OR a peer process's), drop index
@@ -1806,9 +2113,17 @@ private:
     void auto_index_drop_missing_locked() {
         std::unordered_set<std::string> gone;
         for (auto it = auto_idx.by_boundary.begin(); it != auto_idx.by_boundary.end(); ) {
-            std::error_code ec;
-            if (!std::filesystem::exists(it->second.state_path, ec) || ec) {
-                gone.insert(it->second.state_path);
+            auto & vec = it->second;
+            for (auto vit = vec.begin(); vit != vec.end(); ) {
+                std::error_code ec;
+                if (!std::filesystem::exists(vit->state_path, ec) || ec) {
+                    gone.insert(vit->state_path);
+                    vit = vec.erase(vit);
+                } else {
+                    ++vit;
+                }
+            }
+            if (vec.empty()) {
                 it = auto_idx.by_boundary.erase(it);
             } else {
                 ++it;
@@ -1838,19 +2153,38 @@ private:
     // success (slot.prompt.tokens / n_past-equivalent + just_restored + restored_logits are set as
     // for a manual restore). On ANY failure (load <=0, capacity exceeded) the slot seq is left
     // cleared and false is returned so the caller falls through to a normal prefill (invariant 4).
-    bool do_slot_restore(server_slot & slot, const std::string & filepath,
+    bool do_slot_restore(server_slot & slot, const std::vector<std::string> & node_paths,
                          size_t * out_token_count = nullptr, size_t * out_nread = nullptr) {
+        if (node_paths.empty()) {
+            slot.prompt.tokens.clear();
+            if (out_nread)       { *out_nread = 0; }
+            if (out_token_count) { *out_token_count = 0; }
+            return false;
+        }
+        // Load the chain in position order: node [0] clears the destination seq (a whole base/root
+        // snapshot), nodes [1..] append their delta cells with NO_CLEAR so base + deltas compose.
+        // A 1-element chain is exactly the previous single clearing load — byte-for-byte the same.
         llama_tokens tokens;
         tokens.resize(slot.n_ctx);
         size_t token_count = 0;
-        const size_t nread = llama_state_seq_load_file(
-            ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
-        if (out_nread)       { *out_nread = nread; }
-        if (out_token_count) { *out_token_count = token_count; }
-        if (nread == 0) {
-            slot.prompt.tokens.clear(); // KV may already have been invalidated by the partial load
-            return false;
+        size_t total_nread = 0;
+        for (size_t i = 0; i < node_paths.size(); ++i) {
+            const llama_state_seq_flags flags = (i == 0) ? 0 : LLAMA_STATE_SEQ_FLAGS_NO_CLEAR;
+            size_t node_token_count = 0;
+            const size_t nread = llama_state_seq_load_file_ext(
+                ctx_tgt, node_paths[i].c_str(), slot.id, flags,
+                tokens.data(), tokens.size(), &node_token_count);
+            if (nread == 0) {
+                slot.prompt.tokens.clear(); // KV may already have been invalidated by the partial load
+                if (out_nread)       { *out_nread = total_nread; }
+                if (out_token_count) { *out_token_count = 0; }
+                return false;
+            }
+            total_nread += nread;
+            token_count = node_token_count; // the tip (last) node header carries the full [0, hi) list
         }
+        if (out_nread)       { *out_nread = total_nread; }
+        if (out_token_count) { *out_token_count = token_count; }
         tokens.resize(token_count);
         slot.prompt.tokens.clear();
         slot.prompt.tokens.insert(tokens);
@@ -1878,7 +2212,7 @@ private:
         slot.restored_logits.clear();
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-            if (slot_logits_read(filepath, nv, (uint32_t) token_count, slot.restored_logits)) {
+            if (slot_logits_read(node_paths.back(), nv, (uint32_t) token_count, slot.restored_logits)) {
                 SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
             }
         }
@@ -1987,7 +2321,11 @@ private:
         model_fp disk_fp;
         llama_tokens disk_toks;
         std::vector<server_media_record> disk_media;
-        if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
+        uint64_t disk_parent_id = 0;
+        uint32_t disk_range_lo  = 0;
+        uint32_t disk_range_hi  = 0;
+        if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media,
+                            &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
             return 0; // invariant 4
         }
         if (!(disk_fp == cur_fp)) {
@@ -2053,6 +2391,9 @@ private:
             // would have to partially unwind. (No block-boundary clamp for FULL: only the exact whole
             // snapshot is a legal restore length here.)
             if (v != disk_toks.size()) {
+                SLT_DBG(slot, "auto-restore: FULL snapshot is not a whole prefix of the request "
+                              "(verified %zu of %zu snapshot tokens; request %zu) — skipping %s\n",
+                        v, disk_toks.size(), req.size(), cand.state_path.c_str());
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
@@ -2081,13 +2422,74 @@ private:
         if (n_keep_disk < n_keep_mem + B) {
             return 0;
         }
+        // Build the root->tip chain of node .bin paths (the tree is DERIVED FROM DISK — no in-RAM
+        // map). A v1 whole snapshot is its own root: a single-element chain == the previous single
+        // clearing load. A v3 delta only stores its tail cells, so walk parent links to the root and
+        // load base + deltas in position order (NO_CLEAR) to recompose the full prefix. Do this
+        // BEFORE touching the slot so any inconsistency (missing/corrupt/non-contiguous node) simply
+        // returns 0 for a cold prefill, never disturbing the resident KV (invariant 4).
+        std::vector<std::string> chain;
+        chain.push_back(cand.state_path);
+        if (disk_parent_id != 0 || disk_range_lo != 0) {
+            uint64_t cur_parent_id = disk_parent_id;
+            uint32_t cur_range_lo  = disk_range_lo;
+            const size_t MAX_CHAIN_DEPTH = 4096; // bounded walk: a corrupt/looping link never hangs.
+            while (true) {
+                if (chain.size() > MAX_CHAIN_DEPTH) {
+                    return 0; // pathological depth -> cold prefill (invariant 4)
+                }
+                const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
+                model_fp     parent_fp;
+                llama_tokens parent_toks;
+                std::vector<server_media_record> parent_media;
+                uint64_t     parent_parent_id = 0;
+                uint32_t     parent_lo        = 0;
+                uint32_t     parent_hi        = 0;
+                if (!slot_meta_read(parent_path, cur_fp.fp_mmproj, parent_fp, parent_toks, parent_media,
+                                    &parent_parent_id, &parent_lo, &parent_hi)) {
+                    return 0; // parent meta missing/corrupt -> cold prefill
+                }
+                if (!(parent_fp == cur_fp)) {
+                    return 0; // fingerprint drift on the parent -> cold prefill
+                }
+                // contiguity: the parent must end exactly where its child begins.
+                if (parent_hi != cur_range_lo) {
+                    return 0;
+                }
+                // IDENTITY: hash + range-contiguity alone do NOT prove this .bin holds the request's
+                // actual prefix — a parent_id/n_tokens filename collision (two distinct prefixes of
+                // equal length whose block-boundary hash coincides) or a base rewritten for a
+                // different prefix could land on the same deterministic name and compose the WRONG KV
+                // for [0, parent_hi) under NO_CLEAR, silently. The tip's `disk_toks` is the
+                // authoritative full [0, range_hi) token record and is already byte-verified against
+                // the request (up to `v`), so byte-verify the parent's recorded tokens against that
+                // tip prefix. Comparing to `disk_toks` (not `req`) also keeps the legitimate PART
+                // mid-parent divergence case restorable: there the request diverges before parent_hi
+                // yet the trimmed restore stays valid, and parent_toks still equals disk_toks[0,hi).
+                if (parent_toks.size() != (size_t) parent_hi ||
+                    (size_t) parent_hi > disk_toks.size() ||
+                    !std::equal(parent_toks.begin(), parent_toks.end(), disk_toks.begin())) {
+                    return 0; // parent KV does not correspond to this prefix -> cold prefill
+                }
+                // the parent .bin must exist (meta is published last, but an orphan-reap can race).
+                { std::ifstream pf(parent_path, std::ios::binary); if (!pf) { return 0; } }
+                chain.push_back(parent_path);
+                if (parent_parent_id == 0 && parent_lo == 0) {
+                    break; // reached the root covering [0, hi)
+                }
+                cur_parent_id = parent_parent_id;
+                cur_range_lo  = parent_lo;
+            }
+            // chain is tip..root; reverse to root..tip (position order) for the compose load.
+            std::reverse(chain.begin(), chain.end());
+        }
         // Clear the slot's resident KV before loading the snapshot (mirror the restore-continue safe
         // fallback): seq removal + token/checkpoint clear so the restore writes into an empty seq.
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
         slot.prompt.tokens.clear();
         slot.prompt.checkpoints.clear();
 
-        if (!do_slot_restore(slot, cand.state_path)) {
+        if (!do_slot_restore(slot, chain)) {
             // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
             return 0;
         }
@@ -2155,10 +2557,13 @@ private:
         // rewind. For attention models the request may diverge inside the snapshot; keep_first(n_past)
         // + a PARTIAL seq_rm then reprefills the divergent tail (supported for PART). The verified
         // prefix is what we claim as reused.
-        // Bump the snapshot's mtime so the LRU treats a reused-but-not-rewritten base snapshot as
-        // recently-used (true LRU, not least-recently-written) — critical for the fan-out case where
-        // many requests restore one hot base prefix. Best-effort; never errors the restore (invariant 4).
-        auto_touch_unit(cand.state_path);
+        // Bump every node on the chain's mtime so the LRU treats a reused-but-not-rewritten base (and
+        // each shared delta) as recently-used (true LRU, not least-recently-written) — critical for
+        // the fan-out case where many requests restore one hot base prefix, and so eviction keeps the
+        // whole live chain warm. Best-effort; never errors the restore (invariant 4).
+        for (const std::string & node_path : chain) {
+            auto_touch_unit(node_path);
+        }
         SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory match was %d), file=%s\n",
                 n_keep_disk, n_keep_mem, cand.state_path.c_str());
         return n_keep_disk;
@@ -2246,8 +2651,69 @@ private:
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto it = auto_idx.by_boundary.find(full_hash);
-            if (it != auto_idx.by_boundary.end() && it->second.n_tokens >= toks.size()) {
-                return; // an equal-or-longer snapshot for this exact prefix already exists
+            if (it != auto_idx.by_boundary.end()) {
+                const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+                for (const auto_cache_entry & c : it->second) {
+                    // FULL: only an EXACT-length snapshot substitutes (a longer one is unusable, a
+                    // shorter one is a different resume point) — otherwise this incremental save would
+                    // be suppressed by a longer snapshot the model can never restore. PART: an
+                    // equal-or-longer snapshot already covers this prefix (it can rewind to it).
+                    if (full ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
+                        return; // a usable snapshot for this exact prefix already exists
+                    }
+                }
+            }
+        }
+
+        // INCREMENTAL SAVE (U3): when --slot-save-incremental, write only the KV cells added since the
+        // deepest already-saved snapshot on this branch (a v3 delta node) instead of re-D2H'ing and
+        // re-writing the whole prefix. Find the deepest candidate whose persisted tokens are a STRICT
+        // prefix of this prompt under the same fingerprint; the delta .bin then holds cells
+        // [parent_hi, N). auto_index_lookup returns candidates longest-first, so the first strict-prefix
+        // match is the deepest parent. Flag off (or no parent found) => the EXACT whole-save path below
+        // (v1, byte-identical). Everything after this (nonce temp, logits sidecar, temp+rename publish,
+        // index insert, LRU) is SHARED between both modes. INCREMENTAL IS TEXT-ONLY: a media slot never
+        // writes a v3 delta node (no media-delta), so guard on the per-request has_media() — a media
+        // prompt keeps the whole v2 save path below.
+        bool     have_parent = false;
+        uint64_t parent_id   = 0;
+        uint32_t parent_hi   = 0;
+        if (params_base.slot_save_incremental && !prompt_has_media) {
+            // text-only slot: cell tokens == `toks`, so look up against the live prompt (server_tokens).
+            for (const auto_cache_entry & cand : auto_index_lookup(slot.prompt.tokens)) {
+                model_fp     disk_fp;
+                llama_tokens disk_toks;
+                std::vector<server_media_record> disk_media;
+                if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
+                    continue; // unreadable meta -> not a usable parent (invariant 4)
+                }
+                if (!disk_media.empty()) {
+                    continue; // a media snapshot can never be a text delta's parent (invariant 4)
+                }
+                if (!(disk_fp == cur_fp)) {
+                    continue; // invariant 3
+                }
+                // STRICT prefix: disk_toks == toks[0:disk_toks.size()] AND disk_toks.size() < toks.size()
+                // (a delta must add at least one token; an equal/longer snapshot is not a parent here).
+                if (disk_toks.size() >= toks.size() ||
+                    !std::equal(disk_toks.begin(), disk_toks.end(), toks.begin())) {
+                    continue;
+                }
+                // parent_id = the parent node's chain_hash = the last whole-block boundary hash of its
+                // token prefix. Since disk_toks == toks[0:parent_hi], this reproduces the parent's own
+                // full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's file
+                // (the deterministic link U4's restore walk resolves). The parent cleared save_floor >=
+                // block, so its prefix has at least one boundary; guard defensively regardless.
+                const llama_tokens prefix(toks.begin(), toks.begin() + disk_toks.size());
+                const auto pbhs = auto_block_hashes(prefix, /*media=*/{}, params_base.slot_save_block,
+                                                    cur_fp.fp_model, cur_fp.fp_mmproj);
+                if (pbhs.empty()) {
+                    continue;
+                }
+                parent_hi   = (uint32_t) disk_toks.size();
+                parent_id   = pbhs.back();
+                have_parent = true;
+                break; // deepest (longest-first) strict-prefix parent
             }
         }
 
@@ -2286,8 +2752,12 @@ private:
         // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
         //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
         //    crash mid-write never leaves a corrupt state file the index would trust.
-        const size_t nwrite = llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id,
-                                                        toks.data(), toks.size());
+        //    When a parent was found (incremental mode), write a delta covering only cells [parent_hi, N)
+        //    via the range save; otherwise the exact whole-snapshot save (byte-identical v1 path).
+        const size_t nwrite = have_parent
+            ? llama_state_seq_save_file_range(ctx_tgt, tmp.c_str(), slot.id,
+                                              (llama_pos) parent_hi, -1, toks.data(), toks.size())
+            : llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
             return; // invariant 4: disk full / IO error -> generation unaffected
@@ -2299,10 +2769,15 @@ private:
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
         }
-        // 3) meta sidecar on the temp path (tokens + fingerprint + media identity records; a
-        //    text-only prompt's empty `media` keeps the sidecar byte-identical v1). Written but
-        //    renamed LAST.
-        if (!slot_meta_write(tmp, cur_fp, toks, full_hash, media)) {
+        // 3) meta sidecar on the temp path. Written but renamed LAST. A whole snapshot writes the
+        //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
+        //    records). In incremental mode (have_parent, TEXT-ONLY by the guard above) this is a v3
+        //    delta-node meta carrying parent_id + [parent_hi, N) and NO media records.
+        const bool meta_ok = have_parent
+            ? slot_meta_write(tmp, cur_fp, toks, full_hash, /*media=*/{}, /*is_node=*/true,
+                              parent_id, parent_hi, (uint32_t) toks.size())
+            : slot_meta_write(tmp, cur_fp, toks, full_hash, media);
+        if (!meta_ok) {
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
@@ -4220,7 +4695,7 @@ private:
                     // FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
                     size_t token_count = 0;
                     size_t nread = 0;
-                    if (!do_slot_restore(*slot, filepath, &token_count, &nread)) {
+                    if (!do_slot_restore(*slot, { filepath }, &token_count, &nread)) {
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
@@ -4836,7 +5311,14 @@ private:
                                         && slot.task->need_sampling()        // generative only (not embed/rerank)
                                         && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
                                         && are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures global LoRA (invariant 3)
-                                    if (auto cand = auto_index_lookup(input_tokens)) {
+                                    // Try candidates best-first (longest usable snapshot first). Each
+                                    // rejected candidate costs only a small .meta read + byte-compare; the
+                                    // multi-GB state loads only once a candidate passes its gates. This
+                                    // fall-through is what stops a longer superset snapshot (unusable by a
+                                    // FULL model, which needs a whole-prefix match) from shadowing a shorter
+                                    // usable one at the same boundary. Media requests look up first-class:
+                                    // auto_index_lookup folds each chunk's identity into the boundary hashes.
+                                    for (const auto & cand : auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -4848,8 +5330,11 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        auto_restore_into_slot(slot, *cand, input_tokens, (int) n_past);
+                                        const int restored = auto_restore_into_slot(slot, cand, input_tokens, (int) n_past);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                        if (restored > 0) {
+                                            break; // restored; stop trying shorter candidates
+                                        }
                                     }
                                 }
                                 // ===== end AUTO-RESTORE =====================================================

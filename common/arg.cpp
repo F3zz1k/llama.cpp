@@ -776,6 +776,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.slot_save_auto && params.slot_save_path.empty()) {
         throw std::invalid_argument("--slot-save-auto requires --slot-save-path to be set");
     }
+    // incremental (delta) saving only makes sense for the auto disk cache; reject it without the
+    // master switch rather than silently ignoring it.
+    if (params.slot_save_incremental && !params.slot_save_auto) {
+        throw std::invalid_argument("--slot-save-incremental requires --slot-save-auto");
+    }
     // --slot-save-block sizes the auto-cache index but is validated unconditionally: a non-positive
     // block size is never meaningful, so reject it even when the master switch is off.
     if (params.slot_save_block <= 0) {
@@ -3348,6 +3353,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_save_auto = true;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_AUTO").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-incremental"},
+        "for the auto disk cache, save only the KV delta added since the last checkpoint instead of a "
+        "complete snapshot each time (much less disk/PCIe write for a growing conversation); hybrid/SWA "
+        "models still write their recurrent/sliding-window state whole. Requires --slot-save-auto "
+        "(default: complete snapshots)",
+        [](common_params & params) {
+            params.slot_save_incremental = true;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_INCREMENTAL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-block"}, "N",
         string_format("token-ID hash block size for the auto disk cache index; reuse granularity "

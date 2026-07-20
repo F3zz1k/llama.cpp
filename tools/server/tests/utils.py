@@ -76,6 +76,7 @@ class ServerProcess:
     n_prompts: int | None = 0
     slot_save_path: str | None = None
     slot_save_auto: bool = False
+    slot_save_incremental: bool = False
     slot_save_block: int | None = None
     slot_save_min_tokens: int | None = None
     slot_save_idle_seconds: int | None = None
@@ -223,6 +224,8 @@ class ServerProcess:
             server_args.extend(["--slot-save-path", self.slot_save_path])
         if self.slot_save_auto:
             server_args.append("--slot-save-auto")
+        if self.slot_save_incremental:
+            server_args.append("--slot-save-incremental")
         if self.slot_save_block:
             server_args.extend(["--slot-save-block", self.slot_save_block])
         if self.slot_save_min_tokens is not None:

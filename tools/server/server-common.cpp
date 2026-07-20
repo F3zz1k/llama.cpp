@@ -635,7 +635,16 @@ bool slot_meta_write(const std::string & state_filepath,
                      const model_fp & fp,
                      const llama_tokens & toks,
                      uint64_t chain_hash,
-                     const std::vector<server_media_record> & media) {
+                     const std::vector<server_media_record> & media,
+                     bool     is_node,
+                     uint64_t parent_id,
+                     uint32_t range_lo,
+                     uint32_t range_hi) {
+    // a v3 delta node is TEXT-ONLY by construction (there is no media-delta): refuse the
+    // contradictory combination rather than emit a sidecar our own reader could not classify.
+    if (is_node && !media.empty()) {
+        return false;
+    }
     // caps mirror the reader's: an over-cap or identity-less record would produce a
     // sidecar our own slot_meta_read rejects, so refuse to write it in the first place.
     if (media.size() > SLOT_META_MEDIA_MAX) {
@@ -667,7 +676,8 @@ bool slot_meta_write(const std::string & state_filepath,
         put_u32((uint32_t)(v >> 32));
     };
     put_u32(SLOT_META_MAGIC);
-    put_u32(media.empty() ? SLOT_META_VERSION : SLOT_META_VERSION_MEDIA);
+    put_u32(is_node ? SLOT_META_VERSION_NODE
+                    : (media.empty() ? SLOT_META_VERSION : SLOT_META_VERSION_MEDIA));
     put_u64(fp.fp_model);
     put_u32(fp.fp_n_vocab);
     put_u32(fp.fp_n_ctx_train);
@@ -695,9 +705,16 @@ bool slot_meta_write(const std::string & state_filepath,
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
     // contract is native-LE, matching slot_logits_write's float payload).
     f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
+    // v3: appended delta-node section (parent link + covered cell range). Text-only, so it
+    // never coexists with a media section; a whole snapshot never emits it, keeping v1 bytes
+    // byte-identical.
+    if (is_node) {
+        put_u64(parent_id);
+        put_u32(range_lo);
+        put_u32(range_hi);
+    } else if (!media.empty()) {
     // v2: appended media identity section (absent from text-only sidecars, which
     // stay byte-identical to v1).
-    if (!media.empty()) {
         put_u64(fp.fp_mmproj);
         put_u32((uint32_t) media.size());
         for (const auto & rec : media) {
@@ -732,7 +749,10 @@ bool slot_meta_read(const std::string & state_filepath,
                     uint64_t cur_fp_mmproj,
                     model_fp & fp_out,
                     llama_tokens & toks_out,
-                    std::vector<server_media_record> & media_out) {
+                    std::vector<server_media_record> & media_out,
+                    uint64_t * parent_out,
+                    uint32_t * range_lo_out,
+                    uint32_t * range_hi_out) {
     fp_out = model_fp{};
     toks_out.clear();
     media_out.clear();
@@ -763,7 +783,8 @@ bool slot_meta_read(const std::string & state_filepath,
         return false;
     }
     if (magic != SLOT_META_MAGIC ||
-        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA)) {
+        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA &&
+         version != SLOT_META_VERSION_NODE)) {
         return false;
     }
     model_fp fp;
@@ -793,28 +814,52 @@ bool slot_meta_read(const std::string & state_filepath,
         toks_out.clear();
         return false;
     }
-    if (version == SLOT_META_VERSION) {
-        // v1 is text-only BY CONSTRUCTION: no v1 writer ever emits a NULL (media)
-        // cell, so any NULL here means a corrupt or relabelled media sidecar (e.g. a
-        // v2 file whose version byte flipped). Enforce that premise — the fp_mmproj
-        // backfill below is only sound for genuinely text-only KV, and accepting NULL
-        // cells as v1 would silently drop the media identity records they stand for.
+    // delta-node defaults: a v1/v2 whole snapshot is its own parentless root covering
+    // [0, tok_count). v3 overwrites these from its appended section below.
+    if (parent_out)   { *parent_out   = 0; }
+    if (range_lo_out) { *range_lo_out = 0; }
+    if (range_hi_out) { *range_hi_out = tok_count; }
+    if (version == SLOT_META_VERSION || version == SLOT_META_VERSION_NODE) {
+        // v1 and v3 share the text-only token layout BY CONSTRUCTION: no text writer ever
+        // emits a NULL (media) cell, so any NULL here means a corrupt or relabelled media
+        // sidecar (e.g. a v2 file whose version byte flipped). Enforce that premise — the
+        // fp_mmproj backfill below is only sound for genuinely text-only KV, and accepting
+        // NULL cells here would silently drop the media identity records they stand for.
         for (const llama_token tok : toks_out) {
             if (tok == LLAMA_TOKEN_NULL) {
                 toks_out.clear();
                 return false;
             }
         }
-        // a v1 sidecar ends exactly after the token array — trailing bytes mean a
-        // relabelled/corrupt file, and the backfill below must never apply to one.
-        if (f.peek() != std::char_traits<char>::eof()) {
-            toks_out.clear();
-            return false;
-        }
-        // v1 predates fp_mmproj and is always text-only, so its KV is
-        // projector-independent: backfill the live value so the fingerprint compare
-        // cannot refuse a pre-v2 snapshot on an --mmproj server.
+        // v1/v3 text KV is projector-independent: backfill the live value so the
+        // fingerprint compare cannot refuse a text-only snapshot on an --mmproj server.
         fp.fp_mmproj = cur_fp_mmproj;
+        if (version == SLOT_META_VERSION_NODE) {
+            // v3 delta node: parent link + covered cell range appended after the tokens.
+            uint64_t node_parent = 0;
+            uint32_t node_lo     = 0;
+            uint32_t node_hi     = 0;
+            if (!get_u64(node_parent) || !get_u32(node_lo) || !get_u32(node_hi)) {
+                toks_out.clear();
+                return false;
+            }
+            // a v3 sidecar ends exactly after the node section — trailing bytes mean a
+            // relabelled/corrupt file.
+            if (f.peek() != std::char_traits<char>::eof()) {
+                toks_out.clear();
+                return false;
+            }
+            if (parent_out)   { *parent_out   = node_parent; }
+            if (range_lo_out) { *range_lo_out = node_lo; }
+            if (range_hi_out) { *range_hi_out = node_hi; }
+        } else {
+            // a v1 sidecar ends exactly after the token array — trailing bytes mean a
+            // relabelled/corrupt file, and the backfill above must never apply to one.
+            if (f.peek() != std::char_traits<char>::eof()) {
+                toks_out.clear();
+                return false;
+            }
+        }
         fp_out = fp;
         return true;
     }

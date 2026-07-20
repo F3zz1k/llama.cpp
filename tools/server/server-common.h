@@ -280,8 +280,12 @@ bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server
 //
 
 static constexpr uint32_t SLOT_META_MAGIC         = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
-static constexpr uint32_t SLOT_META_VERSION       = 1u;          // text-only snapshot (layout byte-frozen)
+static constexpr uint32_t SLOT_META_VERSION       = 1u;          // text-only whole snapshot (layout byte-frozen)
 static constexpr uint32_t SLOT_META_VERSION_MEDIA = 2u;          // v1 layout + appended media-record section
+static constexpr uint32_t SLOT_META_VERSION_NODE  = 3u;          // v1 text layout + appended delta-node section
+                                                                 // (parent_id + [range_lo, range_hi)); TEXT-ONLY,
+                                                                 // no media records. Version map: v1 whole text,
+                                                                 // v2 media, v3 text delta node (incremental cache).
 static constexpr uint32_t SLOT_META_MEDIA_MAX     = 4096u;       // cap: media records per snapshot
 static constexpr uint32_t SLOT_META_ID_MAX        = 256u;        // cap: bytes per media-record id (0 invalid)
 
@@ -372,29 +376,42 @@ std::string slot_meta_sidecar_path(const std::string & state_filepath);
 // (start_idx/n_tokens/n_pos/nx/ny/is_audio/id_len/id each). For v2 `toks` must be
 // the cell-aligned list (media cells LLAMA_TOKEN_NULL, see get_cell_tokens) and the
 // records must tile its NULL cells exactly, as extract_media_records produces them —
-// slot_meta_read rejects anything else. Returns true on success. Never throws.
+// slot_meta_read rejects anything else. v3 (incremental delta node, `is_node`): the
+// full v1 text layout followed by parent_id + range_lo + range_hi (the KV .bin holds
+// only cells [range_lo, range_hi); parent_id chains to the snapshot it extends, 0 =
+// root). v3 is TEXT-ONLY — passing a non-empty `media` together with `is_node` is a
+// contract violation and refused (there is no media-delta). Whole snapshots (is_node
+// false) still write v1/v2 BYTE-IDENTICALLY. Returns true on success. Never throws.
 bool slot_meta_write(const std::string & state_filepath,
                      const model_fp & fp,
                      const llama_tokens & toks,
                      uint64_t chain_hash,
-                     const std::vector<server_media_record> & media = {});
+                     const std::vector<server_media_record> & media = {},
+                     bool     is_node   = false, // true => v3 delta-node meta (with parent + range)
+                     uint64_t parent_id = 0,     // parent node's chain_hash (0 = root)
+                     uint32_t range_lo  = 0,     // this node's .bin holds KV cells [range_lo,
+                     uint32_t range_hi  = 0);    // range_hi); ignored for a whole snapshot
 
-// Read a .meta sidecar (version-aware: v1 and v2). Returns true and fills the
+// Read a .meta sidecar (version-aware: v1, v2 and v3). Returns true and fills the
 // outputs iff a valid sidecar exists; any short read / bad magic / unknown version /
-// cap or media-tiling violation => false with outputs cleared. Never throws. On v1,
-// fp_out.fp_mmproj is backfilled from `cur_fp_mmproj` (sound: v1 => text-only =>
-// projector-independent KV), so the fingerprint compare cannot refuse pre-v2
-// snapshots on an --mmproj server. To keep that backfill sound, a v1 sidecar
-// containing any LLAMA_TOKEN_NULL cell — or any bytes past the token array — is
-// rejected: no v1 writer ever emits either, so both can only be a corrupt or
-// relabelled media sidecar trying to bypass fp_mmproj. Note: `chain_hash` is
-// recorded for debuggability but the authority for reuse is always the
-// byte-compared tokens.
+// cap or media-tiling violation => false with outputs cleared. Never throws. On v1
+// (and v3 — both text-only), fp_out.fp_mmproj is backfilled from `cur_fp_mmproj`
+// (sound: text KV is projector-independent), so the fingerprint compare cannot refuse
+// text-only snapshots on an --mmproj server. To keep that backfill sound, a v1/v3
+// sidecar containing any LLAMA_TOKEN_NULL cell — or any bytes past its defined layout
+// — is rejected: no text writer ever emits either, so both can only be a corrupt or
+// relabelled media sidecar trying to bypass fp_mmproj. The delta-node fields are
+// exposed via the optional out-ptrs; for a v1/v2 whole snapshot they default to a
+// parentless root (parent_id 0, range [0, tok_count)). Note: `chain_hash` is recorded
+// for debuggability but the authority for reuse is always the byte-compared tokens.
 bool slot_meta_read(const std::string & state_filepath,
                     uint64_t cur_fp_mmproj,
                     model_fp & fp_out,
                     llama_tokens & toks_out,
-                    std::vector<server_media_record> & media_out);
+                    std::vector<server_media_record> & media_out,
+                    uint64_t * parent_out   = nullptr,
+                    uint32_t * range_lo_out = nullptr,
+                    uint32_t * range_hi_out = nullptr);
 
 //
 // auto disk cache block chain hashing
