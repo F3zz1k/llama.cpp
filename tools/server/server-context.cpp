@@ -1979,19 +1979,38 @@ private:
     // success (slot.prompt.tokens / n_past-equivalent + just_restored + restored_logits are set as
     // for a manual restore). On ANY failure (load <=0, capacity exceeded) the slot seq is left
     // cleared and false is returned so the caller falls through to a normal prefill (invariant 4).
-    bool do_slot_restore(server_slot & slot, const std::string & filepath,
+    bool do_slot_restore(server_slot & slot, const std::vector<std::string> & node_paths,
                          size_t * out_token_count = nullptr, size_t * out_nread = nullptr) {
+        if (node_paths.empty()) {
+            slot.prompt.tokens.clear();
+            if (out_nread)       { *out_nread = 0; }
+            if (out_token_count) { *out_token_count = 0; }
+            return false;
+        }
+        // Load the chain in position order: node [0] clears the destination seq (a whole base/root
+        // snapshot), nodes [1..] append their delta cells with NO_CLEAR so base + deltas compose.
+        // A 1-element chain is exactly the previous single clearing load — byte-for-byte the same.
         llama_tokens tokens;
         tokens.resize(slot.n_ctx);
         size_t token_count = 0;
-        const size_t nread = llama_state_seq_load_file(
-            ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
-        if (out_nread)       { *out_nread = nread; }
-        if (out_token_count) { *out_token_count = token_count; }
-        if (nread == 0) {
-            slot.prompt.tokens.clear(); // KV may already have been invalidated by the partial load
-            return false;
+        size_t total_nread = 0;
+        for (size_t i = 0; i < node_paths.size(); ++i) {
+            const llama_state_seq_flags flags = (i == 0) ? 0 : LLAMA_STATE_SEQ_FLAGS_NO_CLEAR;
+            size_t node_token_count = 0;
+            const size_t nread = llama_state_seq_load_file_ext(
+                ctx_tgt, node_paths[i].c_str(), slot.id, flags,
+                tokens.data(), tokens.size(), &node_token_count);
+            if (nread == 0) {
+                slot.prompt.tokens.clear(); // KV may already have been invalidated by the partial load
+                if (out_nread)       { *out_nread = total_nread; }
+                if (out_token_count) { *out_token_count = 0; }
+                return false;
+            }
+            total_nread += nread;
+            token_count = node_token_count; // the tip (last) node header carries the full [0, hi) list
         }
+        if (out_nread)       { *out_nread = total_nread; }
+        if (out_token_count) { *out_token_count = token_count; }
         tokens.resize(token_count);
         slot.prompt.tokens.clear();
         slot.prompt.tokens.insert(tokens);
@@ -2019,7 +2038,7 @@ private:
         slot.restored_logits.clear();
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-            if (slot_logits_read(filepath, nv, (uint32_t) token_count, slot.restored_logits)) {
+            if (slot_logits_read(node_paths.back(), nv, (uint32_t) token_count, slot.restored_logits)) {
                 SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
             }
         }
@@ -2041,13 +2060,6 @@ private:
         if (!slot_meta_read(cand.state_path, disk_fp, disk_toks,
                             &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
             return 0; // invariant 4
-        }
-        // INTERIM GUARD (U3 only; removed by U4's base+delta restore walk): a v3 delta node's .bin
-        // holds only the tail cells [range_lo, range_hi), not a whole prefix. A plain single-file
-        // restore would load a base-less fragment and corrupt the slot, so until U4 wires the
-        // root->node compose refuse delta candidates and cold-prefill instead (invariant 4).
-        if (disk_parent_id != 0 || disk_range_lo != 0) {
-            return 0;
         }
         if (!(disk_fp == cur_fp)) {
             return 0; // invariant 3
@@ -2096,13 +2108,73 @@ private:
         if (n_keep_disk < n_keep_mem + B) {
             return 0;
         }
+        // Build the root->tip chain of node .bin paths (the tree is DERIVED FROM DISK — no in-RAM
+        // map). A v1 whole snapshot is its own root: a single-element chain == the previous single
+        // clearing load. A v3 delta only stores its tail cells, so walk parent links to the root and
+        // load base + deltas in position order (NO_CLEAR) to recompose the full prefix. Do this
+        // BEFORE touching the slot so any inconsistency (missing/corrupt/non-contiguous node) simply
+        // returns 0 for a cold prefill, never disturbing the resident KV (invariant 4).
+        std::vector<std::string> chain;
+        chain.push_back(cand.state_path);
+        if (disk_parent_id != 0 || disk_range_lo != 0) {
+            uint64_t cur_parent_id = disk_parent_id;
+            uint32_t cur_range_lo  = disk_range_lo;
+            const size_t MAX_CHAIN_DEPTH = 4096; // bounded walk: a corrupt/looping link never hangs.
+            while (true) {
+                if (chain.size() > MAX_CHAIN_DEPTH) {
+                    return 0; // pathological depth -> cold prefill (invariant 4)
+                }
+                const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
+                model_fp     parent_fp;
+                llama_tokens parent_toks;
+                uint64_t     parent_parent_id = 0;
+                uint32_t     parent_lo        = 0;
+                uint32_t     parent_hi        = 0;
+                if (!slot_meta_read(parent_path, parent_fp, parent_toks,
+                                    &parent_parent_id, &parent_lo, &parent_hi)) {
+                    return 0; // parent meta missing/corrupt -> cold prefill
+                }
+                if (!(parent_fp == cur_fp)) {
+                    return 0; // fingerprint drift on the parent -> cold prefill
+                }
+                // contiguity: the parent must end exactly where its child begins.
+                if (parent_hi != cur_range_lo) {
+                    return 0;
+                }
+                // IDENTITY: hash + range-contiguity alone do NOT prove this .bin holds the request's
+                // actual prefix — a parent_id/n_tokens filename collision (two distinct prefixes of
+                // equal length whose block-boundary hash coincides) or a base rewritten for a
+                // different prefix could land on the same deterministic name and compose the WRONG KV
+                // for [0, parent_hi) under NO_CLEAR, silently. The tip's `disk_toks` is the
+                // authoritative full [0, range_hi) token record and is already byte-verified against
+                // the request (up to `v`), so byte-verify the parent's recorded tokens against that
+                // tip prefix. Comparing to `disk_toks` (not `req`) also keeps the legitimate PART
+                // mid-parent divergence case restorable: there the request diverges before parent_hi
+                // yet the trimmed restore stays valid, and parent_toks still equals disk_toks[0,hi).
+                if (parent_toks.size() != (size_t) parent_hi ||
+                    (size_t) parent_hi > disk_toks.size() ||
+                    !std::equal(parent_toks.begin(), parent_toks.end(), disk_toks.begin())) {
+                    return 0; // parent KV does not correspond to this prefix -> cold prefill
+                }
+                // the parent .bin must exist (meta is published last, but an orphan-reap can race).
+                { std::ifstream pf(parent_path, std::ios::binary); if (!pf) { return 0; } }
+                chain.push_back(parent_path);
+                if (parent_parent_id == 0 && parent_lo == 0) {
+                    break; // reached the root covering [0, hi)
+                }
+                cur_parent_id = parent_parent_id;
+                cur_range_lo  = parent_lo;
+            }
+            // chain is tip..root; reverse to root..tip (position order) for the compose load.
+            std::reverse(chain.begin(), chain.end());
+        }
         // Clear the slot's resident KV before loading the snapshot (mirror the restore-continue safe
         // fallback): seq removal + token/checkpoint clear so the restore writes into an empty seq.
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
         slot.prompt.tokens.clear();
         slot.prompt.checkpoints.clear();
 
-        if (!do_slot_restore(slot, cand.state_path)) {
+        if (!do_slot_restore(slot, chain)) {
             // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
             return 0;
         }
@@ -2111,10 +2183,13 @@ private:
         // rewind. For attention models the request may diverge inside the snapshot; keep_first(n_past)
         // + a PARTIAL seq_rm then reprefills the divergent tail (supported for PART). The verified
         // prefix is what we claim as reused.
-        // Bump the snapshot's mtime so the LRU treats a reused-but-not-rewritten base snapshot as
-        // recently-used (true LRU, not least-recently-written) — critical for the fan-out case where
-        // many requests restore one hot base prefix. Best-effort; never errors the restore (invariant 4).
-        auto_touch_unit(cand.state_path);
+        // Bump every node on the chain's mtime so the LRU treats a reused-but-not-rewritten base (and
+        // each shared delta) as recently-used (true LRU, not least-recently-written) — critical for
+        // the fan-out case where many requests restore one hot base prefix, and so eviction keeps the
+        // whole live chain warm. Best-effort; never errors the restore (invariant 4).
+        for (const std::string & node_path : chain) {
+            auto_touch_unit(node_path);
+        }
         SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory match was %d), file=%s\n",
                 n_keep_disk, n_keep_mem, cand.state_path.c_str());
         return n_keep_disk;
@@ -4125,7 +4200,7 @@ private:
                     // FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
                     size_t token_count = 0;
                     size_t nread = 0;
-                    if (!do_slot_restore(*slot, filepath, &token_count, &nread)) {
+                    if (!do_slot_restore(*slot, { filepath }, &token_count, &nread)) {
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }

@@ -280,7 +280,9 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         kv_base->state_read(io, seq_id, flags);
     }
 
-    kv_swa->state_read(io, seq_id, flags);
+    // the sliding-window layers hold only the last W positions and are written whole at each node, so the
+    // tip node's window must overwrite (never compose) - mask NO_CLEAR off so kv_swa always clears first.
+    kv_swa->state_read(io, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_NO_CLEAR);
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {
