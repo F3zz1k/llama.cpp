@@ -637,7 +637,12 @@ struct auto_cache_entry {
 // restart (no inotify/no background thread; one stat per gated check).
 struct auto_cache_index {
     std::mutex mtx;
-    std::unordered_map<uint64_t, auto_cache_entry> by_boundary;
+    // boundary-hash -> snapshots reaching that prefix length, longest first. Kept multi-valued so a
+    // longer (superset) snapshot never shadows a shorter exact-length one: a FULL/recurrent/hybrid/SWA
+    // model can only restore a snapshot that is a WHOLE prefix of the request, so when the request ends
+    // before the longer snapshot the shorter one is the ONLY usable candidate (auto_index_lookup picks
+    // model-appropriately). Incremental saving makes overlapping supersets the common case.
+    std::unordered_map<uint64_t, std::vector<auto_cache_entry>> by_boundary;
     std::unordered_set<std::string> indexed_files;    // state paths already scanned (incremental refresh)
     bool scanned = false;
     std::filesystem::file_time_type dir_mtime{};      // dir mtime as of the last scan
@@ -648,6 +653,14 @@ struct auto_cache_index {
 // path (a forced refresh on a lookup miss bypasses it). Sub-second so a peer's new snapshot is
 // visible within ~1 prefill of being written — effectively immediate from the user's view.
 static constexpr int AUTO_REFRESH_MIN_MS = 1000;
+
+// Multi-candidate index bounds. A boundary may be reached by several snapshots of different lengths
+// (incremental saving makes every save a superset of the previous). They are kept longest-first so a
+// longer snapshot never shadows a shorter exact-length one that a FULL model needs; the per-boundary
+// list is capped (dropping the shortest), and a lookup returns at most a few candidates for the caller
+// to try in order.
+static constexpr size_t AUTO_MAX_CANDIDATES_PER_BOUNDARY = 32;
+static constexpr size_t AUTO_MAX_RESTORE_ATTEMPTS        = 4;
 
 // Sidecar path twins for an auto snapshot's state file. `.logits` is the committed
 // (byte-identical) regenerate sidecar; `.meta` is the NEW tokens+fingerprint
@@ -1728,11 +1741,26 @@ private:
         return params_base.slot_save_path + std::string(buf);
     }
 
-    // Insert/keep-longer: an entry replaces an existing boundary only if it covers a longer prefix.
+    // Insert a snapshot at a boundary it reaches. Multiple snapshots are RETAINED per boundary
+    // (longest first, deduped by length) so a longer superset does NOT shadow a shorter exact-length
+    // snapshot — the shorter one is the only candidate a FULL model can restore when the request ends
+    // before the longer one (see auto_index_lookup). The list is capped; the shortest is dropped first
+    // (deep-context snapshots cost the most to lose and reconstruct).
     void auto_index_insert_locked(uint64_t boundary, const auto_cache_entry & e) {
-        auto it = auto_idx.by_boundary.find(boundary);
-        if (it == auto_idx.by_boundary.end() || it->second.n_tokens < e.n_tokens) {
-            auto_idx.by_boundary[boundary] = e;
+        auto & v = auto_idx.by_boundary[boundary];
+        for (auto & c : v) {
+            if (c.n_tokens == e.n_tokens) {
+                c.state_path = e.state_path; // same length/prefix: keep the newest file for this length
+                c.fp         = e.fp;
+                return;
+            }
+        }
+        // keep the vector sorted by descending n_tokens
+        auto pos = std::lower_bound(v.begin(), v.end(), e,
+            [](const auto_cache_entry & a, const auto_cache_entry & b) { return a.n_tokens > b.n_tokens; });
+        v.insert(pos, e);
+        if (v.size() > AUTO_MAX_CANDIDATES_PER_BOUNDARY) {
+            v.pop_back(); // over the cap: drop the shortest
         }
     }
 
@@ -1825,10 +1853,19 @@ private:
     // Longest-prefix lookup over the request tokens. Returns the candidate whose boundary hash is
     // the DEEPEST match with a fingerprint equal to the live one. Verification (byte-compare of the
     // candidate's persisted tokens) is mandatory and done by the caller (invariant 2). O(#blocks).
-    std::optional<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+    // Returns candidate snapshots to try, BEST FIRST (deepest boundary first; within a boundary,
+    // longest first). For a FULL/recurrent/hybrid/SWA model, snapshots longer than the request are
+    // filtered out here — the whole snapshot must be a prefix of the request, so a longer one can never
+    // restore; PART models can rewind so all lengths are kept. The caller tries each in order until one
+    // restores (each rejected candidate costs only a small .meta read + byte-compare; the multi-GB
+    // state loads only once a candidate passes its gates). Byte-verification is mandatory and done by
+    // the caller (invariant 2). O(#blocks).
+    std::vector<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+        std::vector<auto_cache_entry> out;
         if (!auto_cache_enabled()) {
-            return std::nullopt; // off by default
+            return out; // off by default
         }
+        const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
         const auto bhs = auto_block_hashes(req, params_base.slot_save_block, cur_fp.fp_model);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         // Cross-process visibility: cheaply pick up snapshots a peer process created since our last
@@ -1838,21 +1875,37 @@ private:
         // window) is still found on this first request rather than only the next one.
         auto_index_refresh_locked(/*force=*/false);
         for (int attempt = 0; attempt < 2; ++attempt) {
+            out.clear();
+            std::unordered_set<std::string> seen;
             for (size_t k = bhs.size(); k-- > 0; ) { // longest boundary first
                 auto it = auto_idx.by_boundary.find(bhs[k]);
                 if (it == auto_idx.by_boundary.end()) {
                     continue;
                 }
-                if (!(it->second.fp == cur_fp)) {
-                    continue; // invariant 3
+                for (const auto_cache_entry & c : it->second) { // longest first within the boundary
+                    if (!(c.fp == cur_fp)) {
+                        continue; // invariant 3
+                    }
+                    if (full && c.n_tokens > req.size()) {
+                        continue; // a FULL snapshot longer than the request is never a whole prefix
+                    }
+                    if (!seen.insert(c.state_path).second) {
+                        continue; // the same snapshot reaches several boundaries
+                    }
+                    out.push_back(c);
+                    if (out.size() >= AUTO_MAX_RESTORE_ATTEMPTS) {
+                        return out;
+                    }
                 }
-                return it->second;
+            }
+            if (!out.empty()) {
+                return out;
             }
             if (attempt == 0) {
                 auto_index_refresh_locked(/*force=*/true); // miss -> rescan once before giving up
             }
         }
-        return std::nullopt;
+        return out;
     }
 
     // After an LRU eviction (which deletes files silently — ours OR a peer process's), drop index
@@ -1863,9 +1916,17 @@ private:
     void auto_index_drop_missing_locked() {
         std::unordered_set<std::string> gone;
         for (auto it = auto_idx.by_boundary.begin(); it != auto_idx.by_boundary.end(); ) {
-            std::error_code ec;
-            if (!std::filesystem::exists(it->second.state_path, ec) || ec) {
-                gone.insert(it->second.state_path);
+            auto & vec = it->second;
+            for (auto vit = vec.begin(); vit != vec.end(); ) {
+                std::error_code ec;
+                if (!std::filesystem::exists(vit->state_path, ec) || ec) {
+                    gone.insert(vit->state_path);
+                    vit = vec.erase(vit);
+                } else {
+                    ++vit;
+                }
+            }
+            if (vec.empty()) {
                 it = auto_idx.by_boundary.erase(it);
             } else {
                 ++it;
@@ -1967,6 +2028,9 @@ private:
             // would have to partially unwind. (No block-boundary clamp for FULL: only the exact whole
             // snapshot is a legal restore length here.)
             if (v != disk_toks.size()) {
+                SLT_DBG(slot, "auto-restore: FULL snapshot is not a whole prefix of the request "
+                              "(verified %zu of %zu snapshot tokens; request %zu) — skipping %s\n",
+                        v, disk_toks.size(), req.size(), cand.state_path.c_str());
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
@@ -2057,8 +2121,17 @@ private:
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto it = auto_idx.by_boundary.find(full_hash);
-            if (it != auto_idx.by_boundary.end() && it->second.n_tokens >= toks.size()) {
-                return; // an equal-or-longer snapshot for this exact prefix already exists
+            if (it != auto_idx.by_boundary.end()) {
+                const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+                for (const auto_cache_entry & c : it->second) {
+                    // FULL: only an EXACT-length snapshot substitutes (a longer one is unusable, a
+                    // shorter one is a different resume point) — otherwise this incremental save would
+                    // be suppressed by a longer snapshot the model can never restore. PART: an
+                    // equal-or-longer snapshot already covers this prefix (it can rewind to it).
+                    if (full ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
+                        return; // a usable snapshot for this exact prefix already exists
+                    }
+                }
             }
         }
 
@@ -4550,7 +4623,13 @@ private:
                                     // get_text_tokens() (not get_tokens()): media-safe accessor that never asserts
                                     // under has_mtmd and, for this no-media prompt, equals the full token-id prefix.
                                     const llama_tokens req = input_tokens.get_text_tokens();
-                                    if (auto cand = auto_index_lookup(req)) {
+                                    // Try candidates best-first (longest usable snapshot first). Each
+                                    // rejected candidate costs only a small .meta read + byte-compare; the
+                                    // multi-GB state loads only once a candidate passes its gates. This
+                                    // fall-through is what stops a longer superset snapshot (unusable by a
+                                    // FULL model, which needs a whole-prefix match) from shadowing a shorter
+                                    // usable one at the same boundary.
+                                    for (const auto & cand : auto_index_lookup(req)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -4562,8 +4641,11 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        auto_restore_into_slot(slot, *cand, req, (int) n_past);
+                                        const int restored = auto_restore_into_slot(slot, cand, req, (int) n_past);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                        if (restored > 0) {
+                                            break; // restored; stop trying shorter candidates
+                                        }
                                     }
                                 }
                                 // ===== end AUTO-RESTORE =====================================================
