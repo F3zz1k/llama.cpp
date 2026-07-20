@@ -689,6 +689,8 @@ struct common_params {
     // master switch for the transparent cross-process prompt/KV cache. Requires slot_save_path.
     // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
     bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
+    bool    slot_save_incremental = false; // save only the KV delta since the last checkpoint instead
+                                           // of a complete snapshot each time; requires slot_save_auto
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
     // minimum snapshot size (in cells/tokens) worth persisting: a trivially small prefix saves
     // little prefill against the state-file write + later restore, so it is skipped. The effective
