@@ -528,6 +528,10 @@ static void slot_save_enforce_limits(const std::string & dir,
 
 static constexpr uint32_t SLOT_META_MAGIC   = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
 static constexpr uint32_t SLOT_META_VERSION = 1u;
+// Delta-node meta: the v1 layout followed by parent_id + [range_lo, range_hi). Version 2 is reserved
+// for the -mm branch's media meta so the eventual main-patched merge stays collision-free
+// (v1 = whole snapshot, v2 = media, v3 = delta node).
+static constexpr uint32_t SLOT_META_VERSION_NODE = 3u;
 
 // Model/quant/context fingerprint that MUST match for a restore to be sound. All
 // fields are stable inference-affecting identity captured once at model load and
@@ -676,7 +680,11 @@ static std::string slot_meta_sidecar_path(const std::string & state_filepath) {
 static bool slot_meta_write(const std::string & state_filepath,
                             const model_fp & fp,
                             const llama_tokens & toks,
-                            uint64_t chain_hash) {
+                            uint64_t chain_hash,
+                            bool     is_node   = false, // true => delta-node meta (v3) with parent+range
+                            uint64_t parent_id = 0,     // parent node's chain_hash (0 = root)
+                            uint32_t range_lo  = 0,     // this node's .bin holds KV cells [range_lo,
+                            uint32_t range_hi  = 0) {   // range_hi); ignored for a whole snapshot
     const std::string sidecar = slot_meta_sidecar_path(state_filepath);
     const std::string tmp     = sidecar + ".tmp";
 
@@ -698,7 +706,7 @@ static bool slot_meta_write(const std::string & state_filepath,
         put_u32((uint32_t)(v >> 32));
     };
     put_u32(SLOT_META_MAGIC);
-    put_u32(SLOT_META_VERSION);
+    put_u32(is_node ? SLOT_META_VERSION_NODE : SLOT_META_VERSION);
     put_u64(fp.fp_model);
     put_u32(fp.fp_n_vocab);
     put_u32(fp.fp_n_ctx_train);
@@ -726,6 +734,14 @@ static bool slot_meta_write(const std::string & state_filepath,
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
     // contract is native-LE, matching slot_logits_write's float payload).
     f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
+    // delta-node section (v3 only): the KV .bin holds only cells [range_lo, range_hi); parent_id
+    // chains this node to the snapshot it extends (0 = root). Absent from a whole-snapshot v1 meta,
+    // so v1 bytes stay byte-identical.
+    if (is_node) {
+        put_u64(parent_id);
+        put_u32(range_lo);
+        put_u32(range_hi);
+    }
     f.flush();
     if (!f.good()) {
         f.close();
@@ -749,7 +765,10 @@ static bool slot_meta_write(const std::string & state_filepath,
 // debuggability but the authority for reuse is always the byte-compared tokens.
 static bool slot_meta_read(const std::string & state_filepath,
                            model_fp & fp_out,
-                           llama_tokens & toks_out) {
+                           llama_tokens & toks_out,
+                           uint64_t * parent_out   = nullptr,  // delta-node fields (v3); for a v1
+                           uint32_t * range_lo_out = nullptr,  // whole snapshot they default to a
+                           uint32_t * range_hi_out = nullptr) {// root covering [0, tok_count)
     fp_out = model_fp{};
     toks_out.clear();
     const std::string sidecar = slot_meta_sidecar_path(state_filepath);
@@ -778,7 +797,8 @@ static bool slot_meta_read(const std::string & state_filepath,
     if (!get_u32(magic) || !get_u32(version)) {
         return false;
     }
-    if (magic != SLOT_META_MAGIC || version != SLOT_META_VERSION) {
+    if (magic != SLOT_META_MAGIC ||
+        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_NODE)) {
         return false;
     }
     model_fp fp;
@@ -808,6 +828,19 @@ static bool slot_meta_read(const std::string & state_filepath,
         toks_out.clear();
         return false;
     }
+    // defaults for a whole-snapshot (v1) meta: it is its own root covering [0, tok_count).
+    uint64_t parent_id = 0;
+    uint32_t range_lo  = 0;
+    uint32_t range_hi  = tok_count;
+    if (version == SLOT_META_VERSION_NODE) {
+        if (!get_u64(parent_id) || !get_u32(range_lo) || !get_u32(range_hi)) {
+            toks_out.clear();
+            return false;
+        }
+    }
+    if (parent_out)   { *parent_out   = parent_id; }
+    if (range_lo_out) { *range_lo_out = range_lo; }
+    if (range_hi_out) { *range_hi_out = range_hi; }
     fp_out = fp;
     return true;
 }
