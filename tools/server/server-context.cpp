@@ -28,6 +28,7 @@
 #include <exception>
 #include <fstream>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -312,7 +313,79 @@ struct slot_save_unit {
     std::string meta_path;    // "<state>.meta",   "" if none (auto disk cache)
     uintmax_t   bytes = 0;
     std::filesystem::file_time_type mtime;
+    // Tree-aware eviction (U5): a checkpoint node's identity, derived entirely from disk. A node is
+    // identified by the PAIR (`node_id`, `n_tokens`) — both parsed from the auto filename
+    // "auto-<fp>-<chain_hash>-<n_tokens>.bin": `node_id` is the middle-hex chain-hash and `n_tokens` is
+    // the trailing token count. This pair is what a child delta's parent link (`parent_id`, `range_lo`)
+    // resolves to — exactly the pair U4 restore feeds to auto_state_filename(parent_id, range_lo). Keying
+    // on the pair (not chain_hash alone) is essential: a continuation that does NOT cross a whole-block
+    // boundary shares its parent's chain-hash, so node_id ALONE would make the child collide with — and
+    // even self-reference — its parent. `node_id`/`n_tokens` are 0 for any file that is not an auto-*
+    // snapshot. `parent_id`/`range_lo`/`range_hi` come from the .meta (a v3 delta has parent_id != 0; a v1
+    // whole snapshot or a foreign/manual file is a parentless root). When every file is a v1 root the tree
+    // logic collapses to flat mtime LRU.
+    uint64_t    node_id   = 0;
+    uint32_t    n_tokens  = 0;
+    uint64_t    parent_id = 0;
+    uint32_t    range_lo  = 0;
+    uint32_t    range_hi  = 0;
+    bool        is_node   = false; // true => v3 delta node (parent_id != 0)
 };
+
+// Read only the delta-node section of a state file's .meta (parent_id + [range_lo, range_hi)). Thin
+// wrapper over slot_meta_read (defined further down, after model_fp) so slot_save_enforce_limits — which
+// lives above the fingerprint/meta machinery — can resolve the checkpoint tree without pulling model_fp
+// into scope. Returns false (and leaves the outputs as a parentless root) for a v1/foreign/absent meta.
+static bool slot_node_meta_probe(const std::string & state_filepath,
+                                 uint64_t & parent_id, uint32_t & range_lo, uint32_t & range_hi);
+
+// Parse a node's identity PAIR (chain_hash, n_tokens) from an auto-cache state filename
+// ("auto-<fp_model>-<chain_hash>-<n_tokens>.bin"): the middle 16-hex group is the chain-hash a child
+// delta stores as its parent_id, and the trailing decimal group is the token count a child delta stores
+// as its parent link's range_lo. The pair is the node's unique key on disk. Returns false (and leaves
+// both outputs 0) for any name that is not an auto snapshot — a foreign/manual file is then treated as
+// its own parentless root and always ages by plain mtime. n_tokens is clamped to uint32_t; the save side
+// bounds token counts far below 2^32 (slot_meta_read rejects tok_count > 2^28).
+static bool slot_save_parse_node_id(const std::string & state_path, uint64_t & node_id, uint32_t & n_tokens) {
+    node_id  = 0;
+    n_tokens = 0;
+    const size_t slash = state_path.find_last_of("/\\");
+    const std::string name = (slash == std::string::npos) ? state_path : state_path.substr(slash + 1);
+    // layout: "auto-" (5) + 16 hex fp + "-" + 16 hex chain_hash + "-" + digits + ".bin"
+    static const char pfx[] = "auto-";
+    const size_t pfx_len = 5, hex_len = 16;
+    if (name.size() < pfx_len + hex_len + 1 + hex_len + 1 ||
+        name.compare(0, pfx_len, pfx) != 0 ||
+        name[pfx_len + hex_len] != '-' ||
+        name[pfx_len + hex_len + 1 + hex_len] != '-') {
+        return false;
+    }
+    uint64_t id = 0;
+    for (size_t k = pfx_len + hex_len + 1; k < pfx_len + hex_len + 1 + hex_len; ++k) {
+        const char c = name[k];
+        uint64_t d;
+        if      (c >= '0' && c <= '9') { d = (uint64_t) (c - '0'); }
+        else if (c >= 'a' && c <= 'f') { d = (uint64_t) (c - 'a' + 10); }
+        else if (c >= 'A' && c <= 'F') { d = (uint64_t) (c - 'A' + 10); }
+        else { return false; }
+        id = (id << 4) | d;
+    }
+    // trailing decimal token count, terminated by '.' (the ".bin" extension). At least one digit.
+    size_t k = pfx_len + hex_len + 1 + hex_len + 1;
+    if (k >= name.size() || name[k] < '0' || name[k] > '9') {
+        return false;
+    }
+    uint64_t nt = 0;
+    for (; k < name.size() && name[k] >= '0' && name[k] <= '9'; ++k) {
+        nt = nt * 10 + (uint64_t) (name[k] - '0');
+        if (nt > 0xffffffffull) {
+            return false; // token count out of range for a real snapshot
+        }
+    }
+    node_id  = id;
+    n_tokens = (uint32_t) nt;
+    return true;
+}
 
 // Enforce --slot-save-max-count / --slot-save-max-bytes over `dir` using LRU-by-mtime eviction.
 // `just_written` is the state path that was just saved: it is never evicted, but if it ALONE
@@ -425,6 +498,14 @@ static void slot_save_enforce_limits(const std::string & dir,
                 continue;
             }
 
+            // Tree identity for U5 eviction: the node's own key (chain_hash, n_tokens) from the filename,
+            // its parent link + range from the .meta. A file with no delta meta (v1 whole snapshot or a
+            // foreign file) stays a parentless root (parent_id 0), so the eviction below reduces to today's
+            // flat mtime LRU for it.
+            slot_save_parse_node_id(p, u.node_id, u.n_tokens);
+            slot_node_meta_probe(p, u.parent_id, u.range_lo, u.range_hi);
+            u.is_node = (u.parent_id != 0);
+
             if (p == just_written) {
                 this_unit_bytes = u.bytes;
             }
@@ -453,24 +534,22 @@ static void slot_save_enforce_limits(const std::string & dir,
         return;
     }
 
-    std::sort(units.begin(), units.end(),
-              [](const slot_save_unit & a, const slot_save_unit & b) { return a.mtime < b.mtime; }); // oldest first
+    // ---- Tree-aware eviction (U5) --------------------------------------------------------------------
+    // The auto cache is a FOREST of checkpoint trees, reconstructed here purely from what is on disk (no
+    // in-RAM tree map). A v1 whole snapshot — or any foreign/manual file — is a parentless root; a v3
+    // delta node points at the parent whose KV prefix it extends (parent_id == the parent file's
+    // chain-hash == its filename's middle hex). Two rules make eviction tree-correct:
+    //   (a) NEVER evict a node that still has a child on disk — its delta .bin is meaningless without its
+    //       base — so we only ever evict LEAVES (child_count[node_id] == 0), oldest leaf first, which
+    //       peels a lineage tip-to-root.
+    //   (b) Age whole TREES by their most-recent node (tree_recency = MAX mtime in the tree) so a hot
+    //       lineage keeps its cold shared base; the least-recently-used tree is drained before a warmer
+    //       one is touched.
+    // When every file is a v1 root (child_count all zero, each its own tree), tree_recency[root] == the
+    // file's own mtime and every file is a leaf, so this reduces EXACTLY to today's flat mtime LRU
+    // (golden-safe for the incremental-OFF path). Recomputed from disk each pass => cross-process correct.
 
-    size_t    count = units.size();
-    uintmax_t total = 0;
-    for (const auto & u : units) {
-        total += u.bytes;
-    }
-    size_t idx = 0;
-
-    auto evict_oldest = [&]() -> bool {
-        while (idx < units.size() && units[idx].state_path == just_written) {
-            idx++; // never evict the snapshot we just wrote
-        }
-        if (idx >= units.size()) {
-            return false;
-        }
-        const auto & u = units[idx];
+    auto remove_unit_files = [&](const slot_save_unit & u) {
         std::filesystem::remove(u.state_path, ec);
         if (!u.sidecar_path.empty()) {
             std::filesystem::remove(u.sidecar_path, ec);
@@ -478,22 +557,168 @@ static void slot_save_enforce_limits(const std::string & dir,
         if (!u.meta_path.empty()) {
             std::filesystem::remove(u.meta_path, ec);
         }
-        total -= std::min(total, (uintmax_t) u.bytes);
+    };
+
+    // A node's on-disk identity is the PAIR (chain_hash, n_tokens): a continuation that does not cross a
+    // whole-block boundary shares its parent's chain_hash, so chain_hash ALONE would make the child
+    // collide with — indeed parent_id == node_id, self-reference — its parent, pinning the true tip as
+    // unevictable and defeating the caps. n_tokens (from the filename) disambiguates. The parent link is
+    // the pair (parent_id, range_lo) — exactly the pair U4 restore feeds to auto_state_filename.
+    using node_key = std::pair<uint64_t, uint32_t>; // (chain_hash, n_tokens)
+    const auto self_key   = [](const slot_save_unit & u) -> node_key { return { u.node_id,   u.n_tokens }; };
+    const auto parent_key = [](const slot_save_unit & u) -> node_key { return { u.parent_id, u.range_lo  }; };
+
+    // (chain_hash, n_tokens) -> index, for parent-link resolution. Auto filenames are unique per pair; a
+    // non-auto file has node_id 0 and is never a parent target.
+    std::map<node_key, size_t> node_by_key;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (units[i].node_id != 0) {
+            node_by_key[self_key(units[i])] = i;
+        }
+    }
+
+    std::vector<char> alive(units.size(), 1);
+
+    // Reap orphan deltas up front: a delta node whose base file is gone can never be restored (a base-less
+    // delta .bin would corrupt a compose-load), so it is dead weight — delete it regardless of the caps.
+    // Evicting one orphan can orphan its own children, so iterate to a fixed point. just_written is never
+    // touched (a freshly saved node had its parent verified present at save time).
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (!alive[i] || units[i].parent_id == 0 || units[i].state_path == just_written) {
+                continue;
+            }
+            const auto it = node_by_key.find(parent_key(units[i]));
+            if (it == node_by_key.end() || !alive[it->second]) {
+                remove_unit_files(units[i]);
+                alive[i] = 0;
+                if (units[i].node_id != 0) {
+                    const auto self = node_by_key.find(self_key(units[i]));
+                    if (self != node_by_key.end() && self->second == i) {
+                        node_by_key.erase(self);
+                    }
+                }
+                changed = true;
+            }
+        }
+    }
+
+    // child_count[(chain_hash, n_tokens)] = live children of that node (a node is a LEAF iff
+    // child_count[self_key] == 0).
+    std::map<node_key, size_t> child_count;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (alive[i] && units[i].parent_id != 0) {
+            child_count[parent_key(units[i])]++;
+        }
+    }
+
+    // Root index per node (walk parent links to a parentless node) + tree_recency = MAX mtime over each
+    // tree. root_of[i] is always an alive index; a bounded hop count guards a corrupt cycle.
+    std::vector<size_t> root_of(units.size(), 0);
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (!alive[i]) {
+            continue;
+        }
+        size_t cur = i;
+        for (size_t hops = 0; hops <= units.size(); ++hops) {
+            if (units[cur].parent_id == 0) {
+                break; // parentless => this is the root
+            }
+            const auto it = node_by_key.find(parent_key(units[cur]));
+            if (it == node_by_key.end() || !alive[it->second] || it->second == cur) {
+                break; // post-reap this should not happen; treat cur as the root defensively
+            }
+            cur = it->second;
+        }
+        root_of[i] = cur;
+    }
+
+    std::unordered_map<size_t, std::filesystem::file_time_type> tree_recency;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (!alive[i]) {
+            continue;
+        }
+        const size_t r = root_of[i];
+        const auto it = tree_recency.find(r);
+        if (it == tree_recency.end() || it->second < units[i].mtime) {
+            tree_recency[r] = units[i].mtime;
+        }
+    }
+
+    size_t    count = 0;
+    uintmax_t total = 0;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (alive[i]) {
+            count++;
+            total += units[i].bytes;
+        }
+    }
+
+    // Pick the evictable leaf with the smallest (tree_recency[root], mtime): the oldest tip of the
+    // least-recently-used tree. Returns units.size() when nothing is evictable (every remaining node has
+    // a live child, or all that is left is just_written).
+    auto pick_leaf = [&]() -> size_t {
+        size_t best = units.size();
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (!alive[i] || units[i].state_path == just_written) {
+                continue;
+            }
+            if (units[i].node_id != 0) {
+                const auto cc = child_count.find(self_key(units[i]));
+                if (cc != child_count.end() && cc->second > 0) {
+                    continue; // not a leaf: a delta still depends on it
+                }
+            }
+            if (best == units.size()) {
+                best = i;
+                continue;
+            }
+            const auto & ur = tree_recency[root_of[i]];
+            const auto & br = tree_recency[root_of[best]];
+            bool better;
+            if      (ur < br) { better = true; }
+            else if (br < ur) { better = false; }
+            else              { better = (units[i].mtime < units[best].mtime); }
+            if (better) {
+                best = i;
+            }
+        }
+        return best;
+    };
+
+    auto evict_leaf = [&]() -> bool {
+        const size_t i = pick_leaf();
+        if (i == units.size()) {
+            return false;
+        }
+        remove_unit_files(units[i]);
+        alive[i] = 0;
+        total -= std::min(total, (uintmax_t) units[i].bytes);
         count = (count > 0) ? count - 1 : 0;
-        idx++;
+        if (units[i].parent_id != 0) { // evicting a leaf may expose its parent as a new leaf
+            const auto it = child_count.find(parent_key(units[i]));
+            if (it != child_count.end() && it->second > 0) {
+                it->second--;
+            }
+        }
         return true;
     };
 
     if (max_count > 0) {
         while (count > (size_t) max_count) {
-            if (!evict_oldest()) {
+            if (!evict_leaf()) {
+                SRV_WRN("%s", "slot-save cache is over --slot-save-max-count but every remaining snapshot "
+                              "has a live child delta; leaving it above the limit\n");
                 break;
             }
         }
     }
     if (max_bytes > 0) {
         while (total > (uintmax_t) max_bytes) {
-            if (!evict_oldest()) {
+            if (!evict_leaf()) {
+                SRV_WRN("%s", "slot-save cache is over --slot-save-max-bytes but every remaining snapshot "
+                              "has a live child delta; leaving it above the limit\n");
                 break;
             }
         }
@@ -843,6 +1068,19 @@ static bool slot_meta_read(const std::string & state_filepath,
     if (range_hi_out) { *range_hi_out = range_hi; }
     fp_out = fp;
     return true;
+}
+
+// Forward-declared above slot_save_enforce_limits: expose only the delta-node fields so eviction can
+// resolve the tree without model_fp in scope. Leaves the outputs as a parentless root ([0,0) with no
+// parent) for a v1 whole snapshot, a foreign file, or any read failure (invariant 4 — never crash).
+static bool slot_node_meta_probe(const std::string & state_filepath,
+                                 uint64_t & parent_id, uint32_t & range_lo, uint32_t & range_hi) {
+    parent_id = 0;
+    range_lo  = 0;
+    range_hi  = 0;
+    model_fp     fp;
+    llama_tokens toks;
+    return slot_meta_read(state_filepath, fp, toks, &parent_id, &range_lo, &range_hi);
 }
 
 struct server_slot {
