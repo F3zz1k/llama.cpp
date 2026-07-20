@@ -2035,8 +2035,19 @@ private:
         // read the small .meta sidecar (tokens + fp) — never opens the multi-GB state file (invariant 5).
         model_fp disk_fp;
         llama_tokens disk_toks;
-        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
+        uint64_t disk_parent_id = 0;
+        uint32_t disk_range_lo  = 0;
+        uint32_t disk_range_hi  = 0;
+        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks,
+                            &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
             return 0; // invariant 4
+        }
+        // INTERIM GUARD (U3 only; removed by U4's base+delta restore walk): a v3 delta node's .bin
+        // holds only the tail cells [range_lo, range_hi), not a whole prefix. A plain single-file
+        // restore would load a base-less fragment and corrupt the slot, so until U4 wires the
+        // root->node compose refuse delta candidates and cold-prefill instead (invariant 4).
+        if (disk_parent_id != 0 || disk_range_lo != 0) {
+            return 0;
         }
         if (!(disk_fp == cur_fp)) {
             return 0; // invariant 3
@@ -2168,6 +2179,50 @@ private:
             }
         }
 
+        // INCREMENTAL SAVE (U3): when --slot-save-incremental, write only the KV cells added since the
+        // deepest already-saved snapshot on this branch (a v3 delta node) instead of re-D2H'ing and
+        // re-writing the whole prefix. Find the deepest candidate whose persisted tokens are a STRICT
+        // prefix of this prompt under the same fingerprint; the delta .bin then holds cells
+        // [parent_hi, N). auto_index_lookup returns candidates longest-first, so the first strict-prefix
+        // match is the deepest parent. Flag off (or no parent found) => the EXACT whole-save path below
+        // (v1, byte-identical). Everything after this (nonce temp, logits sidecar, temp+rename publish,
+        // index insert, LRU) is SHARED between both modes.
+        bool     have_parent = false;
+        uint64_t parent_id   = 0;
+        uint32_t parent_hi   = 0;
+        if (params_base.slot_save_incremental) {
+            for (const auto_cache_entry & cand : auto_index_lookup(toks)) {
+                model_fp     disk_fp;
+                llama_tokens disk_toks;
+                if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
+                    continue; // unreadable meta -> not a usable parent (invariant 4)
+                }
+                if (!(disk_fp == cur_fp)) {
+                    continue; // invariant 3
+                }
+                // STRICT prefix: disk_toks == toks[0:disk_toks.size()] AND disk_toks.size() < toks.size()
+                // (a delta must add at least one token; an equal/longer snapshot is not a parent here).
+                if (disk_toks.size() >= toks.size() ||
+                    !std::equal(disk_toks.begin(), disk_toks.end(), toks.begin())) {
+                    continue;
+                }
+                // parent_id = the parent node's chain_hash = the last whole-block boundary hash of its
+                // token prefix. Since disk_toks == toks[0:parent_hi], this reproduces the parent's own
+                // full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's file
+                // (the deterministic link U4's restore walk resolves). The parent cleared save_floor >=
+                // block, so its prefix has at least one boundary; guard defensively regardless.
+                const llama_tokens prefix(toks.begin(), toks.begin() + disk_toks.size());
+                const auto pbhs = auto_block_hashes(prefix, params_base.slot_save_block, cur_fp.fp_model);
+                if (pbhs.empty()) {
+                    continue;
+                }
+                parent_hi   = (uint32_t) disk_toks.size();
+                parent_id   = pbhs.back();
+                have_parent = true;
+                break; // deepest (longest-first) strict-prefix parent
+            }
+        }
+
         const std::string fname = auto_state_filename(full_hash, toks.size());
         // cross-process atomicity: the temp path MUST be unique per writer. The final
         // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
@@ -2185,8 +2240,12 @@ private:
         // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
         //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
         //    crash mid-write never leaves a corrupt state file the index would trust.
-        const size_t nwrite = llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id,
-                                                        toks.data(), toks.size());
+        //    When a parent was found (incremental mode), write a delta covering only cells [parent_hi, N)
+        //    via the range save; otherwise the exact whole-snapshot save (byte-identical v1 path).
+        const size_t nwrite = have_parent
+            ? llama_state_seq_save_file_range(ctx_tgt, tmp.c_str(), slot.id,
+                                              (llama_pos) parent_hi, -1, toks.data(), toks.size())
+            : llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
             return; // invariant 4: disk full / IO error -> generation unaffected
@@ -2198,8 +2257,14 @@ private:
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
         }
-        // 3) meta sidecar on the temp path (tokens + fingerprint). Written but renamed LAST.
-        if (!slot_meta_write(tmp, cur_fp, toks, full_hash)) {
+        // 3) meta sidecar on the temp path (tokens + fingerprint). Written but renamed LAST. In
+        //    incremental mode this is a v3 delta-node meta carrying parent_id + [parent_hi, N); a whole
+        //    save writes the v1 meta byte-identically.
+        const bool meta_ok = have_parent
+            ? slot_meta_write(tmp, cur_fp, toks, full_hash, /*is_node=*/true, parent_id, parent_hi,
+                              (uint32_t) toks.size())
+            : slot_meta_write(tmp, cur_fp, toks, full_hash);
+        if (!meta_ok) {
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
