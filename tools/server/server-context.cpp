@@ -2131,7 +2131,17 @@ private:
     // restores (each rejected candidate costs only a small .meta read + byte-compare; the multi-GB
     // state loads only once a candidate passes its gates). Byte-verification is mandatory and done by
     // the caller (invariant 2). O(#blocks).
-    std::vector<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+    //
+    // `max_attempts` caps how many candidates are returned. The RESTORE path keeps the default (each
+    // rejected restore costs a full .meta read + byte-compare, and a restore-side shadow was already
+    // cured by the multi-candidate index) — but the incremental SAVE parent-find passes SIZE_MAX to
+    // scan the FULL per-boundary candidate vectors: the deepest strict-prefix parent (the base) is the
+    // SHORTEST entry in its bucket, so with many divergent siblings it falls past the top few; a 4-cap
+    // there hides it and forces a whole (v1) snapshot instead of a small delta. Ordering is unchanged
+    // (deepest boundary first, longest first within a boundary), so the caller's first strict-prefix
+    // match is still the deepest parent.
+    std::vector<auto_cache_entry> auto_index_lookup(const llama_tokens & req,
+                                                    size_t max_attempts = AUTO_MAX_RESTORE_ATTEMPTS) {
         std::vector<auto_cache_entry> out;
         if (!auto_cache_enabled()) {
             return out; // off by default
@@ -2164,7 +2174,7 @@ private:
                         continue; // the same snapshot reaches several boundaries
                     }
                     out.push_back(c);
-                    if (out.size() >= AUTO_MAX_RESTORE_ATTEMPTS) {
+                    if (out.size() >= max_attempts) {
                         return out;
                     }
                 }
@@ -2496,15 +2506,19 @@ private:
         // deepest already-saved snapshot on this branch (a v3 delta node) instead of re-D2H'ing and
         // re-writing the whole prefix. Find the deepest candidate whose persisted tokens are a STRICT
         // prefix of this prompt under the same fingerprint; the delta .bin then holds cells
-        // [parent_hi, N). auto_index_lookup returns candidates longest-first, so the first strict-prefix
-        // match is the deepest parent. Flag off (or no parent found) => the EXACT whole-save path below
-        // (v1, byte-identical). Everything after this (nonce temp, logits sidecar, temp+rename publish,
-        // index insert, LRU) is SHARED between both modes.
+        // [parent_hi, N). The parent-find scans the FULL per-boundary candidate vectors (SIZE_MAX, not
+        // the RESTORE 4-cap): the real parent is the SHORTEST snapshot at the deepest SHARED boundary
+        // (a base whose bucket also holds N longer divergent siblings), so a 4-cap hides it and forces a
+        // whole (v1) save instead of a small v3 delta. auto_index_lookup still orders candidates
+        // deepest-boundary-first / longest-first, so the FIRST strict-prefix match is the deepest parent.
+        // Flag off (or no parent found) => the EXACT whole-save path below (v1, byte-identical).
+        // Everything after this (nonce temp, logits sidecar, temp+rename publish, index insert, LRU) is
+        // SHARED between both modes.
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
         if (params_base.slot_save_incremental) {
-            for (const auto_cache_entry & cand : auto_index_lookup(toks)) {
+            for (const auto_cache_entry & cand : auto_index_lookup(toks, /*max_attempts=*/SIZE_MAX)) {
                 model_fp     disk_fp;
                 llama_tokens disk_toks;
                 if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
