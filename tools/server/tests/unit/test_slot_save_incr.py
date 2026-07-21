@@ -454,3 +454,130 @@ def test_swa_incremental_save_restore(fa):
 
     assert body["content"] == ref_content, \
         "SWA base+delta cold restore must continue token-identical to the no-cache reference"
+
+
+# --- (9) + (10) many divergent siblings must not shadow the base --------------
+# Regression coverage for the incremental-save parent-find candidate cap. A base prompt shares
+# ONE boundary bucket with every divergent continuation of it; the base is the SHORTEST entry in
+# that bucket yet is the only real strict-prefix parent. Two caps used to (or still, without a
+# pin) hide it: the 4-candidate RESTORE lookup cap (fixed by scanning the full bucket for the
+# save-side parent-find) and the 32-entry per-boundary index cap (a pinned base is exempt).
+
+_DIVERGE_WORDS = [
+    "elephant", "mountain", "ocean", "guitar", "rocket", "garden", "planet", "river",
+    "forest", "castle", "dragon", "wizard", "engine", "comet", "meadow", "harbor",
+    "canyon", "glacier", "volcano", "desert", "island", "valley", "thunder", "crystal",
+    "copper", "silver", "velvet", "amber", "cobalt", "ivory", "marble", "granite",
+    "willow", "cedar", "maple", "birch", "spruce", "cavern", "lantern", "compass",
+]
+
+
+def _divergent_prompt(i: int) -> str:
+    """BASE + a continuation that (a) DIVERGES from every sibling at the FIRST token past BASE (a
+    unique leading word => no tail is a strict prefix of another, so the incremental parent-find
+    can only ever match BASE, never a sibling) and (b) has a token length UNIQUE to i (the filler
+    repeat count grows with i). Distinct lengths are load-bearing: the boundary index dedups
+    same-length entries in place (auto_index_insert_locked), so equal-length siblings would never
+    accumulate in the bucket and the shadowing regime (many siblings stacked ahead of the shorter
+    base) could never arise. BASE ends without a trailing space and the tail starts with one, so
+    BASE's token ids stay an exact strict prefix."""
+    w = _DIVERGE_WORDS[i]
+    return BASE + " " + w + " " + _join("marched onward through the quiet distant land.", i + 2)
+
+
+def _save_base_then_siblings(n_siblings: int, pin_base: bool, n_ctx: int = 1024):
+    """Save BASE as a v1 root, optionally pin it, then save n_siblings divergent continuations,
+    each flushed to its own snapshot. Returns (base_meta, sorted metas after stop). n_ctx must
+    hold BASE + the LONGEST divergent tail (tail length grows with the sibling index)."""
+    global server
+    server = _make_server(incremental=True, n_ctx=n_ctx)
+    server.n_batch = n_ctx
+    server.slot_save_max_count = 200  # disk-eviction off: isolate the in-memory boundary-cap behaviour
+    server.start()
+
+    _complete(server, BASE, n_predict=0)
+    m = _wait_for_metas(1, IDLE_SECONDS + 12)
+    assert len(m) == 1 and parse_meta(m[0])["version"] == 1, "the base must flush as one v1 root"
+    base_meta = parse_meta(m[0])
+
+    if pin_base:
+        # pin the base by touching "<state>.pin" next to its .bin, AFTER it was indexed — the
+        # normal deploy order the drop path re-stats for. Excludes it from the per-boundary cap.
+        pin_marker = _bin_for(m[0]) + ".pin"
+        open(pin_marker, "wb").close()
+        assert os.path.exists(pin_marker)
+
+    for i in range(n_siblings):
+        _complete(server, _divergent_prompt(i), n_predict=0)
+        m = _wait_for_metas(2 + i, IDLE_SECONDS + 12)
+        assert len(m) == 2 + i, f"sibling {i} was not flushed to disk (have {len(m)} metas)"
+    server.stop()
+    return base_meta, _metas()
+
+
+def test_many_divergent_siblings_do_not_shadow_base():
+    """(U7.9) REGRESSION for the parent-find candidate-cap shadow. Save a base as a v1 root, then
+    8 divergent continuations that all share the base's prefix then diverge. EACH must persist as
+    a v3 DELTA node whose parent_id == the base (range_lo == the base token count), NOT a whole v1
+    snapshot — i.e. the base is no longer shadowed.
+
+    Old code path: the incremental parent-find reused the RESTORE lookup's 4-candidate cap. The
+    base is the SHORTEST entry in the boundary bucket it shares with all the (longer) divergent
+    siblings, so once >4 siblings exist the base falls past the cap, is never returned, and each
+    further continuation re-saves the whole prefix as a FRESH v1 root. With 8 siblings the old
+    path yields 5 roots (base + siblings 5..8) and 4 deltas, so `len(roots) == 1` FAILS. The fix
+    scans the full bucket (SIZE_MAX) for the save-side parent-find, so the base is always found
+    and all 8 siblings are small deltas: 1 root, 8 deltas."""
+    n_siblings = 8
+    base_meta, metas = _save_base_then_siblings(n_siblings, pin_base=False)
+
+    roots = _roots(metas)
+    deltas = _deltas(metas)
+    assert len(roots) == 1, (
+        f"exactly one v1 root (the base) is expected; got {len(roots)} — extra roots mean divergent "
+        f"siblings were shadowed off the parent-find cap and re-saved the whole prefix (old bug)")
+    assert len(deltas) == n_siblings, \
+        f"every one of the {n_siblings} divergent siblings must be a v3 delta; got {len(deltas)}"
+    for d in deltas:
+        dm = parse_meta(d)
+        assert dm["parent_id"] == base_meta["chain_hash"], \
+            "each divergent sibling's delta must chain to the ONE base (parent_id == base chain_hash)"
+        assert dm["range_lo"] == base_meta["tok_count"], \
+            "each delta's KV range must begin exactly at the base token count (base is the parent)"
+        assert dm["range_hi"] == dm["tok_count"] > base_meta["tok_count"], \
+            "each delta covers [base_len, sibling_len) and is longer than the base"
+
+
+@pytest.mark.slow
+def test_pinned_base_survives_boundary_cap():
+    """(U7.10) The per-boundary candidate index is capped at 32 entries (AUTO_MAX_CANDIDATES_PER_-
+    BOUNDARY) and, on overflow, drops the SHORTEST entry — which is exactly the base an entire
+    fan-out of divergent siblings depends on. A '<base>.pin' marker excludes the base from that
+    eviction, so even PAST 32 divergent siblings the base stays indexed and every sibling still
+    saves as a v3 delta off it.
+
+    Pin the base (marker touched after it is indexed; the drop path re-stats it), then save 36
+    divergent siblings (> the 32 cap). All 36 must be v3 deltas chaining to the single pinned
+    base: 1 root, 36 deltas. Without the pin the base is the shortest entry and is evicted from
+    the bucket once it overflows at 33, after which the later siblings find no parent and re-save
+    whole v1 roots (>1 root) — this asserts the pin prevents that. NOTE: the 36 sequential
+    idle-flushed turns make this the slow case; marked `slow` so it can be deselected, but it runs
+    green here. Feasible on the tiny CPU model because each turn re-prefills only the short
+    divergent tail (BASE is prefix-cached in the slot)."""
+    n_siblings = 36  # > AUTO_MAX_CANDIDATES_PER_BOUNDARY (32)
+    # n_ctx=2048: the longest tail (sibling 35 => 37 filler repeats) plus BASE is ~1.1k tokens.
+    base_meta, metas = _save_base_then_siblings(n_siblings, pin_base=True, n_ctx=2048)
+
+    roots = _roots(metas)
+    deltas = _deltas(metas)
+    assert len(roots) == 1, (
+        f"the pinned base must remain the ONE root past the 32-cap; got {len(roots)} roots — extra "
+        f"roots mean the base was evicted from the boundary bucket and siblings re-saved whole")
+    assert len(deltas) == n_siblings, \
+        f"all {n_siblings} siblings past the cap must stay deltas off the pinned base; got {len(deltas)}"
+    for d in deltas:
+        dm = parse_meta(d)
+        assert dm["parent_id"] == base_meta["chain_hash"], \
+            "every sibling delta must chain to the single pinned base (parent_id == base chain_hash)"
+        assert dm["range_lo"] == base_meta["tok_count"], \
+            "every sibling delta's KV range must begin exactly at the base token count"

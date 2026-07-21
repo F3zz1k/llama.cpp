@@ -891,6 +891,13 @@ struct auto_cache_entry {
     std::string state_path; // full state file path (sidecars derived via *_path helpers)
     uint32_t    n_tokens = 0;
     model_fp    fp;         // snapshot's fingerprint (must equal the live one to be used)
+    // PINNED: a sibling "<state_path>.pin" marker exists. A pinned entry is NEVER dropped from its
+    // by_boundary bucket when the per-boundary cap (AUTO_MAX_CANDIDATES_PER_BOUNDARY) is exceeded, so a
+    // pinned base — the SHORTEST entry in a bucket shared with many longer divergent siblings, yet the
+    // only real strict-prefix parent the incremental save parent-find can use — stays findable past 32
+    // warm siblings. Set from disk during the scan; re-stat'd authoritatively when a drop is forced (a
+    // .pin touched AFTER the entry was first indexed — the normal deploy order — is still honoured).
+    bool        pinned = false;
 };
 
 // boundary-hash -> best (longest) entry covering that prefix length. Touched only
@@ -929,8 +936,11 @@ static constexpr int AUTO_REFRESH_MIN_MS = 1000;
 // Multi-candidate index bounds. A boundary may be reached by several snapshots of different lengths
 // (incremental saving makes every save a superset of the previous). They are kept longest-first so a
 // longer snapshot never shadows a shorter exact-length one that a FULL model needs; the per-boundary
-// list is capped (dropping the shortest), and a lookup returns at most a few candidates for the caller
-// to try in order.
+// list is capped (dropping the shortest UNPINNED entry — a pinned base is never dropped). A RESTORE
+// lookup returns at most AUTO_MAX_RESTORE_ATTEMPTS candidates for the caller to try in order (each
+// attempt is an expensive .meta read + byte-compare); the incremental SAVE parent-find instead passes
+// SIZE_MAX so the deepest strict-prefix parent (the SHORTEST entry, e.g. a pinned base) is never hidden
+// by the cap behind longer divergent siblings sharing the same boundary bucket.
 static constexpr size_t AUTO_MAX_CANDIDATES_PER_BOUNDARY = 32;
 static constexpr size_t AUTO_MAX_RESTORE_ATTEMPTS        = 4;
 
@@ -1914,6 +1924,7 @@ private:
             if (c.n_tokens == e.n_tokens) {
                 c.state_path = e.state_path; // same length/prefix: keep the newest file for this length
                 c.fp         = e.fp;
+                c.pinned     = e.pinned;
                 return;
             }
         }
@@ -1922,7 +1933,22 @@ private:
             [](const auto_cache_entry & a, const auto_cache_entry & b) { return a.n_tokens > b.n_tokens; });
         v.insert(pos, e);
         if (v.size() > AUTO_MAX_CANDIDATES_PER_BOUNDARY) {
-            v.pop_back(); // over the cap: drop the shortest
+            // Over the cap: drop the SHORTEST UNPINNED entry — NEVER a pinned one. A pinned base is the
+            // shortest entry in a boundary bucket shared with many longer divergent siblings, yet it is
+            // the ONLY real strict-prefix parent the incremental save parent-find can use; dropping it
+            // would force every later sibling to fall back to a whole (v1) snapshot. The .pin marker is
+            // re-stat'd here for authority (a pin touched after the entry was first indexed — the normal
+            // deploy order — is honoured, and the cached flag refreshed). Scan shortest-first (the vector
+            // is sorted descending); if EVERY entry is pinned (pathological) the bucket is left one over
+            // the cap rather than evict a pinned base.
+            for (auto rit = v.rbegin(); rit != v.rend(); ++rit) {
+                std::error_code pec;
+                rit->pinned = std::filesystem::exists(rit->state_path + ".pin", pec) && !pec;
+                if (!rit->pinned) {
+                    v.erase(std::next(rit).base());
+                    break;
+                }
+            }
         }
     }
 
@@ -1992,7 +2018,11 @@ private:
             // pre-image boundaries, so a text request can reuse a media snapshot's prefix.
             const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
                                                cur_fp.fp_model, cur_fp.fp_mmproj);
-            auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
+            // pin-awareness: a sibling "<state>.pin" marks this snapshot pinned so the per-boundary cap
+            // never drops it (protects a pinned base that shares a bucket with >32 divergent siblings).
+            std::error_code pec;
+            const bool pinned = std::filesystem::exists(p + ".pin", pec) && !pec;
+            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
             }
@@ -2045,7 +2075,17 @@ private:
     // shadowing a shorter usable one at the same boundary. Verification (byte-compare of the
     // candidate's persisted cells + per-record media identity) is mandatory and done by the caller
     // (invariant 2). O(#blocks).
-    std::vector<auto_cache_entry> auto_index_lookup(const server_tokens & req) {
+    //
+    // `max_attempts` caps how many candidates are returned. The RESTORE path keeps the default (each
+    // rejected restore costs a full .meta read + byte-compare, and a restore-side shadow was already
+    // cured by the multi-candidate index) — but the incremental SAVE parent-find passes SIZE_MAX to
+    // scan the FULL per-boundary candidate vectors: the deepest strict-prefix parent (the base) is the
+    // SHORTEST entry in its bucket, so with many divergent siblings it falls past the top few; a 4-cap
+    // there hides it and forces a whole (v1) snapshot instead of a small delta. Ordering is unchanged
+    // (deepest boundary first, longest first within a boundary), so the caller's first strict-prefix
+    // match is still the deepest parent.
+    std::vector<auto_cache_entry> auto_index_lookup(const server_tokens & req,
+                                                    size_t max_attempts = AUTO_MAX_RESTORE_ATTEMPTS) {
         std::vector<auto_cache_entry> out;
         if (!auto_cache_enabled()) {
             return out; // off by default
@@ -2090,7 +2130,7 @@ private:
                         continue; // the same snapshot reaches several boundaries
                     }
                     out.push_back(c);
-                    if (out.size() >= AUTO_MAX_RESTORE_ATTEMPTS) {
+                    if (out.size() >= max_attempts) {
                         return out;
                     }
                 }
@@ -2669,18 +2709,22 @@ private:
         // deepest already-saved snapshot on this branch (a v3 delta node) instead of re-D2H'ing and
         // re-writing the whole prefix. Find the deepest candidate whose persisted tokens are a STRICT
         // prefix of this prompt under the same fingerprint; the delta .bin then holds cells
-        // [parent_hi, N). auto_index_lookup returns candidates longest-first, so the first strict-prefix
-        // match is the deepest parent. Flag off (or no parent found) => the EXACT whole-save path below
-        // (v1, byte-identical). Everything after this (nonce temp, logits sidecar, temp+rename publish,
-        // index insert, LRU) is SHARED between both modes. INCREMENTAL IS TEXT-ONLY: a media slot never
-        // writes a v3 delta node (no media-delta), so guard on the per-request has_media() — a media
-        // prompt keeps the whole v2 save path below.
+        // [parent_hi, N). The parent-find scans the FULL per-boundary candidate vectors (SIZE_MAX, not
+        // the RESTORE 4-cap): the real parent is the SHORTEST snapshot at the deepest SHARED boundary
+        // (e.g. a pinned base whose bucket also holds N longer divergent siblings), so a 4-cap hides it
+        // and forces a whole (v1, ~1.77GB) save instead of a small v3 delta. auto_index_lookup still
+        // orders candidates deepest-boundary-first / longest-first, so the FIRST strict-prefix match is
+        // the deepest parent. Flag off (or no parent found) => the EXACT whole-save path below (v1,
+        // byte-identical). Everything after this (nonce temp, logits sidecar, temp+rename publish, index
+        // insert, LRU) is SHARED between both modes. INCREMENTAL IS TEXT-ONLY: a media slot never writes
+        // a v3 delta node (no media-delta), so guard on the per-request has_media() — a media prompt
+        // keeps the whole v2 save path below.
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
         if (params_base.slot_save_incremental && !prompt_has_media) {
             // text-only slot: cell tokens == `toks`, so look up against the live prompt (server_tokens).
-            for (const auto_cache_entry & cand : auto_index_lookup(slot.prompt.tokens)) {
+            for (const auto_cache_entry & cand : auto_index_lookup(slot.prompt.tokens, /*max_attempts=*/SIZE_MAX)) {
                 model_fp     disk_fp;
                 llama_tokens disk_toks;
                 std::vector<server_media_record> disk_media;
