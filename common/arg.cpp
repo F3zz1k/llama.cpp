@@ -791,6 +791,23 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.slot_save_min_tokens < 0) {
         throw std::invalid_argument("--slot-save-min-tokens must be >= 0");
     }
+    // the shared-context base floor and the restore floor are validated unconditionally (negatives
+    // are never meaningful), even with the master switch off.
+    if (params.slot_save_context_min_tokens < 0) {
+        throw std::invalid_argument("--slot-save-context-min-tokens must be >= 0");
+    }
+    if (params.slot_restore_min_tokens < 0) {
+        throw std::invalid_argument("--slot-restore-min-tokens must be >= 0");
+    }
+    // a written snapshot must remain restorable: a snapshot written at length L can never yield a
+    // matched prefix longer than L, so if the restore floor exceeds a save floor the snapshot would
+    // be written and then always skipped on restore — pure waste. Make that unrepresentable.
+    if (params.slot_restore_min_tokens > params.slot_save_min_tokens) {
+        throw std::invalid_argument("--slot-restore-min-tokens must be <= --slot-save-min-tokens");
+    }
+    if (params.slot_restore_min_tokens > params.slot_save_context_min_tokens) {
+        throw std::invalid_argument("--slot-restore-min-tokens must be <= --slot-save-context-min-tokens");
+    }
     // idle-delay flush is inert without the master switch (auto_idle_flush_enabled() gates on
     // auto_cache_enabled()); reject an explicit --slot-save-idle-seconds without --slot-save-auto
     // rather than silently ignoring it. The default (unset) is left alone so plain servers still run.
@@ -3380,6 +3397,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_save_min_tokens = value;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-context-min-tokens"}, "N",
+        string_format("minimum size (tokens) for the [0,B) shared-context base checkpoint written to "
+                      "the auto disk cache; a smaller shared prefix is not worth a distinct base file. "
+                      "The effective floor is max(--slot-save-block, this) (default: %d)", params.slot_save_context_min_tokens),
+        [](common_params & params, int value) {
+            params.slot_save_context_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_CONTEXT_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-restore-min-tokens"}, "N",
+        string_format("skip an auto disk cache restore (reprocess the prompt instead) when the verified, "
+                      "block-aligned matched prefix is below this many tokens; the reprocess beats a "
+                      "multi-GB disk load. Default 0 = opt-in, no behaviour change (default: %d)", params.slot_restore_min_tokens),
+        [](common_params & params, int value) {
+            params.slot_restore_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_RESTORE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-idle-seconds"}, "N",
         string_format("flush a slot's warm KV to the auto disk cache after N seconds of idleness, "

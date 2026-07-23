@@ -217,6 +217,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--slot-save-block N` | token-ID hash block size for the auto disk cache index; reuse granularity is one block (default: 256)<br/>(env: LLAMA_ARG_SLOT_SAVE_BLOCK) |
 | `--slot-save-idle-seconds N` | flush a slot's warm KV to the auto disk cache after N seconds of idleness, so a lone request survives a crash and is visible to peer instances without further traffic; requires --slot-save-auto (default: 60, -1 = disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS) |
 | `--slot-save-incremental` | for the auto disk cache, save only the KV delta added since the last checkpoint instead of a complete snapshot each time (much less disk/PCIe write for a growing conversation); hybrid/SWA models still write their recurrent/sliding-window state whole. Requires --slot-save-auto (default: complete snapshots)<br/>(env: LLAMA_ARG_SLOT_SAVE_INCREMENTAL) |
+| `--slot-save-context-min-tokens N` | minimum block-aligned length of the shared leading context (system + developer + tool + RAG, everything before the first user turn) for the auto disk cache to persist it ONCE as a deduplicated base checkpoint; N chats sharing that prefix then each save only their own small delta. Effective floor is max(--slot-save-block, N). Pure-attention text models only. Requires --slot-save-auto (default: 4096)<br/>(env: LLAMA_ARG_SLOT_SAVE_CONTEXT_MIN_TOKENS) |
+| `--slot-restore-min-tokens N` | skip the auto disk cache restore (reprocess the prompt instead) when the byte-verified matched prefix is shorter than N tokens — for a near-cold slot, reprocessing a tiny prefix beats paying the multi-GB disk read. Must be <= --slot-save-context-min-tokens (default: 0 = never skip; opt-in, no behaviour change)<br/>(env: LLAMA_ARG_SLOT_RESTORE_MIN_TOKENS) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1204,6 +1206,31 @@ token-identical to an uncached run. The first (parentless) save of a lineage sta
 snapshot, and a context shift (which rewrites already-saved token positions) transparently rebases
 to a fresh whole snapshot. `--slot-save-incremental` requires `--slot-save-auto`. The on-disk
 format is documented in [`docs/kv-cache/incremental-disk-cache.md`](../../docs/kv-cache/incremental-disk-cache.md).
+
+`--slot-save-context-min-tokens` adds a **shared-context checkpoint**. When many chats share the
+same leading context — a common system prompt, developer/tool preamble, or a large retrieved (RAG)
+block, everything before the first user turn — each one would otherwise persist a near-identical
+whole prefix, a fan-out of large files. Instead the server saves that shared prefix `[0, B)` **once**
+as a deduplicated base (B = the first-user-message token offset, block-aligned down, gated to
+`>= max(--slot-save-block, --slot-save-context-min-tokens)`), and every later same-context chat writes
+nothing for the base. Combined with `--slot-save-incremental`, each chat's own save then collapses to
+a small `[B, N)` delta parented on that one base — one base plus N deltas instead of N whole prefixes.
+The base is a normal v1 root and the children normal v3 deltas — **no new on-disk format**. Without
+`--slot-save-incremental` the children still whole-save, so the base only accelerates *restore*.
+
+The checkpoint is written **only for pure-attention text models** (`PART` sequence removal,
+`n_swa == 0`, non-media prompts). It is deliberately suppressed for recurrent/hybrid (e.g. GDN) and
+sliding-window (SWA) models, where a `[0, B)` sub-range of the KV is not a sound prefix state and
+would silently produce wrong output; those classes fall back to the existing whole-prefix save with
+no change. Templates that embed the system prompt inside the first user turn (Mistral/Llama-2
+`[INST]`) yield no boundary and simply no-op.
+
+`--slot-restore-min-tokens` is an absolute floor on the restore side: when the byte-verified matched
+prefix is shorter than N tokens the server reprocesses the prompt rather than paying the multi-GB disk
+read + host copy, which for a near-cold slot is faster. It gates **all** auto-restores, so the default
+is `0` (never skip — no behaviour change for existing users); raise it after measuring your own
+disk-read-vs-reprocess crossover. It must not exceed `--slot-save-context-min-tokens` (or
+`--slot-save-min-tokens`), else a snapshot could be written and then always skipped on restore.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

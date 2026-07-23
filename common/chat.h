@@ -188,6 +188,18 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    // forward-iterate mirror of last_user_message_pos(): the token offset of the FIRST user
+    // message, i.e. the end of the shared leading context (system + developer + tool + RAG).
+    // Used as the boundary B for the [0,B) shared-context checkpoint. -1 if there is no user span.
+    int32_t first_user_message_pos() const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) it->pos;
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {
