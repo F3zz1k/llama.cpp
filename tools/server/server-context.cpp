@@ -1952,6 +1952,25 @@ private:
         }
     }
 
+    // True iff an entry of EXACTLY n_tokens length is already indexed at `boundary`. The
+    // shared-context checkpoint uses this for its redundant-write dedup: the 2nd..Nth chat sharing
+    // the same [0,B) prefix finds the base already published at bhs[B/block-1] and writes nothing.
+    // Unlike the whole-save path's equal-or-longer dedup, the base must match on EXACT length — a
+    // LONGER snapshot at the same boundary is a divergent sibling prefix, not this base, so it must
+    // not suppress the base write. CALLER MUST HOLD auto_idx.mtx.
+    bool auto_index_has_exact_locked(uint64_t boundary, uint32_t n_tokens) const {
+        auto it = auto_idx.by_boundary.find(boundary);
+        if (it == auto_idx.by_boundary.end()) {
+            return false;
+        }
+        for (const auto_cache_entry & c : it->second) {
+            if (c.n_tokens == n_tokens) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Scan the slot-save dir and (re)build index entries from .meta sidecars: header-only reads
     // (never the multi-GB state). Each bad/foreign file is skipped individually (invariant 4);
     // foreign-model files are left on disk (a sibling model may own them). Idempotent: re-running it
@@ -2589,6 +2608,16 @@ private:
         if (n_keep_disk < n_keep_mem + B) {
             return 0;
         }
+        // ABSOLUTE restore floor (--slot-restore-min-tokens, default 0 = off): skip the multi-GB
+        // disk load and reprocess instead when the byte-verified, block-aligned matched prefix is
+        // below the floor — for a near-cold slot reprocessing a tiny prefix beats paying the NVMe
+        // read + H2D copy. Gated on n_keep_disk (the ACTUAL verified match), NOT cand.n_tokens (the
+        // snapshot length, which can far exceed the match). Placed after the relative MARGIN gate
+        // (which handles "is disk worth more than the resident match") and before the only multi-GB
+        // read: return 0 falls through to the caller recomputing n_past + a cold prefill (invariant 4).
+        if (n_keep_disk < params_base.slot_restore_min_tokens) {
+            return 0;
+        }
         // Build the root->tip chain of node .bin paths via the shared walker. Done BEFORE touching
         // the slot so any inconsistency (missing/corrupt/non-contiguous node) simply returns 0 for a
         // cold prefill, never disturbing the resident KV (invariant 4). `disk_toks` (the tip's full
@@ -2694,6 +2723,277 @@ private:
     // state + .logits + .meta as a 3-file unit (atomically, .meta LAST so a torn write is never
     // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
     // is the gate; invariant 5: only called on slot release/reassign, never during generation.
+    // SHARED atomic-publish tail, factored out of auto_save_slot_if_useful so the temp->fsync->
+    // rename (meta last) publish invariant, the capacity pre-flight and the per-boundary index
+    // insert live in ONE place. Persists KV cells [lo, hi) of slot.id's sequence as one disk unit
+    // named auto_state_filename(hash, hi):
+    //   - a ROOT snapshot when lo == 0 (v1 text / v2 media, `media` selecting which); either the
+    //     WHOLE prompt (hi == toks.size(), byte-identical to the pre-refactor save_file path) or a
+    //     PARTIAL [0, hi) root — the shared-context checkpoint — persisted via the range API;
+    //   - a v3 DELTA node when lo > 0 (lo == parent_hi): cells [lo, hi=N) parented on `parent_id`.
+    // `hash` is the chain hash that names the file and commits the prefix; the index is populated at
+    // boundaries bhs[0..kb] inclusive. Behaviour-preserving for the whole-save and delta callers.
+    void auto_publish_snapshot(server_slot & slot,
+                               llama_context * ctx,
+                               const llama_tokens & toks,
+                               int32_t lo,
+                               int32_t hi,
+                               uint64_t hash,
+                               const std::vector<uint64_t> & bhs,
+                               size_t kb,
+                               const model_fp & fp,
+                               const std::vector<server_media_record> & media = {},
+                               uint64_t parent_id = 0) {
+        bool     is_node   = lo > 0;      // lo > 0 <=> a delta parented at parent_hi == lo
+        uint32_t parent_hi = (uint32_t) lo; // both cleared below if the U6 delta cell-count check fails
+        // the snapshot's own token prefix [0, hi): equals `toks` for a whole/delta save (hi == N),
+        // a strict prefix for a partial-root checkpoint. Avoid the copy in the common hi == N path.
+        const llama_tokens   snap_owned = ((size_t) hi == toks.size())
+                                          ? llama_tokens{}
+                                          : llama_tokens(toks.begin(), toks.begin() + hi);
+        const llama_tokens & snap_toks  = ((size_t) hi == toks.size()) ? toks : snap_owned;
+
+        // capacity pre-flight (statvfs via std::filesystem::space): refuse to START a multi-GB
+        // write the filesystem cannot hold — on btrfs an ENOSPC mid-write can flip the whole
+        // filesystem read-only, a far worse failure than a skipped opportunistic save. Exact
+        // state size + the token array, with 10% slack covering the file header and the
+        // .logits/.meta sidecars. An unanswerable space query skips too (conservative;
+        // invariant 4: a skipped save never affects generation).
+        {
+            const size_t sz_state = llama_state_seq_get_size(ctx, slot.id);
+            const size_t sz_need  = sz_state + snap_toks.size() * sizeof(llama_token);
+            std::error_code sec;
+            const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
+            if (sec || sinfo.available < sz_need + sz_need / 10) {
+                SLT_DBG(slot, "auto-save: skipped, insufficient free space (need %zu bytes + 10%% slack, available %zu)\n",
+                        sz_need, sec ? 0 : (size_t) sinfo.available);
+                return;
+            }
+        }
+
+        const std::string fname = auto_state_filename(hash, snap_toks.size());
+        // cross-process atomicity: the temp path MUST be unique per writer. The final
+        // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
+        // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
+        // and interleave -> a corrupt temp gets renamed over a good final file. We disambiguate the
+        // temp with pid + a per-process monotonic counter, so each writer owns its own complete temp
+        // and the deterministic-name rename is the ONLY shared, atomic step (idempotent: identical
+        // content). The sidecar temps derive from this same unique base so they are unique too.
+        // (nonce is atomic so it stays correct if save I/O is later threaded.)
+        static std::atomic<uint64_t> s_tmp_nonce{0};
+        const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
+        const std::string tmp = fname + "." + std::to_string((long) getpid()) + "." +
+                                std::to_string(nonce) + ".tmp";
+
+        // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
+        //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
+        //    crash mid-write never leaves a corrupt state file the index would trust.
+        //    A DELTA node (lo > 0) writes only cells [lo, N) via the range save; a PARTIAL root
+        //    (checkpoint, hi < N) writes cells [0, hi) via the range save; the WHOLE root takes the
+        //    byte-identical save_file path.
+        size_t nwrite;
+        if (is_node) {
+            // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
+            // slot.prompt.tokens.pos_next(parent_hi) — the same function that assigned the cell
+            // positions (mtmd decode seeds on pos_next). For text pos_next == parent_hi (byte-identical
+            // delta); for media the two differ and pos_next is the correct boundary.
+            nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
+                                                     slot.prompt.tokens.pos_next((llama_pos) lo), -1,
+                                                     snap_toks.data(), snap_toks.size());
+        } else if ((size_t) hi == toks.size()) {
+            nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
+        } else {
+            nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
+                                                     0, (llama_pos) hi, snap_toks.data(), snap_toks.size());
+        }
+        if (nwrite == 0) {
+            std::error_code ec; std::filesystem::remove(tmp, ec);
+            return; // invariant 4: disk full / IO error -> generation unaffected
+        }
+        // 1b) U6 (mm-delta decision 4): a range-save delta selects suffix cells by POSITION, so a
+        //     mid-chunk anomaly could leave the boundary value right yet silently drop/duplicate suffix
+        //     cells — and restore's byte-verify is NULL-blind. Peek the delta .bin's serialized cell
+        //     count (no multi-GB load) and require it to equal N - parent_hi. On any mismatch do NOT
+        //     persist a corrupt delta: discard and fall back to a WHOLE save of this exact prefix
+        //     (is_node cleared => the meta below is v1/v2 by `media`, byte-identical to a no-parent save).
+        if (is_node) {
+            uint32_t written_cells = 0;
+            const bool ok = delta_bin_cell_count(tmp, snap_toks.size(), written_cells) &&
+                            (size_t) written_cells == snap_toks.size() - parent_hi;
+            if (!ok) {
+                SLT_WRN(slot, "auto-save: delta cell-count check failed (expected %zu, got %u); "
+                              "falling back to a whole snapshot\n",
+                        snap_toks.size() - parent_hi, written_cells);
+                std::error_code ec; std::filesystem::remove(tmp, ec);
+                is_node   = false;
+                parent_id = 0;
+                parent_hi = 0;
+                nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
+                if (nwrite == 0) {
+                    std::filesystem::remove(tmp, ec);
+                    return; // invariant 4
+                }
+            }
+        }
+        // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
+        //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            slot.logits_last_n_tokens == (int32_t) snap_toks.size() && !slot.logits_last.empty()) {
+            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) snap_toks.size());
+        }
+        // 3) meta sidecar on the temp path. Written but renamed LAST. A whole/partial ROOT writes the
+        //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
+        //    records). A DELTA (is_node) passes the FULL `media` records so slot_meta_write's
+        //    (is_node, media-empty) dispatch selects v3 for a text delta (byte-identical) and v4 for a
+        //    media delta; the meta stays WHOLE ([0,N) tokens + full tiling) while the .bin holds only
+        //    cells [lo, N), so restore's byte-verify is the exact v2 path and the .bin composes via NO_CLEAR.
+        const bool meta_ok = is_node
+            ? slot_meta_write(tmp, fp, snap_toks, hash, /*media=*/media, /*is_node=*/true,
+                              parent_id, parent_hi, (uint32_t) snap_toks.size())
+            : slot_meta_write(tmp, fp, snap_toks, hash, media);
+        if (!meta_ok) {
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            return; // invariant 4
+        }
+        // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
+        //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
+        std::error_code ec;
+        std::filesystem::rename(tmp, fname, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            return; // invariant 4
+        }
+        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
+        ec.clear();
+        std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
+        // the .meta is the scan key — a unit whose .meta never landed must NOT be
+        // published. If the meta rename failed, the .bin is already in place but unindexable, so we
+        // unlink the orphan .bin (and any leftover temps) and DO NOT insert into the in-memory index.
+        // Leaving the .bin would waste disk and a restart scan would skip it anyway (no .meta).
+        if (ec) {
+            std::error_code rec;
+            std::filesystem::remove(fname, rec);
+            std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+            return; // invariant 4: don't index a unit whose .meta (the scan key) never published
+        }
+
+        if (media.empty()) {
+            SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", snap_toks.size(), fname.c_str());
+        } else {
+            SLT_INF(slot, "auto-save: persisted %zu cells incl. %zu media chunks to %s\n",
+                    snap_toks.size(), media.size(), fname.c_str());
+        }
+
+        // index insert (bhs[0..kb] -> this snapshot), then bounded-LRU + reconcile.
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp };
+            for (size_t i = 0; i <= kb && i < bhs.size(); ++i) {
+                auto_index_insert_locked(bhs[i], e);
+            }
+            auto_idx.indexed_files.insert(fname); // remember our own write so a refresh won't re-open it
+        }
+        // Eviction is opt-in and scoped to the auto cache. This hook already runs only under
+        // auto_cache_enabled(), but the gate is stated at the call site too so the invariant
+        // (a bounded, self-reaping store belongs to --slot-save-auto, never plain --slot-save-path)
+        // is local to every enforce_limits caller.
+        if (auto_cache_enabled() &&
+            (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
+            bool oversized = false;
+            slot_save_enforce_limits(params_base.slot_save_path,
+                                     params_base.slot_save_max_count,
+                                     params_base.slot_save_max_bytes,
+                                     fname, oversized);
+        }
+        // Reconcile index with what the LRU kept (ours or a peer's) AND adopt the post-write dir
+        // mtime as our scan baseline — both under ONE lock. Re-baselining here means OUR OWN
+        // save+evict does not make the next lookup think a PEER changed the dir (which would force a
+        // redundant full re-scan); a real peer write afterwards bumps the mtime again -> still
+        // detected. CALLER holds no lock here.
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_index_drop_missing_locked();
+            std::error_code mec;
+            const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
+            if (!mec) {
+                auto_idx.dir_mtime = dmt;
+            }
+        }
+    }
+
+    // SHARED-CONTEXT CHECKPOINT: persist the leading shared context [0, B_ctx) ONCE as a deduplicated
+    // v1 ROOT, so N chats that share that prefix each collapse their own save to a small [B_ctx, N)
+    // delta parented on this one base (the existing incremental parent-find discovers it for free).
+    // Called from auto_save_slot_if_useful right after `bhs` is computed and BEFORE the whole-prefix
+    // dedup, reusing the `toks`/`bhs` already in scope. Every early return is a clean no-op to the
+    // existing whole-prefix save (invariant 4). All gates below are correctness- or efficiency-scoped:
+    //   (1) MODEL-CLASS gate (correctness-critical, NOT optional): a [0,B) sub-range save is only
+    //       SOUND for non-windowed attention. For FULL/RS (recurrent/hybrid, e.g. a3b) the range save
+    //       would persist the state-after-N mislabelled as a B-length prefix (byte-verify matches the
+    //       token ids but not that the bytes are the state AT position B) -> silent wrong output. For
+    //       SWA (n_swa>0, e.g. gemma) cells [0,B) are exactly what the sliding window evicts once N
+    //       grows -> the checkpoint targets non-resident KV -> garbage at SAVE time. Gate to PART &&
+    //       n_swa == 0; a3b and gemma are correctly and safely excluded (they NEVER write a base).
+    //   (2) TEXT-ONLY gate: media makes the block-hash array sparse (auto_block_hashes only emits at
+    //       chunk-safe boundaries), so bhs[B/block-1] would index the wrong prefix length; text keeps
+    //       bhs dense and the positional lookup exact. Matches the text-only delta-parenting path.
+    void auto_save_context_checkpoint(server_slot & slot, const llama_tokens & toks,
+                                      const std::vector<uint64_t> & bhs) {
+        // (1) MODEL-CLASS soundness gate — see header. UNSOUND for recurrent/hybrid (FULL/RS) and SWA.
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART || n_swa != 0) {
+            return;
+        }
+        // (2) text-only gate — keeps bhs dense so the positional hash lookup below is valid.
+        if (slot.prompt.tokens.has_media()) {
+            return;
+        }
+        // B = first-user-message offset, stashed on the persistent server_prompt at task creation
+        // (never read from the transient/dead task at idle-flush). <= 0 means no user span was found
+        // (detection failure, INST-family with the system prompt inside the first [INST]) -> no base.
+        const int32_t boundary = slot.prompt.ctx_boundary;
+        if (boundary <= 0) {
+            return;
+        }
+        const int B     = params_base.slot_save_block;
+        const int B_ctx = boundary - (boundary % B);                 // block-align DOWN (idiom at ~2447)
+        // effective floor = max(block, context-min): a base below this saves little dedup against the
+        // state-file write, so it is skipped (efficiency-only; INST no-ops and few-shot get a smaller base).
+        const int floor_ctx = std::max(B, params_base.slot_save_context_min_tokens);
+        if (B_ctx < floor_ctx) {
+            return;
+        }
+        if (B_ctx >= (int) toks.size()) {
+            return;                                                  // must be a STRICT prefix of this prompt
+        }
+        const size_t kb = (size_t) (B_ctx / B) - 1;                 // bhs dense (text) => positional index OK
+        if (kb >= bhs.size()) {
+            return;                                                  // defensive: never index past the chain
+        }
+        const uint64_t ckpt_hash = bhs[kb];                         // NO re-hash: the boundary hash is in bhs
+        // (3) EXACT-LENGTH redundant-write dedup (not equal-or-longer): the 2nd..Nth chat sharing this
+        //     [0,B_ctx) prefix finds the base already published at this boundary and writes nothing.
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            if (auto_index_has_exact_locked(ckpt_hash, (uint32_t) B_ctx)) {
+                return;
+            }
+        }
+        // (4) write cells [0, B_ctx) as a plain v1 ROOT (lo == 0, hi < N, text-only => media empty,
+        //     parent_id 0) via the SHARED atomic-publish helper — same capacity pre-flight, pid+nonce
+        //     temp, three-file temp->rename (meta last) publish + per-boundary index insert as the
+        //     whole-save path. Delta children then fall out of the existing incremental parent-find.
+        auto_publish_snapshot(slot, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
+                              ckpt_hash, bhs, /*kb=*/kb, cur_fp);
+    }
+
     void auto_save_slot_if_useful(server_slot & slot) {
         if (!auto_cache_enabled()) {
             return; // off by default
@@ -2764,6 +3064,12 @@ private:
         if (bhs.empty()) {
             return;
         }
+        // SHARED-CONTEXT CHECKPOINT: publish the leading shared context [0, B_ctx) as ONE deduplicated
+        // base BEFORE the whole-prefix dedup, so the incremental parent-find below discovers it as this
+        // chat's delta parent for free. Fully self-gated (model-class, text-only, boundary, floor);
+        // a clean no-op on every excluded class and when no user boundary was found.
+        auto_save_context_checkpoint(slot, toks, bhs);
+
         const uint64_t full_hash = bhs.back(); // commits the whole whole-block prefix
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -2889,178 +3195,15 @@ private:
             }
         }
 
-        // capacity pre-flight (statvfs via std::filesystem::space): refuse to START a multi-GB
-        // write the filesystem cannot hold — on btrfs an ENOSPC mid-write can flip the whole
-        // filesystem read-only, a far worse failure than a skipped opportunistic save. Exact
-        // state size + the token array, with 10% slack covering the file header and the
-        // .logits/.meta sidecars. An unanswerable space query skips too (conservative;
-        // invariant 4: a skipped save never affects generation).
-        {
-            const size_t sz_state = llama_state_seq_get_size(ctx_tgt, slot.id);
-            const size_t sz_need  = sz_state + toks.size() * sizeof(llama_token);
-            std::error_code sec;
-            const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
-            if (sec || sinfo.available < sz_need + sz_need / 10) {
-                SLT_DBG(slot, "auto-save: skipped, insufficient free space (need %zu bytes + 10%% slack, available %zu)\n",
-                        sz_need, sec ? 0 : (size_t) sinfo.available);
-                return;
-            }
-        }
-
-        const std::string fname = auto_state_filename(full_hash, toks.size());
-        // cross-process atomicity: the temp path MUST be unique per writer. The final
-        // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
-        // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
-        // and interleave -> a corrupt temp gets renamed over a good final file. We disambiguate the
-        // temp with pid + a per-process monotonic counter, so each writer owns its own complete temp
-        // and the deterministic-name rename is the ONLY shared, atomic step (idempotent: identical
-        // content). The sidecar temps derive from this same unique base so they are unique too.
-        // (nonce is atomic so it stays correct if save I/O is later threaded.)
-        static std::atomic<uint64_t> s_tmp_nonce{0};
-        const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
-        const std::string tmp = fname + "." + std::to_string((long) getpid()) + "." +
-                                std::to_string(nonce) + ".tmp";
-
-        // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
-        //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
-        //    crash mid-write never leaves a corrupt state file the index would trust.
-        //    When a parent was found (incremental mode), write a delta covering only cells [parent_hi, N)
-        //    via the range save; otherwise the exact whole-snapshot save (byte-identical whole path).
-        //    U5 (decision 1): the range save filters by POSITION, so the boundary is
-        //    slot.prompt.tokens.pos_next(parent_hi) — the SAME function that assigned the cell
-        //    positions (mtmd decode seeds on pos_next), so reading the boundary back with it is
-        //    identical by construction with no new helper / second source of truth. For text
-        //    pos_next(parent_hi) == parent_hi, so the text delta .bin stays byte-identical — the one
-        //    expression serves both paths.
-        size_t nwrite = have_parent
-            ? llama_state_seq_save_file_range(ctx_tgt, tmp.c_str(), slot.id,
-                                              slot.prompt.tokens.pos_next(parent_hi), -1,
-                                              toks.data(), toks.size())
-            : llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
-        if (nwrite == 0) {
-            std::error_code ec; std::filesystem::remove(tmp, ec);
-            return; // invariant 4: disk full / IO error -> generation unaffected
-        }
-        // 1b) post-save cell-count assert (U6 / decision 4): a range save selects suffix cells by
-        //    position, so a mid-chunk position anomaly could leave the boundary value correct yet make
-        //    the positional filter silently drop or duplicate suffix cells — and restore's byte-verify
-        //    is NULL-blind, so it would not catch it. Peek the delta .bin's serialized cell count (no
-        //    multi-GB load) and require it to equal the expected N - parent_hi. On any mismatch, do NOT
-        //    persist a corrupt delta: discard the temp and fall back to a WHOLE snapshot for this exact
-        //    prefix (byte-identical to a no-parent save — v1/v2 by `media`).
-        if (have_parent) {
-            uint32_t written_cells = 0;
-            const bool ok = delta_bin_cell_count(tmp, toks.size(), written_cells) &&
-                            (size_t) written_cells == toks.size() - parent_hi;
-            if (!ok) {
-                SLT_WRN(slot, "auto-save: delta cell-count check failed (expected %zu, got %u); "
-                              "falling back to a whole snapshot\n",
-                        toks.size() - parent_hi, written_cells);
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                have_parent = false;
-                parent_id   = 0;
-                parent_hi   = 0;
-                nwrite = llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
-                if (nwrite == 0) {
-                    std::filesystem::remove(tmp, ec);
-                    return; // invariant 4
-                }
-            }
-        }
-        // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
-        //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
-            slot.logits_last_n_tokens == (int32_t) toks.size() && !slot.logits_last.empty()) {
-            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-            slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
-        }
-        // 3) meta sidecar on the temp path. Written but renamed LAST. A whole snapshot writes the
-        //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
-        //    records). In incremental mode (have_parent) this is a delta-node meta carrying parent_id
-        //    + [parent_hi, N): U7 (decision 3) passes the FULL `media` records, so slot_meta_write's
-        //    (is_node, media-empty) dispatch selects v3 for a text delta (byte-identical to before)
-        //    and v4 for a media delta. The meta stays WHOLE — the full [0,N) cell-token array and the
-        //    complete record tiling — while the .bin holds only cells [parent_hi, N); restore's
-        //    byte-verify is thus the exact v2 path and the .bin composes through the NO_CLEAR chain.
-        const bool meta_ok = have_parent
-            ? slot_meta_write(tmp, cur_fp, toks, full_hash, /*media=*/media, /*is_node=*/true,
-                              parent_id, parent_hi, (uint32_t) toks.size())
-            : slot_meta_write(tmp, cur_fp, toks, full_hash, media);
-        if (!meta_ok) {
-            std::error_code ec;
-            std::filesystem::remove(tmp, ec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            return; // invariant 4
-        }
-        // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
-        //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
-        std::error_code ec;
-        std::filesystem::rename(tmp, fname, ec);
-        if (ec) {
-            std::filesystem::remove(tmp, ec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            return; // invariant 4
-        }
-        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
-        ec.clear();
-        std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
-        // the .meta is the scan key — a unit whose .meta never landed must NOT be
-        // published. If the meta rename failed, the .bin is already in place but unindexable, so we
-        // unlink the orphan .bin (and any leftover temps) and DO NOT insert into the in-memory index.
-        // Leaving the .bin would waste disk and a restart scan would skip it anyway (no .meta).
-        if (ec) {
-            std::error_code rec;
-            std::filesystem::remove(fname, rec);
-            std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
-            return; // invariant 4: don't index a unit whose .meta (the scan key) never published
-        }
-
-        if (media.empty()) {
-            SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", toks.size(), fname.c_str());
-        } else {
-            SLT_INF(slot, "auto-save: persisted %zu cells incl. %zu media chunks to %s\n",
-                    toks.size(), media.size(), fname.c_str());
-        }
-
-        // index insert (every boundary -> this snapshot), then bounded-LRU + reconcile.
-        {
-            std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            auto_cache_entry e{ fname, (uint32_t) toks.size(), cur_fp };
-            for (uint64_t bh : bhs) {
-                auto_index_insert_locked(bh, e);
-            }
-            auto_idx.indexed_files.insert(fname); // remember our own write so a refresh won't re-open it
-        }
-        // Eviction is opt-in and scoped to the auto cache. This hook already runs only under
-        // auto_cache_enabled(), but the gate is stated at the call site too so the invariant
-        // (a bounded, self-reaping store belongs to --slot-save-auto, never plain --slot-save-path)
-        // is local to every enforce_limits caller.
-        if (auto_cache_enabled() &&
-            (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
-            bool oversized = false;
-            slot_save_enforce_limits(params_base.slot_save_path,
-                                     params_base.slot_save_max_count,
-                                     params_base.slot_save_max_bytes,
-                                     fname, oversized);
-        }
-        // Reconcile index with what the LRU kept (ours or a peer's) AND adopt the post-write dir
-        // mtime as our scan baseline — both under ONE lock. Re-baselining here means OUR OWN
-        // save+evict does not make the next lookup think a PEER changed the dir (which would force a
-        // redundant full re-scan); a real peer write afterwards bumps the mtime again -> still
-        // detected. CALLER holds no lock here.
-        {
-            std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            auto_index_drop_missing_locked();
-            std::error_code mec;
-            const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
-            if (!mec) {
-                auto_idx.dir_mtime = dmt;
-            }
-        }
+        // Publish through the SHARED atomic-publish helper: capacity pre-flight, pid+nonce temp,
+        // three-file temp->rename (meta last) with orphan cleanup, per-boundary index insert + LRU.
+        // Whole root: lo=0, hi=N => byte-identical save_file path. Delta (have_parent): lo=parent_hi>0
+        // => v3 node cells [parent_hi, N). Both index every boundary (kb = bhs.size()-1).
+        auto_publish_snapshot(slot, ctx_tgt, toks,
+                              /*lo=*/ have_parent ? (int32_t) parent_hi : 0,
+                              /*hi=*/ (int32_t) toks.size(),
+                              full_hash, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
+                              /*media=*/ media, /*parent_id=*/ have_parent ? parent_id : 0);
     }
 
     // AUTO-SAVE (shutdown): persist every slot's warm KV on graceful terminate — the third
@@ -4043,6 +4186,12 @@ private:
         } else {
             slot.smpl.reset();
         }
+
+        // stash the first-user-message boundary B for the [0,B) shared-context checkpoint onto the
+        // persistent prompt, computed once here at task launch. The save site also runs at idle-flush
+        // and shutdown, when the transient task may be gone, so it must never read the task for this —
+        // it reads slot.prompt.ctx_boundary instead. -1 (no user span) makes the checkpoint no-op.
+        slot.prompt.ctx_boundary = task.params.message_spans.first_user_message_pos();
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 

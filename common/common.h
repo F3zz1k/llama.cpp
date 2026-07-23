@@ -696,6 +696,16 @@ struct common_params {
     // little prefill against the state-file write + later restore, so it is skipped. The effective
     // floor is max(slot_save_block, slot_save_min_tokens) — a snapshot must always cover >= 1 block.
     int32_t slot_save_min_tokens = 1024;
+    // save-side floor for the [0,B) shared-context base checkpoint only (the sub-range save of the
+    // leading context shared by N chats). Effective floor is max(slot_save_block, this); a base
+    // below a few k tokens is not worth a distinct file. Larger than slot_save_min_tokens on purpose.
+    int32_t slot_save_context_min_tokens = 4096;
+    // restore-side absolute floor: skip the disk load (reprocess instead) when the verified,
+    // block-aligned matched prefix (n_keep_disk) is below this. Default 0 = opt-in / no behaviour
+    // change; a nonzero value silently suppresses short-match restores that ship today. Must be
+    // <= slot_save_min_tokens and <= slot_save_context_min_tokens (else a snapshot could be written
+    // and then always skipped on restore).
+    int32_t slot_restore_min_tokens = 0;
     // idle-delay flush: persist a slot's warm KV after this many seconds of idleness, so a lone
     // request's state survives a crash and becomes visible to peer instances without waiting for
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).

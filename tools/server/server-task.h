@@ -589,9 +589,16 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // token offset of the first user message (= boundary B for the [0,B) shared-context checkpoint),
+    // computed once at task creation via common_chat_msg_spans::first_user_message_pos() and stashed
+    // here so the save site never reads the transient (possibly dead) task at idle-flush/shutdown.
+    // -1 when there is no user boundary (e.g. generation-prompt-only requests) → checkpoint no-ops.
+    int32_t ctx_boundary = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        ctx_boundary = -1;
     }
 
     int n_tokens() const {
@@ -599,10 +606,12 @@ struct server_prompt {
     }
 
     server_prompt clone() const {
-        return server_prompt {
+        server_prompt p {
             tokens.clone(),
             checkpoints,
         };
+        p.ctx_boundary = ctx_boundary;
+        return p;
     }
 };
 

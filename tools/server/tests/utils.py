@@ -79,6 +79,8 @@ class ServerProcess:
     slot_save_incremental: bool = False
     slot_save_block: int | None = None
     slot_save_min_tokens: int | None = None
+    slot_save_context_min_tokens: int | None = None
+    slot_restore_min_tokens: int | None = None
     slot_save_idle_seconds: int | None = None
     slot_save_max_count: int | None = None
     slot_save_max_mb: int | None = None
@@ -230,6 +232,10 @@ class ServerProcess:
             server_args.extend(["--slot-save-block", self.slot_save_block])
         if self.slot_save_min_tokens is not None:
             server_args.extend(["--slot-save-min-tokens", self.slot_save_min_tokens])
+        if self.slot_save_context_min_tokens is not None:
+            server_args.extend(["--slot-save-context-min-tokens", self.slot_save_context_min_tokens])
+        if self.slot_restore_min_tokens is not None:
+            server_args.extend(["--slot-restore-min-tokens", self.slot_restore_min_tokens])
         if self.slot_save_idle_seconds is not None:
             server_args.extend(["--slot-save-idle-seconds", self.slot_save_idle_seconds])
         if self.slot_save_max_count is not None:

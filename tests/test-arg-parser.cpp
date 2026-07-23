@@ -106,6 +106,40 @@ static void test(void) {
     argv = {"binary_name", "--no-mmap"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // shared-context checkpoint / restore-floor validation (server-only knobs). Negatives are never
+    // meaningful; the restore floor must not exceed either save floor (else a snapshot is written and
+    // then always skipped on restore). common_params_parse catches the validation throw -> returns false.
+    printf("test-arg-parser: test shared-context checkpoint knob validation\n\n");
+
+    // negative context-min rejected
+    argv = {"binary_name", "--slot-save-context-min-tokens", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // negative restore-min rejected
+    argv = {"binary_name", "--slot-restore-min-tokens", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // restore-min > save-min rejected (a snapshot at save-min length can never satisfy the restore floor)
+    argv = {"binary_name", "--slot-restore-min-tokens", "2000", "--slot-save-min-tokens", "1000"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // restore-min > context-min rejected (restore-min <= save-min holds here, only the context tie fails)
+    argv = {"binary_name", "--slot-restore-min-tokens", "5000", "--slot-save-min-tokens", "6000",
+            "--slot-save-context-min-tokens", "4000"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // valid: defaults (context-min 4096, restore-min 0, save-min 1024) satisfy every tie
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.slot_save_context_min_tokens == 4096);
+    assert(params.slot_restore_min_tokens == 0);
+
+    // valid: restore-min == save-min == context-min (boundary of the <= ties)
+    argv = {"binary_name", "--slot-restore-min-tokens", "1024", "--slot-save-min-tokens", "1024",
+            "--slot-save-context-min-tokens", "1024"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.slot_restore_min_tokens == 1024);
+
 
     printf("test-arg-parser: test valid usage\n\n");
 
