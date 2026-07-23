@@ -168,6 +168,55 @@ int main(void) {
         check_read_invariants(rtoks, rmedia);
     }
 
+    // --- v4 round-trip (media delta node = v2 media tail + v3 node tail) ----------------------
+    // Same cells + records as v2, now emitted as an incremental MEDIA delta node: the meta carries
+    // the WHOLE [0,N) tiling and cell-token array (exactly like v2) while its .bin (not written by
+    // this format test) would hold only the delta cells [range_lo, range_hi). Exercises the media-
+    // then-node tail order, the real (non-backfilled) fp_mmproj alongside NULL cells, the node-field
+    // out-ptrs and the exact-EOF requirement — the ONLY format carrying both a media tail and a
+    // node tail. A whole v2 snapshot must still default the node fields to a parentless root.
+    const std::string v4_path   = state_path("v4.bin");
+    const uint64_t     v4_parent = 0xABCDEF0123456789ULL;
+    const uint32_t     v4_lo     = 3;                            // delta from the first media chunk on
+    const uint32_t     v4_hi     = (uint32_t) media_toks.size(); // .. to the end
+    const size_t       v2_meta_size = read_meta_bytes(v2_path).size();
+    {
+        GGML_ASSERT(slot_meta_write(v4_path, fp, media_toks, 0x0011223344556677ULL, media,
+                                    /*is_node=*/true, v4_parent, v4_lo, v4_hi));
+        // byte layout: exactly the v2 file (v1 header + tokens + media tail) followed by the 16-byte
+        // node tail (parent_id u64 + range_lo u32 + range_hi u32) — media-then-node, prefix-nested.
+        GGML_ASSERT(read_meta_bytes(v4_path).size() == v2_meta_size + 16);
+
+        model_fp rfp;
+        llama_tokens rtoks;
+        std::vector<server_media_record> rmedia;
+        uint64_t rparent = 123; uint32_t rlo = 123, rhi = 123;
+        GGML_ASSERT(slot_meta_read(v4_path, /*cur_fp_mmproj=*/0x77ULL, rfp, rtoks, rmedia,
+                                   &rparent, &rlo, &rhi));
+        GGML_ASSERT(rtoks == media_toks);
+        GGML_ASSERT(rfp.fp_mmproj == fp.fp_mmproj); // v4 carries the real value — no backfill
+        GGML_ASSERT(rfp == fp);
+        GGML_ASSERT(rmedia.size() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+            GGML_ASSERT(rmedia[i].start_idx == media[i].start_idx);
+            GGML_ASSERT(rmedia[i].n_tokens  == media[i].n_tokens);
+            GGML_ASSERT(rmedia[i].n_pos     == media[i].n_pos);
+            GGML_ASSERT(rmedia[i].nx        == media[i].nx);
+            GGML_ASSERT(rmedia[i].ny        == media[i].ny);
+            GGML_ASSERT(rmedia[i].is_audio  == media[i].is_audio);
+            GGML_ASSERT(rmedia[i].id        == media[i].id);
+        }
+        GGML_ASSERT(rparent == v4_parent && rlo == v4_lo && rhi == v4_hi);
+        check_read_invariants(rtoks, rmedia);
+
+        // a WHOLE v2 snapshot read with the node out-ptrs defaults them to a parentless root
+        // covering [0, tok_count) — the whole/delta distinction is carried by the version byte.
+        model_fp wfp; llama_tokens wtoks; std::vector<server_media_record> wmedia;
+        uint64_t wparent = 7; uint32_t wlo = 7, whi = 7;
+        GGML_ASSERT(slot_meta_read(v2_path, 0x77ULL, wfp, wtoks, wmedia, &wparent, &wlo, &whi));
+        GGML_ASSERT(wparent == 0 && wlo == 0 && whi == (uint32_t) media_toks.size());
+    }
+
     // --- write-side refusals ------------------------------------------------------------------
     {
         const std::string p = state_path("refuse.bin");
@@ -244,6 +293,32 @@ int main(void) {
         GGML_ASSERT(slot_meta_read(mut_path, 0, rfp, rtoks, rmedia));
     }
 
+    // --- v4 structured read rejections (media delta node) -------------------------------------
+    const std::vector<char> v4_bytes = read_meta_bytes(v4_path);
+    GGML_ASSERT(v4_bytes.size() == v2_meta_size + 16); // v2 layout + node tail
+    {
+        // a trailing byte past the node tail is a corrupt/relabelled file
+        auto b = v4_bytes; b.push_back('\0');                         expect_reject(b);
+        // a v4 relabelled v2 (drop the node tail via the version byte): the reader consumes the
+        // media tail then sees the 16-byte node tail as trailing bytes -> reject (a delta must not
+        // masquerade as a whole media snapshot, whose .bin would be the full cell set)
+        b = v4_bytes; patch_u32(b, 4, 2u);                            expect_reject(b);
+        // a v4 relabelled v3 (text delta): v3 is a text format that rejects the NULL media cells
+        b = v4_bytes; patch_u32(b, 4, 3u);                            expect_reject(b);
+        // the media tail's tiling invariants are enforced for v4 exactly as for v2 (n_media == 0)
+        b = v4_bytes; patch_u32(b, off_nm, 0u);                       expect_reject(b);
+        // every truncation of the v4 file must be rejected (short header, tokens, media or node tail)
+        for (size_t len = 0; len < v4_bytes.size(); ++len) {
+            expect_reject(std::vector<char>(v4_bytes.begin(), v4_bytes.begin() + len));
+        }
+        // untruncated v4 still parses, node fields intact
+        write_meta_bytes(mut_path, v4_bytes);
+        model_fp rfp; llama_tokens rtoks; std::vector<server_media_record> rmedia;
+        uint64_t rp = 0; uint32_t rl = 0, rh = 0;
+        GGML_ASSERT(slot_meta_read(mut_path, 0, rfp, rtoks, rmedia, &rp, &rl, &rh));
+        GGML_ASSERT(rp == v4_parent && rl == v4_lo && rh == v4_hi);
+    }
+
     // --- mutation fuzz over the parser ---------------------------------------------------------
     // Seeded (reproducible) random mutations of valid v1/v2 sidecars plus pure-random buffers.
     // Pass criterion: no crash/UB, and every ACCEPTED input satisfies the format invariants
@@ -256,7 +331,7 @@ int main(void) {
         const size_t n_iter = 2500;
         for (size_t iter = 0; iter < n_iter; ++iter) {
             std::vector<char> b;
-            const uint32_t kind = rng() % 5;
+            const uint32_t kind = rng() % 6;
             if (kind == 0) {
                 // pure-random buffer, random length
                 b.resize(rng() % 600);
@@ -264,7 +339,10 @@ int main(void) {
                     c = (char) (rng() & 0xFF);
                 }
             } else {
-                b = (kind == 1) ? v1_bytes : v2_bytes;
+                // seed corpus spans all three tail shapes: v1 (no tail), v2 (media tail),
+                // v4 (media + node tail). check_read_invariants holds for any accepted mutant of
+                // each (v1/v3 reject NULL cells, v2/v4 validate the media tiling).
+                b = (kind == 1) ? v1_bytes : (kind == 2) ? v2_bytes : v4_bytes;
                 const uint32_t n_mut = 1 + rng() % 8;
                 for (uint32_t m = 0; m < n_mut; ++m) {
                     if (!b.empty()) {

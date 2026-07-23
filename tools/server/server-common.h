@@ -279,15 +279,58 @@ bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server
 // fuzz/unit test (tests/test-slot-meta.cpp).
 //
 
-static constexpr uint32_t SLOT_META_MAGIC         = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
-static constexpr uint32_t SLOT_META_VERSION       = 1u;          // text-only whole snapshot (layout byte-frozen)
-static constexpr uint32_t SLOT_META_VERSION_MEDIA = 2u;          // v1 layout + appended media-record section
-static constexpr uint32_t SLOT_META_VERSION_NODE  = 3u;          // v1 text layout + appended delta-node section
-                                                                 // (parent_id + [range_lo, range_hi)); TEXT-ONLY,
-                                                                 // no media records. Version map: v1 whole text,
-                                                                 // v2 media, v3 text delta node (incremental cache).
+static constexpr uint32_t SLOT_META_MAGIC             = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
+static constexpr uint32_t SLOT_META_VERSION           = 1u;         // text-only whole snapshot (layout byte-frozen)
+static constexpr uint32_t SLOT_META_VERSION_MEDIA     = 2u;         // v1 layout + appended media-record section
+static constexpr uint32_t SLOT_META_VERSION_NODE      = 3u;         // v1 text layout + appended delta-node section
+                                                                    // (parent_id + [range_lo, range_hi)); TEXT-ONLY,
+                                                                    // no media records.
+static constexpr uint32_t SLOT_META_VERSION_MEDIA_NODE = 4u;        // v1 header + v2 media tail + v3 node tail
+                                                                    // (media-then-node): a media DELTA node whose
+                                                                    // meta carries the WHOLE [0,N) record tiling +
+                                                                    // cell-token array while its .bin holds only
+                                                                    // cells [range_lo, range_hi). The ONLY format
+                                                                    // with both NULL media cells AND a delta range.
+// Version map (the 2x2 of {whole|delta-node} x {text|media}): v1 whole text, v2 whole media,
+// v3 text delta node, v4 media delta node. The mapping between a (is_node, has_media) pair and
+// the version byte lives in exactly ONE place per direction — slot_meta_version_for (write) and
+// slot_meta_features_for (read) below — so the writer and reader can never disagree, and a future
+// format is a contained edit to those two helpers rather than scattered version compares. See
+// docs/kv-cache on the longer-term migration to capability flags / sections.
 static constexpr uint32_t SLOT_META_MEDIA_MAX     = 4096u;       // cap: media records per snapshot
 static constexpr uint32_t SLOT_META_ID_MAX        = 256u;        // cap: bytes per media-record id (0 invalid)
+
+// The on-disk feature set a version byte selects: an optional v2-style media tail (fp_mmproj +
+// records, with real LLAMA_TOKEN_NULL cells) and/or an optional v3-style delta-node tail
+// (parent_id + range_lo + range_hi), always written media-then-node. `valid` is false for an
+// unknown version byte. has_media_tail also governs the text/media split the reader keys on:
+// media formats read fp_mmproj for real and permit NULL cells; text formats backfill fp_mmproj
+// from the live value and reject any NULL cell.
+struct slot_meta_features {
+    bool has_media_tail = false;
+    bool has_node_tail  = false;
+    bool valid          = false;
+};
+
+// (is_node, has_media) -> version byte. The single write-side mapping point (used by
+// slot_meta_write). Keep in lock-step with slot_meta_features_for.
+static inline uint32_t slot_meta_version_for(bool is_node, bool has_media) {
+    return is_node ? (has_media ? SLOT_META_VERSION_MEDIA_NODE : SLOT_META_VERSION_NODE)
+                   : (has_media ? SLOT_META_VERSION_MEDIA       : SLOT_META_VERSION);
+}
+
+// version byte -> feature set. The single read-side mapping point (used by slot_meta_read to
+// both whitelist the version and drive which tails/validation apply). Keep in lock-step with
+// slot_meta_version_for.
+static inline slot_meta_features slot_meta_features_for(uint32_t version) {
+    switch (version) {
+        case SLOT_META_VERSION:            return { /*media*/false, /*node*/false, /*valid*/true };
+        case SLOT_META_VERSION_MEDIA:      return { /*media*/true,  /*node*/false, /*valid*/true };
+        case SLOT_META_VERSION_NODE:       return { /*media*/false, /*node*/true,  /*valid*/true };
+        case SLOT_META_VERSION_MEDIA_NODE: return { /*media*/true,  /*node*/true,  /*valid*/true };
+        default:                           return { /*media*/false, /*node*/false, /*valid*/false };
+    }
+}
 
 // Model/quant/context fingerprint that MUST match for a restore to be sound. All
 // fields are stable inference-affecting identity captured once at model load and
@@ -376,12 +419,16 @@ std::string slot_meta_sidecar_path(const std::string & state_filepath);
 // (start_idx/n_tokens/n_pos/nx/ny/is_audio/id_len/id each). For v2 `toks` must be
 // the cell-aligned list (media cells LLAMA_TOKEN_NULL, see get_cell_tokens) and the
 // records must tile its NULL cells exactly, as extract_media_records produces them —
-// slot_meta_read rejects anything else. v3 (incremental delta node, `is_node`): the
-// full v1 text layout followed by parent_id + range_lo + range_hi (the KV .bin holds
-// only cells [range_lo, range_hi); parent_id chains to the snapshot it extends, 0 =
-// root). v3 is TEXT-ONLY — passing a non-empty `media` together with `is_node` is a
-// contract violation and refused (there is no media-delta). Whole snapshots (is_node
-// false) still write v1/v2 BYTE-IDENTICALLY. Returns true on success. Never throws.
+// slot_meta_read rejects anything else. v3 (incremental delta node, `is_node`, no
+// media): the full v1 text layout followed by parent_id + range_lo + range_hi (the KV
+// .bin holds only cells [range_lo, range_hi); parent_id chains to the snapshot it
+// extends, 0 = root). v4 (media delta node, `is_node` WITH non-empty `media`): the v2
+// media tail and the v3 node tail concatenated media-then-node — the meta carries the
+// WHOLE [0,N) tiling + cell-token array (so restore's byte-verify is the v2 path) while
+// the .bin holds only cells [range_lo, range_hi). The (is_node, media-empty) pair
+// selects v1/v2/v3/v4 via slot_meta_version_for — the single write-side mapping point.
+// Whole snapshots (is_node false) still write v1/v2 BYTE-IDENTICALLY, and a v3 text
+// delta is byte-identical to before. Returns true on success. Never throws.
 bool slot_meta_write(const std::string & state_filepath,
                      const model_fp & fp,
                      const llama_tokens & toks,
@@ -392,18 +439,22 @@ bool slot_meta_write(const std::string & state_filepath,
                      uint32_t range_lo  = 0,     // this node's .bin holds KV cells [range_lo,
                      uint32_t range_hi  = 0);    // range_hi); ignored for a whole snapshot
 
-// Read a .meta sidecar (version-aware: v1, v2 and v3). Returns true and fills the
+// Read a .meta sidecar (version-aware: v1, v2, v3 and v4). Returns true and fills the
 // outputs iff a valid sidecar exists; any short read / bad magic / unknown version /
-// cap or media-tiling violation => false with outputs cleared. Never throws. On v1
-// (and v3 — both text-only), fp_out.fp_mmproj is backfilled from `cur_fp_mmproj`
-// (sound: text KV is projector-independent), so the fingerprint compare cannot refuse
-// text-only snapshots on an --mmproj server. To keep that backfill sound, a v1/v3
-// sidecar containing any LLAMA_TOKEN_NULL cell — or any bytes past its defined layout
+// cap or media-tiling violation => false with outputs cleared. Never throws. The version
+// byte is decoded once via slot_meta_features_for (the single read-side mapping point).
+// On the TEXT formats (v1, v3 — no media tail), fp_out.fp_mmproj is backfilled from
+// `cur_fp_mmproj` (sound: text KV is projector-independent), so the fingerprint compare
+// cannot refuse text-only snapshots on an --mmproj server. To keep that backfill sound, a
+// text sidecar containing any LLAMA_TOKEN_NULL cell — or any bytes past its defined layout
 // — is rejected: no text writer ever emits either, so both can only be a corrupt or
-// relabelled media sidecar trying to bypass fp_mmproj. The delta-node fields are
-// exposed via the optional out-ptrs; for a v1/v2 whole snapshot they default to a
-// parentless root (parent_id 0, range [0, tok_count)). Note: `chain_hash` is recorded
-// for debuggability but the authority for reuse is always the byte-compared tokens.
+// relabelled media sidecar trying to bypass fp_mmproj. The MEDIA formats (v2, v4 — media
+// tail present) read fp_mmproj for real (no backfill), permit NULL cells and enforce the
+// v2 record-tiling invariants over [0, tok_count). The delta-node fields are exposed via
+// the optional out-ptrs; the NODE formats (v3, v4) fill them from the node tail, while a
+// v1/v2 whole snapshot defaults them to a parentless root (parent_id 0, range
+// [0, tok_count)). Note: `chain_hash` is recorded for debuggability but the authority for
+// reuse is always the byte-compared tokens.
 bool slot_meta_read(const std::string & state_filepath,
                     uint64_t cur_fp_mmproj,
                     model_fp & fp_out,
