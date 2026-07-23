@@ -40,33 +40,47 @@ scan key): `<state>.bin`, an optional `<state>.bin.logits`, and `<state>.bin.met
 carries the token ids, a model fingerprint, and (for delta nodes) the parent link. Its second u32
 is a version:
 
-| version | name | meaning | trailing section |
-|---------|------|---------|------------------|
-| **1** | `SLOT_META_VERSION` | whole snapshot (a lineage **root**, covering `[0, N)`) | none |
-| **2** | *reserved* | media/mmproj meta on the multimodal branch (`-mm`) | (media cells) |
-| **3** | `SLOT_META_VERSION_NODE` | **delta node** (a continuation covering `[range_lo, range_hi)`) | parent link |
+The four versions are the 2×2 of {whole | delta-node} × {text | media}:
 
-Version 2 is intentionally reserved, not used here, so the eventual merge of the multimodal branch
-and this branch is collision-free (v1 whole / v2 media / v3 delta).
+| version | name | meaning | trailing section(s) |
+|---------|------|---------|---------------------|
+| **1** | `SLOT_META_VERSION` | whole **text** snapshot (a lineage **root**, covering `[0, N)`) | none |
+| **2** | `SLOT_META_VERSION_MEDIA` | whole **media** snapshot (root with NULL media cells) | media |
+| **3** | `SLOT_META_VERSION_NODE` | **text delta node** (a continuation covering `[range_lo, range_hi)`) | node |
+| **4** | `SLOT_META_VERSION_MEDIA_NODE` | **media delta node** (continuation with NULL media cells) | media, then node |
 
-A **root stays v1** — a whole snapshot's bytes are byte-identical whether or not
+Trailing sections are always written **media-then-node**, so the four layouts are prefix-nested
+(v1 ⊂ v2, v1 ⊂ v3, and v2+node = v4). The `(is_node, has_media)` → version mapping lives in exactly
+one place per direction — `slot_meta_version_for` (write) and `slot_meta_features_for` (read) — so
+the writer and reader can never disagree.
+
+A **root stays v1/v2** — a whole snapshot's bytes are byte-identical whether or not
 `--slot-save-incremental` is set (a golden lock enforced by the tests). Only continuations with a
-found parent are written as v3.
+found parent are written as a delta node (v3 text, v4 media).
 
 ### `.meta` byte layout
 
-All integers are little-endian. The header is common to v1 and v3:
+All integers are little-endian. The header is common to all versions:
 
 ```
 u32   magic          = 0x544D4B4C  ("LKMT")
-u32   version        = 1 (whole) | 3 (delta node)
+u32   version        = 1 (whole text) | 2 (whole media) | 3 (text delta) | 4 (media delta)
 ...   model fingerprint  (fp_model u64, geometry, cache types, rope/yarn, lora, mmproj bit)
 u32   tok_count
 u64   chain_hash                       # rolling block hash of the whole token prefix
-i32[tok_count]  tokens                 # the full [0, range_hi) token-id list
+i32[tok_count]  tokens                 # the full [0, range_hi) cell-token list (media cells = NULL)
 ```
 
-A **v3 delta node** appends, after the tokens:
+The **media tail** (v2, v4) appends, after the tokens — describing the WHOLE `[0, N)` tiling even
+when the `.bin` is a delta:
+
+```
+u64   fp_mmproj                        # projector fingerprint (authoritative; not backfilled)
+u32   n_media
+per record: u32 start_idx, n_tokens, n_pos, nx, ny, is_audio, id_len, then id_len id bytes
+```
+
+The **node tail** (v3, v4) appends, after any media tail:
 
 ```
 u64   parent_id      # the parent node's chain_hash (0 = root)
@@ -75,7 +89,24 @@ u32   range_hi       # one past the last KV position             (== this node's
 ```
 
 A v1 meta has no trailing section, so its bytes are unchanged from the non-incremental format; a
-reader treats it as an implicit root with `parent_id = 0`, `range_lo = 0`, `range_hi = tok_count`.
+reader treats a whole snapshot (v1/v2) as an implicit root with `parent_id = 0`, `range_lo = 0`,
+`range_hi = tok_count`. For **v4 the meta is WHOLE while the `.bin` is a DELTA**: the token array
+and media tiling cover `[0, N)` (so restore's byte-verify is the same v2 path), while `range_lo/hi`
+describe only the `[parent_hi, N)` cells the `.bin` actually holds.
+
+### On format evolution (why version-per-feature, and the long-term path)
+
+Today each new capability gets its own version byte and the 2×2 above is enumerated explicitly in
+`slot_meta_version_for` / `slot_meta_features_for`. This is deliberate for a small, additive feature
+set: v1–v3 stay byte-frozen, the golden-lock tests are trivial, and a corrupt/relabelled file is
+rejected by the exact-EOF check. It does **not** scale — an Nth independent, composable feature would
+demand up to `2^N` version bytes. The intended long-term migration, when a *third* orthogonal tail
+appears, is to move to **capability flags + self-describing sections**: replace the version byte with
+a feature-flags word plus a sequence of `(section-id, length)`-prefixed tails, so the reader skips
+unknown sections and features compose without a combinatorial version table. Because the version↔
+feature dispatch is already funnelled through the two helpers above (not scattered across the writer
+and reader), that migration is a contained change to those helpers plus one new reader loop — it is
+structured for now and does not need to be built until the third tail exists.
 
 ### Filename scheme is the tree
 

@@ -2349,6 +2349,133 @@ private:
         return true;
     }
 
+    // Peek the number of KV cells a range-save .bin actually serialized, WITHOUT loading the
+    // multi-GB state into a seq. The .bin layout is: magic(u32) version(u32) n_token_count(u32)
+    // tokens[n_token_count] then the memory state — and for every media-relevant family the state
+    // opens with n_stream(u32) followed by, per stream, cell_count(u32) [+ meta + data when the
+    // count is non-zero, nothing when zero]. A range save writes the delta sub-cache FIRST (plain
+    // FULL attention writes the single cache; iSWA writes kv_base's [p0,p1) delta before the whole
+    // kv_swa; hybrid writes the attention delta before the whole recurrent state), and a single-seq
+    // slot save populates exactly ONE stream, so the first non-zero cell_count is the delta's cell
+    // count. Returns true and sets `cells_out` on a well-formed header whose n_token_count matches
+    // `n_tokens` (a guard that this is the file we just wrote); false on any short read / mismatch,
+    // which the caller treats as a failed verify. Best-effort, never throws.
+    bool delta_bin_cell_count(const std::string & bin_path, size_t n_tokens, uint32_t & cells_out) {
+        std::ifstream f(bin_path, std::ios::binary);
+        if (!f) {
+            return false;
+        }
+        auto rd_u32 = [&](uint32_t & v) -> bool {
+            unsigned char b[4];
+            f.read((char *) b, 4);
+            if (f.gcount() != 4) {
+                return false;
+            }
+            v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+            return true;
+        };
+        uint32_t magic = 0, version = 0, tok_count = 0, n_stream = 0;
+        if (!rd_u32(magic) || !rd_u32(version) || !rd_u32(tok_count)) {
+            return false;
+        }
+        if ((size_t) tok_count != n_tokens) {
+            return false; // header token count disagrees -> not the delta we just wrote
+        }
+        f.seekg((std::streamoff) tok_count * (std::streamoff) sizeof(llama_token), std::ios::cur);
+        if (!f || !rd_u32(n_stream)) {
+            return false;
+        }
+        // exactly one stream holds this seq's cells; empty streams write only cell_count == 0 with no
+        // meta/data following, so scan cell_counts until the first non-zero one (the delta count).
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            uint32_t cell_count = 0;
+            if (!rd_u32(cell_count)) {
+                return false;
+            }
+            if (cell_count != 0) {
+                cells_out = cell_count;
+                return true;
+            }
+        }
+        cells_out = 0; // every stream empty: a delta that serialized nothing (a mismatch upstream)
+        return true;
+    }
+
+    // Build the root->tip chain of node .bin paths for a (possibly delta) tip by walking parent
+    // links ON DISK (the tree is DERIVED FROM DISK — no in-RAM map) and verifying every hop.
+    // `tip_path` is the tip's .bin; `tip_toks` is its authoritative full [0, range_hi) cell-token
+    // list (the meta is WHOLE even for a v3/v4 delta, so this is the byte-authority every parent
+    // prefix is checked against); (parent_id, range_lo) are the tip's node-tail fields — (0, 0)
+    // means a whole snapshot whose chain is just itself (a single clearing load == the pre-delta
+    // behaviour). On success `chain` is root..tip in position order and returns true; on ANY
+    // inconsistency (missing/corrupt/fingerprint-drift/non-contiguous/byte-mismatch parent, or a
+    // pathological depth) returns false so the caller cold-prefills (invariant 4). SHARED by both
+    // the auto-restore path and the manual /slots restore path so a v4 media delta tip composes
+    // base + deltas (NO_CLEAR) identically on both — never mis-loading a partial .bin (decision 2).
+    bool auto_build_restore_chain(const std::string & tip_path, const llama_tokens & tip_toks,
+                                  uint64_t parent_id, uint32_t range_lo,
+                                  std::vector<std::string> & chain) {
+        chain.clear();
+        chain.push_back(tip_path);
+        // A v1/v2 whole snapshot is its own root: a single-element chain == the previous single
+        // clearing load. A v3/v4 delta only stores its tail cells, so walk parent links to the
+        // root and load base + deltas in position order (NO_CLEAR) to recompose the full prefix.
+        if (parent_id == 0 && range_lo == 0) {
+            return true;
+        }
+        uint64_t cur_parent_id = parent_id;
+        uint32_t cur_range_lo  = range_lo;
+        const size_t MAX_CHAIN_DEPTH = 4096; // bounded walk: a corrupt/looping link never hangs.
+        while (true) {
+            if (chain.size() > MAX_CHAIN_DEPTH) {
+                return false; // pathological depth -> cold prefill (invariant 4)
+            }
+            const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
+            model_fp     parent_fp;
+            llama_tokens parent_toks;
+            std::vector<server_media_record> parent_media;
+            uint64_t     parent_parent_id = 0;
+            uint32_t     parent_lo        = 0;
+            uint32_t     parent_hi        = 0;
+            if (!slot_meta_read(parent_path, cur_fp.fp_mmproj, parent_fp, parent_toks, parent_media,
+                                &parent_parent_id, &parent_lo, &parent_hi)) {
+                return false; // parent meta missing/corrupt -> cold prefill
+            }
+            if (!(parent_fp == cur_fp)) {
+                return false; // fingerprint drift on the parent -> cold prefill
+            }
+            // contiguity: the parent must end exactly where its child begins.
+            if (parent_hi != cur_range_lo) {
+                return false;
+            }
+            // IDENTITY: hash + range-contiguity alone do NOT prove this .bin holds the tip's actual
+            // prefix — a parent_id/n_tokens filename collision (two distinct prefixes of equal length
+            // whose block-boundary hash coincides) or a base rewritten for a different prefix could
+            // land on the same deterministic name and compose the WRONG KV for [0, parent_hi) under
+            // NO_CLEAR, silently. `tip_toks` is the authoritative full [0, range_hi) token record, so
+            // byte-verify the parent's recorded tokens against that tip prefix. Media cells are
+            // LLAMA_TOKEN_NULL on both sides (a media parent of a media delta), so this compare is
+            // NULL==NULL for the shared media prefix — the per-record identity backstop that closes
+            // that gap is enforced save-side (parent-find) and restore-side (tip full tiling verify).
+            if (parent_toks.size() != (size_t) parent_hi ||
+                (size_t) parent_hi > tip_toks.size() ||
+                !std::equal(parent_toks.begin(), parent_toks.end(), tip_toks.begin())) {
+                return false; // parent KV does not correspond to this prefix -> cold prefill
+            }
+            // the parent .bin must exist (meta is published last, but an orphan-reap can race).
+            { std::ifstream pf(parent_path, std::ios::binary); if (!pf) { return false; } }
+            chain.push_back(parent_path);
+            if (parent_parent_id == 0 && parent_lo == 0) {
+                break; // reached the root covering [0, hi)
+            }
+            cur_parent_id = parent_parent_id;
+            cur_range_lo  = parent_lo;
+        }
+        // chain is tip..root; reverse to root..tip (position order) for the compose load.
+        std::reverse(chain.begin(), chain.end());
+        return true;
+    }
+
     // AUTO-RESTORE wrapper: byte-verify the candidate's persisted cells against the request prefix
     // and its media records against the request's live chunks (invariant 2), confirm the
     // fingerprint (invariant 3), then restore. Returns the verified prefix length actually
@@ -2462,66 +2589,16 @@ private:
         if (n_keep_disk < n_keep_mem + B) {
             return 0;
         }
-        // Build the root->tip chain of node .bin paths (the tree is DERIVED FROM DISK — no in-RAM
-        // map). A v1 whole snapshot is its own root: a single-element chain == the previous single
-        // clearing load. A v3 delta only stores its tail cells, so walk parent links to the root and
-        // load base + deltas in position order (NO_CLEAR) to recompose the full prefix. Do this
-        // BEFORE touching the slot so any inconsistency (missing/corrupt/non-contiguous node) simply
-        // returns 0 for a cold prefill, never disturbing the resident KV (invariant 4).
+        // Build the root->tip chain of node .bin paths via the shared walker. Done BEFORE touching
+        // the slot so any inconsistency (missing/corrupt/non-contiguous node) simply returns 0 for a
+        // cold prefill, never disturbing the resident KV (invariant 4). `disk_toks` (the tip's full
+        // [0, range_hi) record) is the byte-authority each parent prefix is verified against; it is
+        // already byte-verified against the request up to `v`, and the compare keeps the legitimate
+        // PART mid-parent divergence case restorable. Identical composition for v3 text and v4 media
+        // tips, and shared with the manual /slots restore path.
         std::vector<std::string> chain;
-        chain.push_back(cand.state_path);
-        if (disk_parent_id != 0 || disk_range_lo != 0) {
-            uint64_t cur_parent_id = disk_parent_id;
-            uint32_t cur_range_lo  = disk_range_lo;
-            const size_t MAX_CHAIN_DEPTH = 4096; // bounded walk: a corrupt/looping link never hangs.
-            while (true) {
-                if (chain.size() > MAX_CHAIN_DEPTH) {
-                    return 0; // pathological depth -> cold prefill (invariant 4)
-                }
-                const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
-                model_fp     parent_fp;
-                llama_tokens parent_toks;
-                std::vector<server_media_record> parent_media;
-                uint64_t     parent_parent_id = 0;
-                uint32_t     parent_lo        = 0;
-                uint32_t     parent_hi        = 0;
-                if (!slot_meta_read(parent_path, cur_fp.fp_mmproj, parent_fp, parent_toks, parent_media,
-                                    &parent_parent_id, &parent_lo, &parent_hi)) {
-                    return 0; // parent meta missing/corrupt -> cold prefill
-                }
-                if (!(parent_fp == cur_fp)) {
-                    return 0; // fingerprint drift on the parent -> cold prefill
-                }
-                // contiguity: the parent must end exactly where its child begins.
-                if (parent_hi != cur_range_lo) {
-                    return 0;
-                }
-                // IDENTITY: hash + range-contiguity alone do NOT prove this .bin holds the request's
-                // actual prefix — a parent_id/n_tokens filename collision (two distinct prefixes of
-                // equal length whose block-boundary hash coincides) or a base rewritten for a
-                // different prefix could land on the same deterministic name and compose the WRONG KV
-                // for [0, parent_hi) under NO_CLEAR, silently. The tip's `disk_toks` is the
-                // authoritative full [0, range_hi) token record and is already byte-verified against
-                // the request (up to `v`), so byte-verify the parent's recorded tokens against that
-                // tip prefix. Comparing to `disk_toks` (not `req`) also keeps the legitimate PART
-                // mid-parent divergence case restorable: there the request diverges before parent_hi
-                // yet the trimmed restore stays valid, and parent_toks still equals disk_toks[0,hi).
-                if (parent_toks.size() != (size_t) parent_hi ||
-                    (size_t) parent_hi > disk_toks.size() ||
-                    !std::equal(parent_toks.begin(), parent_toks.end(), disk_toks.begin())) {
-                    return 0; // parent KV does not correspond to this prefix -> cold prefill
-                }
-                // the parent .bin must exist (meta is published last, but an orphan-reap can race).
-                { std::ifstream pf(parent_path, std::ios::binary); if (!pf) { return 0; } }
-                chain.push_back(parent_path);
-                if (parent_parent_id == 0 && parent_lo == 0) {
-                    break; // reached the root covering [0, hi)
-                }
-                cur_parent_id = parent_parent_id;
-                cur_range_lo  = parent_lo;
-            }
-            // chain is tip..root; reverse to root..tip (position order) for the compose load.
-            std::reverse(chain.begin(), chain.end());
+        if (!auto_build_restore_chain(cand.state_path, disk_toks, disk_parent_id, disk_range_lo, chain)) {
+            return 0;
         }
         // Clear the slot's resident KV before loading the snapshot (mirror the restore-continue safe
         // fallback): seq removal + token/checkpoint clear so the restore writes into an empty seq.
@@ -2705,25 +2782,31 @@ private:
             }
         }
 
-        // INCREMENTAL SAVE (U3): when --slot-save-incremental, write only the KV cells added since the
-        // deepest already-saved snapshot on this branch (a v3 delta node) instead of re-D2H'ing and
-        // re-writing the whole prefix. Find the deepest candidate whose persisted tokens are a STRICT
-        // prefix of this prompt under the same fingerprint; the delta .bin then holds cells
-        // [parent_hi, N). The parent-find scans the FULL per-boundary candidate vectors (SIZE_MAX, not
-        // the RESTORE 4-cap): the real parent is the SHORTEST snapshot at the deepest SHARED boundary
-        // (e.g. a pinned base whose bucket also holds N longer divergent siblings), so a 4-cap hides it
-        // and forces a whole (v1, ~1.77GB) save instead of a small v3 delta. auto_index_lookup still
-        // orders candidates deepest-boundary-first / longest-first, so the FIRST strict-prefix match is
-        // the deepest parent. Flag off (or no parent found) => the EXACT whole-save path below (v1,
-        // byte-identical). Everything after this (nonce temp, logits sidecar, temp+rename publish, index
-        // insert, LRU) is SHARED between both modes. INCREMENTAL IS TEXT-ONLY: a media slot never writes
-        // a v3 delta node (no media-delta), so guard on the per-request has_media() — a media prompt
-        // keeps the whole v2 save path below.
+        // INCREMENTAL SAVE: when --slot-save-incremental, write only the KV cells added since the
+        // deepest already-saved snapshot on this branch (a v3 text / v4 media delta node) instead of
+        // re-D2H'ing and re-writing the whole prefix. Find the deepest candidate whose persisted cells
+        // are a STRICT prefix of this prompt under the same fingerprint; the delta .bin then holds
+        // cells [parent_hi, N). The parent-find scans the FULL per-boundary candidate vectors (SIZE_MAX,
+        // not the RESTORE 4-cap): the real parent is the SHORTEST snapshot at the deepest SHARED
+        // boundary (e.g. a pinned base whose bucket also holds N longer divergent siblings), so a 4-cap
+        // hides it and forces a whole (~1.77GB) save instead of a small delta. auto_index_lookup orders
+        // candidates deepest-boundary-first / longest-first, so the FIRST strict-prefix match is the
+        // deepest parent. Flag off (or no parent found) => the EXACT whole-save path below (byte-
+        // identical). Everything after this (nonce temp, logits sidecar, temp+rename publish, index
+        // insert, LRU) is SHARED between both modes.
+        //
+        // TEXT AND MEDIA UNIFY here (decision 1/3): a media prompt now takes exactly the same parent-
+        // find as a text one — the cell-token byte compare, the per-record parent verify and the
+        // media-aware parent hash all reduce to the pre-media text behaviour when `media` is empty. A
+        // text prompt therefore emits a byte-identical v3 delta; a media prompt emits a v4 delta. The
+        // parent may itself be text (v1) OR media (v2/v4): a text base can parent a media delta (an
+        // image added in the new turn) and vice-versa — the media-aware hash keys the exact parent
+        // file for either kind (decision 6).
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
-        if (params_base.slot_save_incremental && !prompt_has_media) {
-            // text-only slot: cell tokens == `toks`, so look up against the live prompt (server_tokens).
+        if (params_base.slot_save_incremental) {
+            // `toks`/`media` are this prompt's cell tokens + records; look up against the live prompt.
             for (const auto_cache_entry & cand : auto_index_lookup(slot.prompt.tokens, /*max_attempts=*/SIZE_MAX)) {
                 model_fp     disk_fp;
                 llama_tokens disk_toks;
@@ -2731,30 +2814,75 @@ private:
                 if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
                     continue; // unreadable meta -> not a usable parent (invariant 4)
                 }
-                if (!disk_media.empty()) {
-                    continue; // a media snapshot can never be a text delta's parent (invariant 4)
-                }
                 if (!(disk_fp == cur_fp)) {
                     continue; // invariant 3
                 }
-                // STRICT prefix: disk_toks == toks[0:disk_toks.size()] AND disk_toks.size() < toks.size()
-                // (a delta must add at least one token; an equal/longer snapshot is not a parent here).
+                // STRICT prefix of the CELL tokens (media cells LLAMA_TOKEN_NULL on both sides):
+                // disk_toks == toks[0:disk_toks.size()] AND disk_toks.size() < toks.size() (a delta
+                // must add at least one cell; an equal/longer snapshot is not a parent here). A media
+                // parent's NULL cells never equal a text prompt's real tokens, so a text prompt can
+                // never pick a media parent — the text path is unchanged.
                 if (disk_toks.size() >= toks.size() ||
                     !std::equal(disk_toks.begin(), disk_toks.end(), toks.begin())) {
                     continue;
                 }
+                const size_t parent_hi_sz = disk_toks.size();
+                // the delta .bin covers cells [parent_hi, N); the boundary may not split a media chunk
+                // (a chunk's cells + M-RoPE positions must all live in one .bin), so refuse a candidate
+                // whose end cuts one. Always true on the text path (no media chunks in `media`).
+                if (!boundary_is_chunk_safe(toks, media, parent_hi_sz)) {
+                    continue;
+                }
+                // per-record parent verify over the shared prefix [0, parent_hi): every candidate
+                // record starting inside the parent must equal THIS prompt's record at that exact start
+                // index (id, shape, type). Media cells are NULL==NULL so the byte compare above is
+                // identity-blind; this restores the byte backstop a text delta gets for free — without
+                // it a ~2^-64 filename-hash collision between same-text/different-image prefixes could
+                // compose the WRONG parent KV. Reuses the restore-path match block; a no-op for a text
+                // delta (disk_media empty) (decision 5).
+                bool records_ok = true;
+                for (const auto & rec : disk_media) {
+                    if ((size_t) rec.start_idx >= parent_hi_sz) {
+                        break; // this and all later records start outside the shared prefix
+                    }
+                    const auto it = std::lower_bound(media.begin(), media.end(), rec.start_idx,
+                        [](const server_media_record & r, uint32_t s) { return r.start_idx < s; });
+                    const bool match = it != media.end()             &&
+                                       it->start_idx == rec.start_idx &&
+                                       it->id        == rec.id        &&
+                                       it->n_tokens  == rec.n_tokens  &&
+                                       it->n_pos     == rec.n_pos     &&
+                                       it->nx        == rec.nx        &&
+                                       it->ny        == rec.ny        &&
+                                       it->is_audio  == rec.is_audio;
+                    if (!match) {
+                        records_ok = false;
+                        break;
+                    }
+                }
+                if (!records_ok) {
+                    continue;
+                }
                 // parent_id = the parent node's chain_hash = the last whole-block boundary hash of its
-                // token prefix. Since disk_toks == toks[0:parent_hi], this reproduces the parent's own
-                // full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's file
-                // (the deterministic link U4's restore walk resolves). The parent cleared save_floor >=
-                // block, so its prefix has at least one boundary; guard defensively regardless.
-                const llama_tokens prefix(toks.begin(), toks.begin() + disk_toks.size());
-                const auto pbhs = auto_block_hashes(prefix, /*media=*/{}, params_base.slot_save_block,
+                // cell prefix under the MEDIA-AWARE hash (prefix cells + the records fully inside
+                // [0, parent_hi)). Since disk_toks == toks[0:parent_hi], this reproduces the parent's
+                // own full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's
+                // file (the deterministic link the restore walk resolves). For a text delta prefix_media
+                // is empty and this is bit-identical to the pre-media parent hash. The parent cleared
+                // save_floor >= block, so its prefix has at least one boundary; guard defensively.
+                const llama_tokens prefix(toks.begin(), toks.begin() + parent_hi_sz);
+                std::vector<server_media_record> prefix_media;
+                for (const auto & rec : media) {
+                    if ((size_t) rec.start_idx + rec.n_tokens <= parent_hi_sz) {
+                        prefix_media.push_back(rec);
+                    }
+                }
+                const auto pbhs = auto_block_hashes(prefix, prefix_media, params_base.slot_save_block,
                                                     cur_fp.fp_model, cur_fp.fp_mmproj);
                 if (pbhs.empty()) {
                     continue;
                 }
-                parent_hi   = (uint32_t) disk_toks.size();
+                parent_hi   = (uint32_t) parent_hi_sz;
                 parent_id   = pbhs.back();
                 have_parent = true;
                 break; // deepest (longest-first) strict-prefix parent
@@ -2797,14 +2925,47 @@ private:
         //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
         //    crash mid-write never leaves a corrupt state file the index would trust.
         //    When a parent was found (incremental mode), write a delta covering only cells [parent_hi, N)
-        //    via the range save; otherwise the exact whole-snapshot save (byte-identical v1 path).
-        const size_t nwrite = have_parent
+        //    via the range save; otherwise the exact whole-snapshot save (byte-identical whole path).
+        //    U5 (decision 1): the range save filters by POSITION, so the boundary is
+        //    slot.prompt.tokens.pos_next(parent_hi) — the SAME function that assigned the cell
+        //    positions (mtmd decode seeds on pos_next), so reading the boundary back with it is
+        //    identical by construction with no new helper / second source of truth. For text
+        //    pos_next(parent_hi) == parent_hi, so the text delta .bin stays byte-identical — the one
+        //    expression serves both paths.
+        size_t nwrite = have_parent
             ? llama_state_seq_save_file_range(ctx_tgt, tmp.c_str(), slot.id,
-                                              (llama_pos) parent_hi, -1, toks.data(), toks.size())
+                                              slot.prompt.tokens.pos_next(parent_hi), -1,
+                                              toks.data(), toks.size())
             : llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
             return; // invariant 4: disk full / IO error -> generation unaffected
+        }
+        // 1b) post-save cell-count assert (U6 / decision 4): a range save selects suffix cells by
+        //    position, so a mid-chunk position anomaly could leave the boundary value correct yet make
+        //    the positional filter silently drop or duplicate suffix cells — and restore's byte-verify
+        //    is NULL-blind, so it would not catch it. Peek the delta .bin's serialized cell count (no
+        //    multi-GB load) and require it to equal the expected N - parent_hi. On any mismatch, do NOT
+        //    persist a corrupt delta: discard the temp and fall back to a WHOLE snapshot for this exact
+        //    prefix (byte-identical to a no-parent save — v1/v2 by `media`).
+        if (have_parent) {
+            uint32_t written_cells = 0;
+            const bool ok = delta_bin_cell_count(tmp, toks.size(), written_cells) &&
+                            (size_t) written_cells == toks.size() - parent_hi;
+            if (!ok) {
+                SLT_WRN(slot, "auto-save: delta cell-count check failed (expected %zu, got %u); "
+                              "falling back to a whole snapshot\n",
+                        toks.size() - parent_hi, written_cells);
+                std::error_code ec; std::filesystem::remove(tmp, ec);
+                have_parent = false;
+                parent_id   = 0;
+                parent_hi   = 0;
+                nwrite = llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
+                if (nwrite == 0) {
+                    std::filesystem::remove(tmp, ec);
+                    return; // invariant 4
+                }
+            }
         }
         // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
         //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
@@ -2815,10 +2976,14 @@ private:
         }
         // 3) meta sidecar on the temp path. Written but renamed LAST. A whole snapshot writes the
         //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
-        //    records). In incremental mode (have_parent, TEXT-ONLY by the guard above) this is a v3
-        //    delta-node meta carrying parent_id + [parent_hi, N) and NO media records.
+        //    records). In incremental mode (have_parent) this is a delta-node meta carrying parent_id
+        //    + [parent_hi, N): U7 (decision 3) passes the FULL `media` records, so slot_meta_write's
+        //    (is_node, media-empty) dispatch selects v3 for a text delta (byte-identical to before)
+        //    and v4 for a media delta. The meta stays WHOLE — the full [0,N) cell-token array and the
+        //    complete record tiling — while the .bin holds only cells [parent_hi, N); restore's
+        //    byte-verify is thus the exact v2 path and the .bin composes through the NO_CLEAR chain.
         const bool meta_ok = have_parent
-            ? slot_meta_write(tmp, cur_fp, toks, full_hash, /*media=*/{}, /*is_node=*/true,
+            ? slot_meta_write(tmp, cur_fp, toks, full_hash, /*media=*/media, /*is_node=*/true,
                               parent_id, parent_hi, (uint32_t) toks.size())
             : slot_meta_write(tmp, cur_fp, toks, full_hash, media);
         if (!meta_ok) {
@@ -4734,12 +4899,43 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // Compose the restore chain (U9 / decision 2). Manual SAVE only ever writes a
+                    // self-contained WHOLE unit (a v1/v2 snapshot, parent 0) — the guaranteed floor —
+                    // so a unit this endpoint produced restores as a single clearing load exactly as
+                    // before. But the same directory may hold an auto-cache v3/v4 DELTA tip whose .bin
+                    // carries only cells [parent_hi, N); pointing a manual restore at one MUST NOT be
+                    // refused (decision 2). Read its node tail and, when it is a delta, walk parent
+                    // links via the SHARED auto_build_restore_chain so base + deltas compose to the
+                    // full cell set before loading — the identical path the auto restore uses, so a v4
+                    // media delta tip restores correctly here too. A missing .meta / whole snapshot
+                    // (parent 0) keeps the single-file chain; only a genuinely broken delta chain
+                    // (a parent file gone or corrupt) errors, the same way a corrupt whole unit would.
+                    std::vector<std::string> restore_chain = { filepath };
+                    {
+                        model_fp     tip_fp;
+                        llama_tokens tip_toks;
+                        std::vector<server_media_record> tip_media;
+                        uint64_t tip_parent_id = 0;
+                        uint32_t tip_range_lo  = 0;
+                        uint32_t tip_range_hi  = 0;
+                        if (slot_meta_read(filepath, cur_fp.fp_mmproj, tip_fp, tip_toks, tip_media,
+                                           &tip_parent_id, &tip_range_lo, &tip_range_hi) &&
+                            (tip_parent_id != 0 || tip_range_lo != 0)) {
+                            if (!auto_build_restore_chain(filepath, tip_toks, tip_parent_id, tip_range_lo,
+                                                          restore_chain)) {
+                                send_error(task, "Unable to restore slot: the delta snapshot's parent "
+                                                 "chain is missing or inconsistent", ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                        }
+                    }
+
                     // Shared restore body (also used by the transparent auto-restore path): loads the
-                    // state file into seq slot->id, sets just_restored + restored_logits, rebuilds the
-                    // FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
+                    // composed chain into seq slot->id, sets just_restored + restored_logits, rebuilds
+                    // the FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
                     size_t token_count = 0;
                     size_t nread = 0;
-                    if (!do_slot_restore(*slot, { filepath }, &token_count, &nread)) {
+                    if (!do_slot_restore(*slot, restore_chain, &token_count, &nread)) {
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }

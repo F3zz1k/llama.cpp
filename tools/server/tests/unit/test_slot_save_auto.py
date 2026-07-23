@@ -613,6 +613,143 @@ def read_v2_metas():
     return out
 
 
+def parse_meta_node(path: str):
+    """Parse a .meta sidecar of ANY version (v1..v4), returning the media tail AND the delta-node
+    tail. Mirrors parse_meta but does not stop at v2: a v3 text-delta / v4 media-delta node appends
+    parent_id + range_lo + range_hi (media-then-node order). A whole snapshot reports the implicit
+    root (parent_id=0, range_lo=0, range_hi=tok_count). Asserts exact EOF."""
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, version = struct.unpack_from("<II", data, 0)
+    assert magic == SLOT_META_MAGIC
+    tok_count = struct.unpack_from("<I", data, SLOT_META_TOKS_OFF)[0]
+    off = SLOT_META_TOKS_OFF + 4
+    chain_hash = struct.unpack_from("<Q", data, off)[0]
+    off += 8
+    toks = list(struct.unpack_from(f"<{tok_count}i", data, off))
+    off += 4 * tok_count
+    media = []
+    if version in (2, 4):
+        off += 8  # fp_mmproj
+        n_media = struct.unpack_from("<I", data, off)[0]
+        off += 4
+        for _ in range(n_media):
+            start_idx, n_tokens, n_pos, nx, ny, is_audio, id_len = struct.unpack_from("<7I", data, off)
+            off += 28
+            assert id_len > 0
+            media.append({"start_idx": start_idx, "n_tokens": n_tokens, "n_pos": n_pos,
+                          "nx": nx, "ny": ny, "is_audio": is_audio, "id": data[off:off + id_len]})
+            off += id_len
+    parent_id, range_lo, range_hi = 0, 0, tok_count
+    if version in (3, 4):
+        parent_id, range_lo, range_hi = struct.unpack_from("<QII", data, off)
+        off += 16
+    assert off == len(data), f"trailing bytes in {path}"
+    return {"version": version, "tok_count": tok_count, "toks": toks, "chain_hash": chain_hash,
+            "media": media, "parent_id": parent_id, "range_lo": range_lo, "range_hi": range_hi}
+
+
+def test_vision_incremental_writes_v4_delta_node():
+    """End-to-end media delta: with --slot-save-incremental, a conversation turn that EXTENDS an
+    already-persisted media prefix is restored from disk and re-saved as a v4 media delta node —
+    a media tail (the WHOLE [0,N) record tiling) + a node tail (parent link + [parent_hi, N) range),
+    the only format carrying both. Exercises U4 (media parent-find), U5/U6 (the pos_next range save +
+    post-save cell-count assert — a mismatch would have fallen back to a whole v2), U7 (v4 emission)
+    and U8 (restore/compose: session 2 cold-restores the v2 root before extending it).
+
+    tinygemma3 is PART-seq-rm (no CPU vision model is FULL), so this locks the on-disk delta signature
+    and the base restore; M-RoPE delta-compose CORRECTNESS against cold-prefill is the on-rig gate
+    (it uses normal positions here). Two server sessions share CACHE_DIR so the base is genuinely on
+    disk (not just in the resident slot) when the extending turn's parent-find runs."""
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    os.makedirs(CACHE_DIR)
+
+    # session 1: a media turn -> a v2 media whole root on disk (the base).
+    s1 = make_vision_server(auto=True)
+    s1.slot_save_incremental = True
+    s1.start()
+    r1 = s1.make_request("POST", "/chat/completions", data={
+        "temperature": 0, "max_tokens": 4, "id_slot": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": VISION_TEXT_PRE},
+            {"type": "image_url", "image_url": {"url": IMG_DATA_URI}},
+        ]}],
+    })
+    assert r1.status_code == 200
+    reply = r1.body["choices"][0]["message"]["content"]
+    s1.stop()  # shutdown flush publishes the v2 root
+
+    roots = [parse_meta_node(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))]
+    assert len(roots) == 1 and roots[0]["version"] == 2, "session 1 must persist exactly one v2 media root"
+    root = roots[0]
+    assert len(root["media"]) >= 1  # the image chunk is recorded
+
+    # session 2 (fresh process, shared dir): continue the SAME conversation. The re-rendered prefix
+    # (user turn + assistant reply) strict-extends the base's cells, so it cold-restores the v2 root
+    # from disk (proving U8) and the extending turn is saved as a v4 delta chained to it.
+    s2 = make_vision_server(auto=True)
+    s2.slot_save_incremental = True
+    s2.start()
+    r2 = s2.make_request("POST", "/chat/completions", data={
+        "temperature": 0, "max_tokens": 4, "id_slot": 0,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": VISION_TEXT_PRE},
+                {"type": "image_url", "image_url": {"url": IMG_DATA_URI}},
+            ]},
+            {"role": "assistant", "content": reply},
+            {"role": "user", "content": VISION_TEXT_STORY},
+        ],
+    })
+    assert r2.status_code == 200
+    # the base restored from disk: the extending turn reused ~the whole base prefix rather than
+    # cold-prefilling it (U8 media restore + compose).
+    assert r2.body["timings"]["cache_n"] >= root["tok_count"] - s2.slot_save_block, \
+        f"session 2 must restore the media base from disk; cache_n={r2.body['timings']['cache_n']}"
+    s2.stop()  # shutdown flush publishes the v4 delta
+
+    metas = {p: parse_meta_node(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))}
+    v2s = [m for m in metas.values() if m["version"] == 2]
+    v4s = [m for m in metas.values() if m["version"] == 4]
+    assert len(v2s) == 1 and len(v4s) == 1, \
+        f"expected exactly one v2 root + one v4 media delta, got {sorted(m['version'] for m in metas.values())}"
+    delta = v4s[0]
+    # the v4 delta chains to the root and its .bin covers only [parent_hi, N)
+    assert delta["parent_id"] == root["chain_hash"], "the v4 delta must chain to the v2 root"
+    assert delta["range_lo"] == root["tok_count"], "the delta's KV range begins at the root's cell count"
+    assert delta["range_hi"] == delta["tok_count"] > root["tok_count"], \
+        "the delta covers [root_len, full_len) and is longer than the root"
+    # the v4 meta carries the WHOLE tiling (media tail present) even though the .bin is a delta
+    assert len(delta["media"]) >= 1, "a v4 delta carries the full [0,N) media record tiling"
+    n_null = sum(1 for t in delta["toks"] if t == LLAMA_TOKEN_NULL)
+    assert n_null == sum(r["n_tokens"] for r in delta["media"]), "records tile every NULL cell of [0,N)"
+
+    # session 3 (decision 2 / U9): a MANUAL /slots restore pointed at the v4 delta tip MUST NOT
+    # refuse it — the manual path uses the SAME shared chain-walk helper, so it composes the base
+    # v2 root + this v4 delta to the full cell set and rehydrates the media records into stubs. A
+    # pre-U9 manual restore would have loaded the partial delta .bin alone (or refused). We assert
+    # it succeeds and reports the WHOLE composed token count, not the delta's [parent_hi, N) slice.
+    v4_meta_path = [p for p, m in metas.items() if m["version"] == 4][0]
+    v4_bin_name = os.path.basename(v4_meta_path[:-len(".meta")])
+    s3 = make_vision_server(auto=True)
+    s3.slot_save_incremental = True
+    s3.server_slots = True  # expose the manual /slots endpoints
+    s3.start()
+    mres = s3.make_request("POST", "/slots/0?action=restore", data={"filename": v4_bin_name})
+    assert mres.status_code == 200, f"manual restore of a v4 media delta tip must not refuse: {mres.body}"
+    assert mres.body["n_restored"] == delta["tok_count"], \
+        "manual restore composes the whole [0,N) cell set, not just the delta's tail slice"
+    s3.stop()
+
+    # (no delta-vs-root .bin size assertion here: tinygemma3 is iSWA, so kv_swa is written WHOLE at
+    # every node and grows with the TOTAL sequence length — the delta shrinks only the kv_base
+    # portion, so a delta over a longer total prompt can exceed a shorter whole root on disk. The
+    # write-amplification win is model-family-dependent, per the design's family analysis; the
+    # structural range/parent/tiling asserts above are what pin the v4 delta's correctness.)
+
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+
 def test_text_only_on_vision_server():
     """A TEXT-ONLY prompt on a --mmproj server caches and restores across a restart —
     the #21133 case: the media gate is per-request, so merely loading a projector must
