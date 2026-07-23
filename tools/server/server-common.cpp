@@ -1018,9 +1018,26 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
         } else {
             h = auto_hash_mix(h, cells[i]);
         }
-        if ((i + 1) % (size_t) B == 0 && boundary_is_chunk_safe(cells, media, i + 1)) {
+        // Emit an index key at a block-aligned position OR at the END of a media chunk. The
+        // chunk-boundary emission is essential for media: one image chunk can span every
+        // block-aligned position in a short prompt, so without it the snapshot has NO index key and
+        // the media conversation gets no disk cache (bhs empty -> save skipped). A chunk end cuts no
+        // chunk (always safe) and is a position any repeat/continuation recomputes identically, so it
+        // is a valid restore key. Text prompts have no NULL cells, so at_chunk_end is never set and
+        // text keys are byte-identical to before.
+        bool at_chunk_end = false;
+        if (cells[i] == LLAMA_TOKEN_NULL && ri < media.size()) {
+            at_chunk_end = (i + 1 == (size_t) media[ri].start_idx + (size_t) media[ri].n_tokens);
+        }
+        if (((i + 1) % (size_t) B == 0 || at_chunk_end) && boundary_is_chunk_safe(cells, media, i + 1)) {
             out.push_back(h);
         }
+    }
+    // Degenerate guard: a prompt that still produced no key (e.g. one media chunk shorter than a
+    // block with nothing after it) must be indexable — emit the full length (a prompt never ends
+    // mid-chunk, so the full length is always chunk-safe).
+    if (out.empty() && !cells.empty() && boundary_is_chunk_safe(cells, media, cells.size())) {
+        out.push_back(h);
     }
     return out;
 }
