@@ -17,7 +17,7 @@ lives in `common/` and `tools/server/`.
 | Incremental (delta) save | `--slot-save-incremental` | **stable** | a growing conversation saves only the new `[parent, N)` tail as a delta node instead of re-writing the whole prefix |
 | Pin a snapshot | touch `<state>.pin` | **stable** | exempt one snapshot from eviction (e.g. a shared assistant/system base) |
 | Multimodal delta | (uses `--slot-save-incremental`) | **branch `auto-disk-kvcache-mm-delta`** | image/audio conversations also save deltas (a new additive v4 sidecar), not a whole snapshot every turn |
-| Shared-context checkpoint | `--slot-save-context-min-tokens` | **branch `auto-disk-kvcache-context-ckpt`** | the shared system+tools+RAG prefix of many chats is saved **once** as a deduplicated base; each chat chains a small delta off it |
+| Shared-context base | `--slot-save-context-min-tokens` | **branch `auto-disk-kvcache-context-ckpt`** | the shared system+tools+RAG prefix of many chats is whole-saved **once** MID-PREFILL as a deduplicated base (sound for every model class incl. recurrent/hybrid); later chats restore it instead of re-prefilling, and with `--slot-save-incremental` chain a small delta off it |
 | Restore floor | `--slot-restore-min-tokens` | **branch `auto-disk-kvcache-context-ckpt`** | skip a disk restore when the matched prefix is short enough that re-prefilling is cheaper |
 
 "Branch" features are implemented and CPU-tested on their own feature branches, pending on-hardware
@@ -30,18 +30,23 @@ The cache is model-general, but the **sub-range** features depend on how a model
 `llama-server` classifies each model's memory as `PART` (rewindable attention), `FULL`/`RS`
 (recurrent/hybrid), or windowed (`n_swa > 0`, SWA/iSWA).
 
-| Model class | Example | Incremental delta | Multimodal delta | Shared-context checkpoint |
+| Model class | Example | Incremental delta | Multimodal delta | Shared-context base |
 |---|---|---|---|---|
 | Dense / full attention (`PART`, `n_swa == 0`) | Qwen3.x dense | ✅ full (save **and** restore reuse) | ✅ write-side win¹ | ✅ |
-| SWA / iSWA (`PART`, `n_swa > 0`) | Gemma | ✅ (attention delta + window saved whole) | ✅ (+ restore reuse) | ⛔ gated² → whole-snapshot caching |
-| Recurrent / hybrid (`FULL`/`RS`) | Mamba / GDN (a3b-class) | ✅ attention delta + recurrent state whole; restore is extend-only | ✅ | ⛔ gated² → whole-snapshot caching |
+| SWA / iSWA (`PART`, `n_swa > 0`) | Gemma | ✅ (attention delta + window saved whole) | ✅ (+ restore reuse) | ✅² |
+| Recurrent / hybrid (`FULL`/`RS`) | Mamba / GDN (a3b-class) | ✅ attention delta + recurrent state whole; restore is extend-only | ✅ | ✅² |
 
 ¹ On dense models a **multimodal delta** cuts the per-turn write (no more re-writing the whole KV),
 but restore still needs the whole verified prefix — the restore-reuse upside is on SWA.
-² The shared-context checkpoint saves cells `[0, B)` of a *longer* prompt; that is **unsound** for
-recurrent/hybrid (no positional KV to slice at `B`) and SWA (the window has already evicted `[0, B)`),
-so it is **hard-gated off** for those classes — they keep normal whole-snapshot caching and never
-produce a wrong result. This is a correctness boundary, not a bug.
+² The shared-context base is now written MID-PREFILL as a **whole** state save, taken at the exact
+instant a cold prefill has decoded precisely `[0, B_ctx)` (the block-aligned first-user boundary) and
+nothing beyond — so the resident sequence *is* the true whole state at `B_ctx`. That is sound for
+every class: dense attention holds exactly cells `[0, B_ctx)`, an SWA window has evicted nothing yet
+(`N == B_ctx`), and a recurrent/hybrid fold is the correct fold over `[0, B_ctx)`. (The earlier design
+saved a `[0, B)` **sub-range** with the slot sitting at `N`, which mislabelled the state-after-`N` as a
+`B`-length prefix and was therefore hard-gated to dense-only; the mid-prefill whole-save removes that
+gate — the production qwen3.6-27b, a `qwen35` hybrid, now writes and reuses a base.) Later chats sharing
+the preamble RESTORE this base (longest-prefix restore) instead of re-prefilling it.
 
 ## Quick start (the common case: a dense chat model)
 
@@ -71,14 +76,16 @@ With the **`auto-disk-kvcache-context-ckpt`** branch you additionally get, for d
 large shared system prompt (agents, RAG, tool definitions):
 
 ```sh
-    --slot-save-context-min-tokens 4096 \   # save the shared [0,B) prefix once as a base (min length)
+    --slot-save-context-min-tokens 4096 \   # whole-save the shared [0,B_ctx) preamble once as a base (min length)
     --slot-restore-min-tokens 0             # 0 = always restore; raise to skip loads shorter than this
 ```
 
 `--slot-save-context-min-tokens` collapses N chats that share the same ~8–12k-token preamble from N
-whole snapshots to **one base + N small deltas**. `--slot-restore-min-tokens` must be `<=` the save
-floors (validated at startup); the default `0` changes nothing until you measure your own
-restore-vs-reprocess crossover and raise it.
+whole snapshots to **one base** that every later chat restores (and, with `--slot-save-incremental`,
+**N small deltas** chained off it). Unlike the earlier dense-only checkpoint, the base is written mid-
+prefill as a whole state save and so works for **every model class**, including the recurrent/hybrid
+qwen3.6-27b. `--slot-restore-min-tokens` must be `<=` the save floors (validated at startup); the
+default `0` changes nothing until you measure your own restore-vs-reprocess crossover and raise it.
 
 ## Two rules for a shared directory
 

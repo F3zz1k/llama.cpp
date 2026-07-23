@@ -1015,6 +1015,16 @@ struct server_slot {
     bool truncated      = false;
     bool just_restored  = false; // set on disk slot-restore; one-shot, gates restored-slot KV reuse
 
+    // --- mid-prefill shared-context base save (Option A) ---
+    // When > 0, this cold-prefilling slot is ARMED to whole-save the leading shared preamble
+    // [0, ctx_save_pos) as a deduplicated base: ctx_save_pos is the block-aligned first-user
+    // boundary B_ctx. The prefill loop CLAMPS the batch exactly there (never crossing it), and the
+    // post-decode hook in update_slots() whole-saves [0, B_ctx) at the instant the slot is resident
+    // at exactly B_ctx — the true whole state there, so the save is recurrent-/SWA-/dense-correct.
+    // One-shot: armed once per task at prompt start, cleared (-> -1) after the save so the slot then
+    // prefills [B_ctx, N) normally. -1 = not armed (no boundary / warm restore / small preamble).
+    int32_t ctx_save_pos = -1;
+
     // --- KV restore-reuse (logits sidecar) ---
     // Full-vocab logits of this slot's most recently sampled token, captured at sample time
     // (only populated for FULL/recurrent models when --slot-save-path is set). Serialized to the
@@ -2929,67 +2939,70 @@ private:
         }
     }
 
-    // SHARED-CONTEXT CHECKPOINT: persist the leading shared context [0, B_ctx) ONCE as a deduplicated
-    // v1 ROOT, so N chats that share that prefix each collapse their own save to a small [B_ctx, N)
-    // delta parented on this one base (the existing incremental parent-find discovers it for free).
-    // Called from auto_save_slot_if_useful right after `bhs` is computed and BEFORE the whole-prefix
-    // dedup, reusing the `toks`/`bhs` already in scope. Every early return is a clean no-op to the
-    // existing whole-prefix save (invariant 4). All gates below are correctness- or efficiency-scoped:
-    //   (1) MODEL-CLASS gate (correctness-critical, NOT optional): a [0,B) sub-range save is only
-    //       SOUND for non-windowed attention. For FULL/RS (recurrent/hybrid, e.g. a3b) the range save
-    //       would persist the state-after-N mislabelled as a B-length prefix (byte-verify matches the
-    //       token ids but not that the bytes are the state AT position B) -> silent wrong output. For
-    //       SWA (n_swa>0, e.g. gemma) cells [0,B) are exactly what the sliding window evicts once N
-    //       grows -> the checkpoint targets non-resident KV -> garbage at SAVE time. Gate to PART &&
-    //       n_swa == 0; a3b and gemma are correctly and safely excluded (they NEVER write a base).
-    //   (2) TEXT-ONLY gate: media makes the block-hash array sparse (auto_block_hashes only emits at
-    //       chunk-safe boundaries), so bhs[B/block-1] would index the wrong prefix length; text keeps
-    //       bhs dense and the positional lookup exact. Matches the text-only delta-parenting path.
-    void auto_save_context_checkpoint(server_slot & slot, const llama_tokens & toks,
-                                      const std::vector<uint64_t> & bhs) {
-        // (1) MODEL-CLASS soundness gate — see header. UNSOUND for recurrent/hybrid (FULL/RS) and SWA.
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART || n_swa != 0) {
-            return;
+    // MID-PREFILL SHARED-CONTEXT BASE (Option A): persist the leading shared preamble [0, B_ctx) ONCE
+    // as a deduplicated WHOLE-state v1 ROOT, so N chats sharing that prefix each restore this base via
+    // the existing longest-prefix restore instead of re-prefilling it (and, with --slot-save-incremental,
+    // collapse their own save to a small [B_ctx, N) delta parented on it — the incremental parent-find
+    // discovers it for free). Called from update_slots() at the exact instant a COLD-prefilling slot has
+    // decoded EXACTLY cells [0, B_ctx) and NOTHING beyond (armed via slot.ctx_save_pos at prompt start,
+    // clamped there by the prefill loop). Because the resident sequence IS the true whole state at
+    // B_ctx, the whole-save (auto_publish_snapshot lo==0, hi==toks.size() -> llama_state_seq_save_file
+    // whole-root branch) serialises the correct recurrent/attention state — SOUND for dense, SWA AND
+    // recurrent/hybrid. This is why there is NO model-class gate here (the old idle-flush [0,B) sub-range
+    // checkpoint, taken with the slot sitting at N, mislabelled the state-after-N as a B-length prefix
+    // and had to be hard-gated to PART && n_swa == 0; the mid-prefill whole-save removes that unsoundness
+    // for every class). Every early return is a clean no-op (invariant 4). Remaining gates:
+    //   - TEXT-ONLY: media makes the block-hash array sparse (auto_block_hashes only emits at chunk-safe
+    //     boundaries), so bhs[B_ctx/block-1] would index the wrong prefix length. Arming already excludes
+    //     media requests; re-checked here for safety.
+    //   - LoRA-equal: the fingerprint captures the global LoRA set; refuse a base taken under a per-request
+    //     adapter override (invariant 3), same guard as the whole-prefix save path.
+    void auto_save_context_base(server_slot & slot) {
+        if (!auto_cache_enabled()) {
+            return; // off by default
         }
-        // (2) text-only gate — keeps bhs dense so the positional hash lookup below is valid.
         if (slot.prompt.tokens.has_media()) {
+            return; // text-only keeps bhs dense so the positional hash lookup below is exact
+        }
+        if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
+            return; // fp captures the global LoRA set (invariant 3)
+        }
+        // B_ctx = the armed target. The slot is resident at EXACTLY B_ctx here (clamped there and this
+        // batch decoded), so get_text_tokens() has length B_ctx and a whole-save serialises the whole
+        // state at B_ctx. The two equalities below are guaranteed by the arm gates + clamp; re-checked
+        // defensively so a spurious call can only no-op, never write a mislabelled prefix.
+        const int32_t B_ctx = slot.ctx_save_pos;
+        if (B_ctx <= 0) {
             return;
         }
-        // B = first-user-message offset, stashed on the persistent server_prompt at task creation
-        // (never read from the transient/dead task at idle-flush). <= 0 means no user span was found
-        // (detection failure, INST-family with the system prompt inside the first [INST]) -> no base.
-        const int32_t boundary = slot.prompt.ctx_boundary;
-        if (boundary <= 0) {
-            return;
+        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        if ((int32_t) toks.size() != B_ctx) {
+            return; // defensive: the hook must fire with the slot resident at exactly B_ctx
         }
-        const int B     = params_base.slot_save_block;
-        const int B_ctx = boundary - (boundary % B);                 // block-align DOWN (idiom at ~2447)
-        // effective floor = max(block, context-min): a base below this saves little dedup against the
-        // state-file write, so it is skipped (efficiency-only; INST no-ops and few-shot get a smaller base).
-        const int floor_ctx = std::max(B, params_base.slot_save_context_min_tokens);
-        if (B_ctx < floor_ctx) {
-            return;
+        const int B = params_base.slot_save_block;
+        if (B <= 0 || (B_ctx % B) != 0) {
+            return; // defensive: B_ctx is block-aligned by construction (arm uses boundary - boundary % B)
         }
-        if (B_ctx >= (int) toks.size()) {
-            return;                                                  // must be a STRICT prefix of this prompt
-        }
-        const size_t kb = (size_t) (B_ctx / B) - 1;                 // bhs dense (text) => positional index OK
+        // dense (text) block-hash chain over [0, B_ctx); the boundary hash names the base.
+        const auto bhs = auto_block_hashes(toks, {}, B, cur_fp.fp_model, cur_fp.fp_mmproj);
+        const size_t kb = (size_t) (B_ctx / B) - 1;                  // bhs dense (text) => positional index OK
         if (kb >= bhs.size()) {
             return;                                                  // defensive: never index past the chain
         }
         const uint64_t ckpt_hash = bhs[kb];                         // NO re-hash: the boundary hash is in bhs
-        // (3) EXACT-LENGTH redundant-write dedup (not equal-or-longer): the 2nd..Nth chat sharing this
-        //     [0,B_ctx) prefix finds the base already published at this boundary and writes nothing.
+        // EXACT-LENGTH redundant-write dedup (not equal-or-longer): the 2nd..Nth chat sharing this
+        // [0, B_ctx) preamble finds the base already published at this boundary and writes nothing.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             if (auto_index_has_exact_locked(ckpt_hash, (uint32_t) B_ctx)) {
                 return;
             }
         }
-        // (4) write cells [0, B_ctx) as a plain v1 ROOT (lo == 0, hi < N, text-only => media empty,
-        //     parent_id 0) via the SHARED atomic-publish helper — same capacity pre-flight, pid+nonce
-        //     temp, three-file temp->rename (meta last) publish + per-boundary index insert as the
-        //     whole-save path. Delta children then fall out of the existing incremental parent-find.
+        // Write cells [0, B_ctx) as a WHOLE-state v1 ROOT: lo == 0 and hi == B_ctx == toks.size() so
+        // auto_publish_snapshot takes the llama_state_seq_save_file (whole-root) branch — NOT the range
+        // branch — which serialises the true whole recurrent/attention state at B_ctx (text-only =>
+        // media empty, parent_id 0). Same capacity pre-flight, pid+nonce temp, three-file temp->rename
+        // (meta last) publish + per-boundary index insert as every other save.
         auto_publish_snapshot(slot, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
                               ckpt_hash, bhs, /*kb=*/kb, cur_fp);
     }
@@ -3064,12 +3077,11 @@ private:
         if (bhs.empty()) {
             return;
         }
-        // SHARED-CONTEXT CHECKPOINT: publish the leading shared context [0, B_ctx) as ONE deduplicated
-        // base BEFORE the whole-prefix dedup, so the incremental parent-find below discovers it as this
-        // chat's delta parent for free. Fully self-gated (model-class, text-only, boundary, floor);
-        // a clean no-op on every excluded class and when no user boundary was found.
-        auto_save_context_checkpoint(slot, toks, bhs);
-
+        // NOTE: the shared-context preamble base is NO LONGER written here at idle-flush. It is now
+        // whole-saved MID-PREFILL (Option A: auto_save_context_base, fired from update_slots when a cold
+        // slot is resident at exactly the block-aligned first-user boundary B_ctx), which is sound for
+        // dense, SWA AND recurrent/hybrid. The old idle-flush [0,B_ctx) sub-range checkpoint — unsound
+        // for FULL/RS and SWA and therefore a no-op on the production qwen3.6 (hybrid) — is gone.
         const uint64_t full_hash = bhs.back(); // commits the whole whole-block prefix
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -5368,6 +5380,24 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // ===== MID-PREFILL SHARED-CONTEXT BASE whole-save (Option A) =====================
+        // Runs AFTER the decode loop, so every batch chunk has been llama_decode'd and the KV
+        // cells for the tokens added in pre_decode() actually exist. A slot armed at B_ctx and now
+        // resident at EXACTLY [0, B_ctx) (clamped by the prefill loop, still SLOT_STATE_PROCESSING_
+        // PROMPT because B_ctx < N is a strict prefix) holds the true whole state at B_ctx: whole-
+        // save it ONCE, then disarm so the slot prefills [B_ctx, N) normally. post_decode() is NOT a
+        // viable hook — a still-prefilling slot has i_batch == -1 and is skipped by its
+        // is_inside_view() early-return. Cost when nothing is armed: one cheap slot scan.
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                slot.ctx_save_pos > 0 &&
+                slot.prompt.n_tokens() == slot.ctx_save_pos) {
+                auto_save_context_base(slot);
+                slot.ctx_save_pos = -1; // one-shot: neither re-clamp nor re-save this task
+            }
+        }
+        // ===== end MID-PREFILL BASE =====================================================
     }
 
     void pre_decode() {
@@ -6066,6 +6096,37 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // ===== ARM the mid-prefill shared-context base save (Option A) ==============
+                        // Reset here first (STARTED runs exactly once per task) so a target left over
+                        // from a released/aborted task never leaks into slot reuse. Then arm iff this is
+                        // a COLD prefill of a text-only generative request that has a block-aligned
+                        // first-user boundary B_ctx clearing the floor and strictly inside the prompt.
+                        // The prefill loop clamps the batch at B_ctx; the post-decode hook whole-saves
+                        // [0, B_ctx) when the slot is resident at exactly B_ctx. Because the resident
+                        // sequence IS the true whole state at B_ctx, the whole-save is sound for dense,
+                        // SWA AND recurrent/hybrid — there is NO model-class gate (unlike the old
+                        // idle-flush [0,B) sub-range checkpoint this replaces).
+                        slot.ctx_save_pos = -1;
+                        if (auto_cache_enabled() &&
+                            slot.task->need_sampling() &&               // generative only (not embed/rerank; keeps the can_split path)
+                            slot.alora_invocation_start <= 0 &&         // aLoRA caching bound (mirror the auto-restore gate)
+                            are_lora_equal(slot.lora, params_base.lora_adapters) && // fp captures the global LoRA set (invariant 3)
+                            !input_tokens.has_media()) {                // text-only keeps the block-hash array dense
+                            const int32_t boundary = slot.prompt.ctx_boundary; // first_user_message_pos, stashed at task launch
+                            if (boundary > 0) {
+                                const int     B     = params_base.slot_save_block;
+                                const int32_t B_ctx = boundary - (boundary % B);   // block-align DOWN: base stays within the shared preamble
+                                const int     floor = std::max(B, params_base.slot_save_context_min_tokens);
+                                // COLD only: n_past < B_ctx means the [0, B_ctx) region was NOT reused/
+                                // restored, so there is genuinely-new state to persist. A warm/restored
+                                // slot (n_past >= B_ctx) arms nothing (zero change to normal prefill).
+                                if (B_ctx >= floor && B_ctx < slot.task->n_tokens() && n_past < B_ctx) {
+                                    slot.ctx_save_pos = B_ctx;
+                                }
+                            }
+                        }
+                        // ===== end ARM =============================================================
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -6190,6 +6251,17 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
+
+                        // mid-prefill shared-context base (Option A): stop this batch EXACTLY at the
+                        // block-aligned first-user boundary B_ctx, never crossing it, so that once this
+                        // batch is decoded the slot's resident sequence is precisely [0, B_ctx) — the
+                        // true whole state there for the post-decode whole-save. One-shot: the hook
+                        // disarms ctx_save_pos, after which the slot prefills [B_ctx, N) unclamped. If
+                        // B_ctx exceeds n_batch the loop's own batch.size() < n_batch cap stops it first
+                        // and a later update_slots() iteration re-enters here to reach B_ctx.
+                        if (slot.ctx_save_pos > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {

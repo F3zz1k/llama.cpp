@@ -7,12 +7,16 @@ import time
 import pytest
 from utils import *
 
-# Shared-context checkpoint integration tests (RECOMMENDATION.md §6). The feature saves the leading
-# shared context [0, B) — everything before the first user turn — ONCE as a deduplicated v1 base, so
-# N chats that share that prefix each collapse their own save to a small [B, N) v3 delta parented on
-# that one base. B is the first-user-message token offset (block-aligned down). It is gated to
-# pure-attention text models (PART, n_swa == 0) and is UNSOUND (silent wrong output) for
-# recurrent/hybrid (FULL/RS) and SWA (n_swa > 0) models, where NO base may ever be written.
+# Shared-context BASE integration tests (Option A). The feature whole-saves the leading shared context
+# [0, B_ctx) — everything before the first user turn — ONCE as a deduplicated v1 base, so N chats that
+# share that prefix RESTORE it instead of re-prefilling (and, with --slot-save-incremental, each collapse
+# their own save to a small [B_ctx, N) v3 delta parented on that one base). B_ctx is the first-user-
+# message token offset, block-aligned down. Unlike the earlier design — which saved a [0,B) SUB-RANGE at
+# idle-flush with the slot sitting at N and was therefore hard-gated to dense/PART, n_swa == 0 — the base
+# is now written MID-PREFILL as a WHOLE state save, taken at the instant a cold prefill is resident at
+# exactly B_ctx. That is sound for EVERY model class (dense, SWA and recurrent/hybrid), so there is NO
+# model-class gate: the production qwen3.6-27b (qwen35 hybrid) writes and reuses a base. The old SWA/
+# recurrent "no base may ever be written" SOUNDNESS test is therefore obsolete (see the note below).
 
 
 # --- .meta parsing (shared with test_slot_save_incr.py's on-disk format) -------
@@ -54,18 +58,18 @@ CACHE_DIR = "./tmp/slot_save_context_ckpt"
 
 IDLE_SECONDS = 2
 
-# The positive base-write path needs a model that is BOTH pure-attention (PART, n_swa == 0) AND has a
-# separate-system-role chat template AND whose role delimiters are atomic special tokens. No test-suite
-# preset qualifies: stories260K (tinyllama2) is PART but its tokenizer lacks the chatml markers as
-# special tokens, so the delimiters do not align and the first-user boundary is never found; tinygemma3
-# has aligned special-token delimiters but is SWA (gated for soundness) and its template merges the
-# system prompt INTO the first user turn (boundary == 1, below the floor). The positive base-write and
-# the restore guard with a real match are therefore validated ON-RIG with qwen3.6-27b (chatml, separate
-# system role, atomic specials, dense/PART). CPU CI still covers boundary detection (test-chat), arg
-# validation, the no-boundary no-op, and the SOUNDNESS gate (no base ever on SWA/recurrent).
+# The positive base-write path needs a model with a separate-system-role chat template whose role
+# delimiters are atomic special tokens (so the first-user boundary is found and clears the floor). No
+# test-suite preset qualifies: stories260K (tinyllama2) lacks the chatml markers as special tokens, so
+# the delimiters do not align and the boundary is never found; tinygemma3 has aligned special-token
+# delimiters but its template merges the system prompt INTO the first user turn (boundary == 1, below the
+# floor). The positive base-write and the restore-with-a-real-match are therefore validated ON-RIG with
+# qwen3.6-27b (chatml, separate system role, atomic specials) — which, being a qwen35 HYBRID, also
+# exercises the Option-A soundness for the recurrent/hybrid class the old design excluded. CPU CI still
+# covers boundary detection (test-chat), arg validation, and the no-boundary no-op.
 _NO_CPU_POSITIVE_MODEL = (
-    "no CPU preset is pure-attention + separate-system-role + special-token delimiters; "
-    "the shared-context base-write path is validated on-rig (qwen3.6-27b)"
+    "no CPU preset has separate-system-role + special-token delimiters clearing the floor; "
+    "the shared-context base-write path is validated on-rig (qwen3.6-27b, a qwen35 hybrid)"
 )
 
 BLOCK = 16
@@ -113,9 +117,8 @@ def _deltas(metas):
 
 def _has_strict_prefix_base(metas) -> bool:
     """True iff some v1 root's token ids are a STRICT prefix of another saved snapshot's tokens —
-    i.e. a shared-context base checkpoint was written. This is the direct, delta-mechanics-independent
-    definition of "a base was written", used to assert the model-class gate both fires (pure attention)
-    and is suppressed (recurrent/SWA)."""
+    i.e. a shared-context base was written. This is the direct, delta-mechanics-independent definition
+    of "a base was written", used to assert the base is absent when there is no user boundary."""
     parsed = [parse_meta(m) for m in metas]
     roots = [p for p in parsed if p["version"] == 1]
     for r in roots:
@@ -274,40 +277,23 @@ def test_restore_min_above_match_skips_disk_load():
         f"restore-min above the match must skip the disk load (reprocess); cached={guarded_cached}"
 
 
-# --- (4) SOUNDNESS GATE: a SWA model never writes a base ----------------------
-
-def test_swa_model_never_writes_base_checkpoint():
-    """RECOMMENDATION §1/§8 soundness gate: on a sliding-window model (tinygemma3, n_swa > 0) the
-    [0, B) sub-range save is UNSOUND (cells [0, B) are evicted by the window -> garbage at save time),
-    so NO base checkpoint may EVER be written even when the two chats share a >context-min leading
-    context. The model-class gate must suppress it; the chats fall back to whole/delta saves with no
-    strict-prefix base. (Same assertion holds for recurrent/hybrid FULL/RS models.)"""
-    global server
-    server = ServerPreset.tinygemma3()
-    server.n_ctx = 2048
-    server.n_batch = 2048
-    server.n_slots = 1
-    server.temperature = 0.0
-    server.seed = 42
-    server.jinja = True
-    server.slot_save_path = CACHE_DIR
-    server.slot_save_auto = True
-    server.slot_save_incremental = True
-    server.slot_save_block = BLOCK
-    server.slot_save_min_tokens = 0
-    server.slot_save_context_min_tokens = CONTEXT_MIN
-    server.slot_save_idle_seconds = IDLE_SECONDS
-    server.start()
-
-    _chat(server, SHARED_SYSTEM, USER_A)
-    _wait_for_metas(1, IDLE_SECONDS + 15)
-    _chat(server, SHARED_SYSTEM, USER_B)
-    metas = _wait_for_metas(2, IDLE_SECONDS + 15)
-    server.stop()
-
-    assert len(metas) >= 2, "both SWA chats must still persist their (whole) KV"
-    assert not _has_strict_prefix_base(metas), \
-        "SOUNDNESS: a SWA model must NEVER write a [0,B) base checkpoint (silent wrong output otherwise)"
-    # a written base would additionally collapse the second chat into a delta; assert it did not.
-    assert len(_deltas(metas)) == 0, \
-        "no shared base => the divergent SWA chats cannot parent a delta; both stay whole roots"
+# --- (4) OBSOLETE: the model-class SOUNDNESS gate is gone (Option A) -----------
+#
+# The former test here — test_swa_model_never_writes_base_checkpoint — asserted that a sliding-window
+# (SWA) model, and by extension a recurrent/hybrid (FULL/RS) model, could NEVER write a shared-context
+# base, because the earlier design saved a [0, B) SUB-RANGE with the slot sitting at N: for SWA the
+# window had already evicted cells [0, B), and for a recurrent fold the persisted bytes were the state-
+# after-N mislabelled as a B-length prefix — both silent wrong output. That was a real correctness
+# boundary, and the code hard-gated the save to dense/PART, n_swa == 0.
+#
+# Option A REMOVES that gate. The base is now whole-saved MID-PREFILL, at the instant a cold prefill is
+# resident at EXACTLY B_ctx (nothing decoded beyond it): the resident sequence IS the true whole state
+# at B_ctx, so llama_state_seq_save_file serialises the correct state for dense, SWA AND recurrent/
+# hybrid alike. There is consequently no model-class gate left to test — an SWA or hybrid model with a
+# real first-user boundary above the floor now legitimately WRITES and reuses a base, which is exactly
+# the behaviour the old test forbade. Asserting "no base on SWA" would now be asserting a bug.
+#
+# The positive base-write on a class the old design excluded (the qwen35 HYBRID qwen3.6-27b) is
+# validated ON-RIG — see _NO_CPU_POSITIVE_MODEL and test_two_chats_share_one_base_plus_two_deltas. CPU
+# CI retains the model-class-independent coverage: boundary detection (test-chat), arg validation, and
+# the no-boundary no-op (test_no_user_boundary_writes_whole_prefix_no_base above).
