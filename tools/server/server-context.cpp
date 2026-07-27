@@ -1769,6 +1769,11 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // The value the ENGINE masks with (llama_model_n_swa), NEVER zeroed by --swa-full. Every disk
+    // save/restore soundness decision must use THIS, not n_swa: --swa-full enlarges the SWA cache but
+    // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
+    int32_t n_swa_mem = 0;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -2152,8 +2157,14 @@ private:
                     if (!(c.fp == cur_fp)) {
                         continue; // invariant 3
                     }
-                    if (full && c.n_tokens > req.size()) {
-                        continue; // a FULL snapshot longer than the request is never a whole prefix
+                    if ((full || n_swa_mem > 0) && c.n_tokens > req.size()) {
+                        // A FULL/recurrent snapshot longer than the request is never a whole prefix.
+                        // Same for SWA: its persisted window is anchored at its own end, so a longer
+                        // snapshot can only ever be refused by the restore gate — and because the store
+                        // is dominated by release-time (prompt+generated) snapshots, such siblings are
+                        // the COMMON case. Left unfiltered they exhaust AUTO_MAX_RESTORE_ATTEMPTS and
+                        // starve the shorter, usable mid-prefill base (which sorts last).
+                        continue;
                     }
                     if (!seen.insert(c.state_path).second) {
                         continue; // the same snapshot reaches several boundaries
@@ -2593,7 +2604,7 @@ private:
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
-        } else if (n_swa > 0) {
+        } else if (n_swa_mem > 0) {
             // SWA (PART + n_swa > 0): llama_kv_cache::state_write DROPS every SWA-masked cell
             // (is_masked_swa against cells.seq_pos_max(seq_id) at SAVE time), so a snapshot of
             // length L persists an SWA window anchored at ITS OWN end - only positions
@@ -2607,7 +2618,7 @@ private:
             if (v != disk_toks.size()) {
                 SLT_DBG(slot, "auto-restore: SWA snapshot is not a whole prefix of the request "
                               "(verified %zu of %zu snapshot tokens; request %zu, n_swa = %d) - skipping %s\n",
-                        v, disk_toks.size(), req.size(), n_swa, cand.state_path.c_str());
+                        v, disk_toks.size(), req.size(), n_swa_mem, cand.state_path.c_str());
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
@@ -2703,7 +2714,7 @@ private:
         // mirroring the FULL branch inside do_slot_restore (which never needs the trim: FULL only
         // restores whole-snapshot extend-matches). Non-SWA attention models skip the checkpoint
         // machinery entirely and need none of this.
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa_mem > 0) {
             if (v < disk_toks.size()) {
                 if (disk_media.empty()) {
                     slot.prompt.tokens.keep_first(v); // media prompts were already rebuilt to exactly v cells
@@ -3111,7 +3122,7 @@ private:
                     // shorter one is a different resume point) — otherwise this incremental save would
                     // be suppressed by a longer snapshot the model can never restore. PART: an
                     // equal-or-longer snapshot already covers this prefix (it can rewind to it).
-                    if (full ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
+                    if ((full || n_swa_mem > 0) ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
                         return; // a usable snapshot for this exact prefix already exists
                     }
                 }
@@ -3639,7 +3650,15 @@ private:
             }
         }
 
-        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+        // NOTE: --swa-full only enlarges the SWA cache; it does NOT disable masking.
+        // llama_kv_cache_iswa still constructs kv_swa with hparams.n_swa/swa_type, and
+        // llama_kv_cache::state_write masks on those members unconditionally — so saves stay
+        // WINDOWED even under --swa-full. Zeroing n_swa here would disarm the disk-cache SWA
+        // guards while the engine keeps writing windowed blobs, letting a restore claim a prefix
+        // over a hole (silent wrong attention). Keep the scheduling value for the batch planner,
+        // but keep a model-derived value for every save/restore soundness decision.
+        n_swa      = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+        n_swa_mem  = llama_model_n_swa(model_tgt);   // what the ENGINE masks with — never 0 for an SWA model
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -5157,7 +5176,7 @@ private:
                     // finds none in a fresh process and would force a full re-process on the next
                     // request, silently discarding the restore. (FULL models get theirs inside
                     // do_slot_restore; non-SWA attention models skip the checkpoint machinery.)
-                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0) {
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa_mem > 0) {
                         const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
                         const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
                         if (ckpt_pos_min >= 0) {
@@ -6174,7 +6193,7 @@ private:
                             // Only when this request got essentially no reuse (n_past < floor), so a warm
                             // continuation never pays a redundant whole-state write. n_swa == 0 (the
                             // FULL/hybrid production path) is untouched by construction.
-                            if (n_swa > 0 && n_past < floor &&
+                            if (n_swa_mem > 0 && n_past < floor &&
                                 !(B_ctx >= floor && B_ctx < slot.task->n_tokens())) {
                                 const int32_t e = slot.task->n_tokens() - 1; // -1 keeps B_ctx a STRICT prefix
                                 B_ctx = e > 0 ? e - (e % B) : -1;
