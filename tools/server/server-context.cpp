@@ -3521,6 +3521,11 @@ private:
             return false;
         }
 
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -4431,6 +4436,18 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // Gate slot save/restore/erase on slot content (does it hold media),
+    // not model capability: a multimodal model may hold a pure-text slot.
+    bool check_slot_no_media(const server_slot & slot, const int id_task) {
+        if (slot.prompt.tokens.has_media()) {
+            send_error(id_task,
+                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
+                ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+        return true;
+    }
+
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -4928,6 +4945,9 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
@@ -5147,6 +5167,10 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    // Gate on slot content, consistent with save/restore.
+                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {

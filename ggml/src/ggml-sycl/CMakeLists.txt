@@ -197,11 +197,11 @@ if (GGML_SYCL_DEVICE_ARCH)
     target_compile_options(
         ggml-sycl PRIVATE
         -fsycl-targets=spir64_gen
-        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
+        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH} -options -ze-intel-greater-than-4GB-buffer-required\""
     )
     target_link_options(
         ggml-sycl PRIVATE
         -fsycl-targets=spir64_gen
-        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
+        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH} -options -ze-intel-greater-than-4GB-buffer-required\""
     )
 endif()
