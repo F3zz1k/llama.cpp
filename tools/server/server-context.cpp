@@ -2593,6 +2593,24 @@ private:
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
+        } else if (n_swa > 0) {
+            // SWA (PART + n_swa > 0): llama_kv_cache::state_write DROPS every SWA-masked cell
+            // (is_masked_swa against cells.seq_pos_max(seq_id) at SAVE time), so a snapshot of
+            // length L persists an SWA window anchored at ITS OWN end - only positions
+            // [L - n_swa, L). Restoring it and trimming back to a shorter verified prefix v < L can
+            // NEVER recreate positions [v - n_swa, L - n_swa): those bytes were never written, and
+            // re-decoding from there would attend over a hole. The ONLY sound reuse length on an SWA
+            // model is therefore the WHOLE snapshot (v == disk_toks.size(), i.e. the request
+            // strictly EXTENDS it) - the same rule the FULL branch above enforces. Refuse here,
+            // BEFORE the multi-GB read, so the candidate loop falls through to a SHORTER snapshot
+            // that IS a whole prefix of this request (e.g. the mid-prefill context base).
+            if (v != disk_toks.size()) {
+                SLT_DBG(slot, "auto-restore: SWA snapshot is not a whole prefix of the request "
+                              "(verified %zu of %zu snapshot tokens; request %zu, n_swa = %d) - skipping %s\n",
+                        v, disk_toks.size(), req.size(), n_swa, cand.state_path.c_str());
+                return 0;
+            }
+            n_keep_disk = (int) disk_toks.size();
         } else {
             // Attention (PART) models support per-token partial seq_rm, so a mid-snapshot divergence
             // is fine: claim the verified prefix clamped down to the last whole block boundary <= v.
@@ -6136,17 +6154,36 @@ private:
                             slot.alora_invocation_start <= 0 &&         // aLoRA caching bound (mirror the auto-restore gate)
                             are_lora_equal(slot.lora, params_base.lora_adapters) && // fp captures the global LoRA set (invariant 3)
                             !input_tokens.has_media()) {                // text-only keeps the block-hash array dense
+                            const int     B        = params_base.slot_save_block;
+                            const int     floor    = std::max(B, params_base.slot_save_context_min_tokens);
                             const int32_t boundary = slot.prompt.ctx_boundary; // first_user_message_pos, stashed at task launch
-                            if (boundary > 0) {
-                                const int     B     = params_base.slot_save_block;
-                                const int32_t B_ctx = boundary - (boundary % B);   // block-align DOWN: base stays within the shared preamble
-                                const int     floor = std::max(B, params_base.slot_save_context_min_tokens);
-                                // COLD only: n_past < B_ctx means the [0, B_ctx) region was NOT reused/
-                                // restored, so there is genuinely-new state to persist. A warm/restored
-                                // slot (n_past >= B_ctx) arms nothing (zero change to normal prefill).
-                                if (B_ctx >= floor && B_ctx < slot.task->n_tokens() && n_past < B_ctx) {
-                                    slot.ctx_save_pos = B_ctx;
-                                }
+                            // block-align DOWN: base stays within the shared preamble
+                            int32_t B_ctx = boundary > 0 ? boundary - (boundary % B) : -1;
+                            // SWA FALLBACK: on an SWA model a release-time snapshot (prompt + generated
+                            // tail) is restorable ONLY by a request that STRICTLY EXTENDS it - its state
+                            // file carries just the window [L - n_swa, L), so it can never be rewound to
+                            // a shorter prefix (see the SWA gate in auto_restore_into_slot). A repeat /
+                            // regenerate of the SAME prompt - and, on a reasoning model, EVERY follow-up
+                            // turn, since the generated thinking tokens are not replayed - therefore gets
+                            // ZERO reuse unless the store also holds a whole-state root STRICTLY INSIDE
+                            // the prompt. When the shared-context boundary does not arm one (absent, or
+                            // below the floor - the common single-user-message case), anchor it at the
+                            // deepest block boundary below the prompt end instead. The mid-prefill
+                            // whole-save is sound for SWA precisely because the resident sequence IS the
+                            // true whole state at B_ctx, so its persisted window is anchored at B_ctx.
+                            // Only when this request got essentially no reuse (n_past < floor), so a warm
+                            // continuation never pays a redundant whole-state write. n_swa == 0 (the
+                            // FULL/hybrid production path) is untouched by construction.
+                            if (n_swa > 0 && n_past < floor &&
+                                !(B_ctx >= floor && B_ctx < slot.task->n_tokens())) {
+                                const int32_t e = slot.task->n_tokens() - 1; // -1 keeps B_ctx a STRICT prefix
+                                B_ctx = e > 0 ? e - (e % B) : -1;
+                            }
+                            // COLD only: n_past < B_ctx means the [0, B_ctx) region was NOT reused/
+                            // restored, so there is genuinely-new state to persist. A warm/restored
+                            // slot (n_past >= B_ctx) arms nothing (zero change to normal prefill).
+                            if (B_ctx >= floor && B_ctx < slot.task->n_tokens() && n_past < B_ctx) {
+                                slot.ctx_save_pos = B_ctx;
                             }
                         }
                         // ===== end ARM =============================================================
