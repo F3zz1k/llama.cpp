@@ -1769,6 +1769,20 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // P0.1 (anchored-resume): does THIS model's memory class actually honour a position range in
+    // state_write_range? The base-class default (src/llama-memory.h:132-136) IGNORES [p0,p1) and
+    // writes the WHOLE sequence, and only 4 of the 7+ memory implementations override it. On a
+    // non-overriding class a "delta node" silently contains [0,N); composing root [0,lo) + that node
+    // under NO_CLEAR yields DUPLICATE cells per position => wrong attention, silently.
+    // We cannot ask the engine (no API reports what it serialised) and we cannot sniff the blob
+    // (composite classes concatenate independently-narrowing sections). So we PROBE, once, on the
+    // first delta write, against real resident state: write the range AND the whole sequence and
+    // compare byte counts. Probe-don't-declare mirrors common_context_can_seq_rm, which likewise
+    // decodes and tries the operation rather than trusting a class predicate.
+    // Fails CLOSED: unknown/no => never write deltas, only whole roots at anchors.
+    enum class delta_cap : uint8_t { unknown, yes, no };
+    delta_cap delta_capable = delta_cap::unknown;
+
     // The value the ENGINE masks with (llama_model_n_swa), NEVER zeroed by --swa-full. Every disk
     // save/restore soundness decision must use THIS, not n_swa: --swa-full enlarges the SWA cache but
     // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
@@ -2831,6 +2845,11 @@ private:
         //    (checkpoint, hi < N) writes cells [0, hi) via the range save; the WHOLE root takes the
         //    byte-identical save_file path.
         size_t nwrite;
+        // P0.1: a class that does not honour ranges must never publish a delta. Probe once, here,
+        // where real resident state exists and the range save is about to happen anyway.
+        if (is_node && delta_capable == delta_cap::no) {
+            return; // fail closed: this instance only writes whole roots
+        }
         if (is_node) {
             // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
             // slot.prompt.tokens.pos_next(parent_hi) — the same function that assigned the cell
@@ -2848,6 +2867,48 @@ private:
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
             return; // invariant 4: disk full / IO error -> generation unaffected
+        }
+
+        // P0.1: resolve the probe on the FIRST delta write. Cost: one extra whole-sequence write,
+        // once per instance. If the range was ignored the two byte counts match (the "delta" is a
+        // whole save wearing a delta's .meta) and composing it would duplicate cells -> refuse, and
+        // never attempt a delta again on this instance.
+        if (is_node && delta_capable == delta_cap::unknown) {
+            const std::string probe = tmp + ".probe";
+            const size_t nwhole = llama_state_seq_save_file(ctx, probe.c_str(), slot.id,
+                                                            snap_toks.data(), snap_toks.size());
+            std::error_code pec; std::filesystem::remove(probe, pec);
+            if (nwhole == 0) {
+                std::error_code ec; std::filesystem::remove(tmp, ec);
+                return; // could not probe; try again on the next save rather than guess
+            }
+            delta_capable = (nwrite < nwhole) ? delta_cap::yes : delta_cap::no;
+            SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
+                    delta_capable == delta_cap::yes ? "YES" : "NO (whole roots only)", nwrite, nwhole);
+            if (delta_capable == delta_cap::no) {
+                std::error_code ec; std::filesystem::remove(tmp, ec);
+                return;
+            }
+        }
+
+        // P0.4: refuse to publish a snapshot with NO memory payload. llama_kv_cache::state_write and
+        // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return;`,
+        // src/llama-kv-cache.cpp:2125-2127 / :2204-2206) — as on LLM_ARCH_GEMMA4_ASSISTANT, whose
+        // sub-caches both carry mem_other. llama_state_seq_save_file still returns nwrite > 0 (file
+        // header + token array), so the existing nwrite==0 gate passes, the .meta claims N tokens,
+        // and a later restore loads NOTHING while reporting success. Class-agnostic guard: a real
+        // snapshot must be substantially larger than its own header + token array. (The early return
+        // in the engine is CORRECT for a pure view sharing v_cells_impl — we refuse the empty
+        // SNAPSHOT, never the model.)
+        {
+            const size_t hdr_and_toks = 256 + snap_toks.size() * sizeof(llama_token);
+            if (nwrite <= hdr_and_toks) {
+                SRV_WRN("auto disk cache: refusing to publish a snapshot with no memory payload "
+                        "(%zu B for %zu tokens) - the memory type serialised nothing\n",
+                        nwrite, snap_toks.size());
+                std::error_code ec; std::filesystem::remove(tmp, ec);
+                return;
+            }
         }
         // 1b) U6 (mm-delta decision 4): a range-save delta selects suffix cells by POSITION, so a
         //     mid-chunk anomaly could leave the boundary value right yet silently drop/duplicate suffix
