@@ -570,12 +570,21 @@ static void slot_save_enforce_limits(const std::string & dir,
     //   (a) NEVER evict a node that still has a child on disk — its delta .bin is meaningless without its
     //       base — so we only ever evict LEAVES (child_count[node_id] == 0), oldest leaf first, which
     //       peels a lineage tip-to-root.
-    //   (b) Age whole TREES by their most-recent node (tree_recency = MAX mtime in the tree) so a hot
-    //       lineage keeps its cold shared base; the least-recently-used tree is drained before a warmer
-    //       one is touched.
-    // When every file is a v1 root (child_count all zero, each its own tree), tree_recency[root] == the
-    // file's own mtime and every file is a leaf, so this reduces EXACTLY to today's flat mtime LRU
-    // (golden-safe for the incremental-OFF path). Recomputed from disk each pass => cross-process correct.
+    //   (b) Age every candidate by its OWN mtime. A restore touches EVERY node on the chain it used
+    //       (see auto_touch_unit at the restore site), so a live lineage's shared base already has a
+    //       fresh mtime of its own and is additionally un-evictable by (a) while any child survives.
+    //       An untouched sibling therefore ages out on its own, which is the whole point.
+    //
+    // NOTE: this deliberately REPLACES a previous `tree_recency` rule that aged whole TREES by their
+    // most-recent node. That rule was redundant with (a) + chain-propagating touch for its stated goal
+    // ("a hot lineage keeps its cold shared base"), and it actively broke the fan-out case it was
+    // supposed to help: with N subagent forks off one shared prefix, a single active fork refreshed
+    // the whole tree's recency and made all N-1 dead forks immortal, so eviction pressure fell on
+    // OTHER trees instead — a wide fan-out could evict the entire rest of the store. It also let a
+    // single synthetic warm-on-spawn restore (which touches the chain) immunise a lineage that had
+    // seen no real traffic for days. Measured on the live store: 21 sibling tips off one root, median
+    // leaf age 82.5 h, shielded by a tree_recency of 2.0 h that came from the boot-time warm read.
+    // Recomputed from disk each pass => cross-process correct.
 
     auto remove_unit_files = [&](const slot_save_unit & u) {
         std::filesystem::remove(u.state_path, ec);
@@ -644,39 +653,6 @@ static void slot_save_enforce_limits(const std::string & dir,
         }
     }
 
-    // Root index per node (walk parent links to a parentless node) + tree_recency = MAX mtime over each
-    // tree. root_of[i] is always an alive index; a bounded hop count guards a corrupt cycle.
-    std::vector<size_t> root_of(units.size(), 0);
-    for (size_t i = 0; i < units.size(); ++i) {
-        if (!alive[i]) {
-            continue;
-        }
-        size_t cur = i;
-        for (size_t hops = 0; hops <= units.size(); ++hops) {
-            if (units[cur].parent_id == 0) {
-                break; // parentless => this is the root
-            }
-            const auto it = node_by_key.find(parent_key(units[cur]));
-            if (it == node_by_key.end() || !alive[it->second] || it->second == cur) {
-                break; // post-reap this should not happen; treat cur as the root defensively
-            }
-            cur = it->second;
-        }
-        root_of[i] = cur;
-    }
-
-    std::unordered_map<size_t, std::filesystem::file_time_type> tree_recency;
-    for (size_t i = 0; i < units.size(); ++i) {
-        if (!alive[i]) {
-            continue;
-        }
-        const size_t r = root_of[i];
-        const auto it = tree_recency.find(r);
-        if (it == tree_recency.end() || it->second < units[i].mtime) {
-            tree_recency[r] = units[i].mtime;
-        }
-    }
-
     // Pinned units are excluded from the caps entirely — they occupy the tree only so their ancestors
     // stay refcount-protected — matching the flat-LRU pin semantics (a pinned unit was uncounted there).
     size_t    count = 0;
@@ -688,9 +664,8 @@ static void slot_save_enforce_limits(const std::string & dir,
         }
     }
 
-    // Pick the evictable leaf with the smallest (tree_recency[root], mtime): the oldest tip of the
-    // least-recently-used tree. Returns units.size() when nothing is evictable (every remaining node has
-    // a live child, or all that is left is just_written).
+    // Pick the least-recently-used evictable leaf, by its OWN mtime. Returns units.size() when nothing
+    // is evictable (every remaining node has a live child, or all that is left is just_written).
     auto pick_leaf = [&]() -> size_t {
         size_t best = units.size();
         for (size_t i = 0; i < units.size(); ++i) {
@@ -707,13 +682,7 @@ static void slot_save_enforce_limits(const std::string & dir,
                 best = i;
                 continue;
             }
-            const auto & ur = tree_recency[root_of[i]];
-            const auto & br = tree_recency[root_of[best]];
-            bool better;
-            if      (ur < br) { better = true; }
-            else if (br < ur) { better = false; }
-            else              { better = (units[i].mtime < units[best].mtime); }
-            if (better) {
+            if (units[i].mtime < units[best].mtime) {
                 best = i;
             }
         }
