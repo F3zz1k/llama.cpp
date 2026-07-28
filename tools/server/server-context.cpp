@@ -1931,15 +1931,29 @@ private:
             [](const auto_cache_entry & a, const auto_cache_entry & b) { return a.n_tokens > b.n_tokens; });
         v.insert(pos, e);
         if (v.size() > AUTO_MAX_CANDIDATES_PER_BOUNDARY) {
-            // Over the cap: drop the SHORTEST UNPINNED entry — NEVER a pinned one. A pinned base is the
-            // shortest entry in a boundary bucket shared with many longer divergent siblings, yet it is
-            // the ONLY real strict-prefix parent the incremental save parent-find can use; dropping it
-            // would force every later sibling to fall back to a whole (v1) snapshot. The .pin marker is
-            // re-stat'd here for authority (a pin touched after the entry was first indexed — the normal
-            // deploy order — is honoured, and the cached flag refreshed). Scan shortest-first (the vector
-            // is sorted descending); if EVERY entry is pinned (pathological) the bucket is left one over
-            // the cap rather than evict a pinned base.
-            for (auto rit = v.rbegin(); rit != v.rend(); ++rit) {
+            // Over the cap: NEVER drop the SHORTEST entry, and never a pinned one.
+            //
+            // The shortest entry at a boundary is the snapshot that ends closest to it — i.e. the
+            // SHARED BASE for this prefix. It is the only real strict-prefix parent the incremental
+            // save parent-find can use, and the only candidate a *different* conversation sharing this
+            // prefix can restore from. Every longer entry is a divergent sibling: losing one costs that
+            // one lineage its deep reuse; losing the base costs EVERY lineage the shared prefix and
+            // forces each later sibling to fall back to a whole (v1) snapshot.
+            //
+            // This used to drop the shortest unpinned entry, protecting the base only via a MANUAL
+            // `<state>.pin` marker. That is backwards: bases created automatically (the mid-prefill
+            // context base, and any root a chat happens to establish) are never pinned, so the one
+            // entry the bucket exists to serve was the first thing evicted. A boundary shared by more
+            // than the cap — one long conversation with >32 saved nodes, or >32 chats behind a common
+            // system prompt — silently un-indexed the shared prefix while its file stayed on disk, and
+            // every new chat then cold-prefilled it. `.pin` stays honoured, but is no longer
+            // load-bearing for correctness of the common case.
+            //
+            // Scan shortest-first among the REST (skip the last element, the base); the .pin marker is
+            // re-stat'd for authority (a pin touched after the entry was indexed — the normal deploy
+            // order — is honoured and the cached flag refreshed). If every droppable entry is pinned,
+            // leave the bucket one over the cap rather than evict a base or a pinned entry.
+            for (auto rit = std::next(v.rbegin()); rit != v.rend(); ++rit) {
                 std::error_code pec;
                 rit->pinned = std::filesystem::exists(rit->state_path + ".pin", pec) && !pec;
                 if (!rit->pinned) {
