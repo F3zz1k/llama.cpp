@@ -5918,6 +5918,24 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 return src0_type == GGML_TYPE_F32;
             }
         case GGML_OP_CONCAT:
+            {
+                // must match the dst types implemented by ggml_sycl_op_concat, which
+                // hard-aborts on anything else (e.g. quantized types)
+                switch (op->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+#ifdef GGML_SYCL_HAS_BF16
+                    case GGML_TYPE_BF16:
+#endif
+                    case GGML_TYPE_I32:
+                    case GGML_TYPE_I16:
+                    case GGML_TYPE_I64:
+                    case GGML_TYPE_I8:
+                        return true;
+                    default:
+                        return false;
+                }
+            }
         case GGML_OP_DUP:
         case GGML_OP_ARGMAX:
         case GGML_OP_NONE:
