@@ -16,8 +16,19 @@ template<typename TIn, typename TOut>
 static inline std::enable_if_t<utils::is_arithmetic_v<TIn>() && utils::is_arithmetic_v<TOut>(), void>
 convert (const char* src, char* dst) {
     auto src_val = *reinterpret_cast<const TIn*>(src);
-    auto dst_val = sycl::vec<TIn, 1>(src_val).template convert<TOut, sycl::rounding_mode::automatic>()[0];
-   *reinterpret_cast<TOut*>(dst) = dst_val;
+#ifdef GGML_SYCL_HAS_BF16
+    constexpr bool is_half_to_bf16 =
+        std::is_same_v<TIn, sycl::half> && std::is_same_v<TOut, sycl::ext::oneapi::bfloat16>;
+#else
+    constexpr bool is_half_to_bf16 = false;
+#endif
+    if constexpr (is_half_to_bf16) {
+        // sycl::vec has no half -> bf16 conversion; go through float
+        *reinterpret_cast<TOut*>(dst) = TOut(static_cast<float>(src_val));
+    } else {
+        auto dst_val = sycl::vec<TIn, 1>(src_val).template convert<TOut, sycl::rounding_mode::automatic>()[0];
+        *reinterpret_cast<TOut*>(dst) = dst_val;
+    }
 }
 
 template <typename TIdx, typename blockType, int qk, cpy_kernel_t cpyblck>
@@ -237,12 +248,24 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I64 || dst->src[1]->type == GGML_TYPE_I32);
 
-    if (src1->type == GGML_TYPE_I64) {
-        set_rows_sycl<float, int64_t>(ctx, src0, src1, dst);
+    if (src0->type == GGML_TYPE_F16) {
+        // f16 sources go through the converting float-family kernel only; quantized
+        // destinations require an f32 source (the block quantize kernels are f32-only)
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+        dpct::has_capability_or_fail(ctx.stream()->get_device(), { sycl::aspect::fp16 });
+        if (src1->type == GGML_TYPE_I64) {
+            set_rows_sycl<sycl::half, int64_t>(ctx, src0, src1, dst);
+        } else {
+            set_rows_sycl<sycl::half, int32_t>(ctx, src0, src1, dst);
+        }
     } else {
-        set_rows_sycl<float, int32_t>(ctx, src0, src1, dst);
+        if (src1->type == GGML_TYPE_I64) {
+            set_rows_sycl<float, int64_t>(ctx, src0, src1, dst);
+        } else {
+            set_rows_sycl<float, int32_t>(ctx, src0, src1, dst);
+        }
     }
 }
