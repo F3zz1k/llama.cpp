@@ -2325,46 +2325,39 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
-        // tool call segment in reasoning
+        // a tool call ends the prefilled thinking block, with or without a closing </think>
         tst.test(
-               "Let's call a tool: <tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Not the real call!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n</think>\n\n"
                "<tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Hello, world!\")\n"
-               "\n"
-               "hello()\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
                "</parameter>\n"
                "</function>\n"
                "</tool_call>")
             .enable_thinking(true)
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .tools({
-                python_tool
-        })
-            .expect_reasoning(
-                "Let's call a tool: <tool_call>\n"
-                "<function=python>\n"
-                "<parameter=code>\n"
-                "def hello():\n"
-                "    print(\"Not the real call!\")\n"
-                "\n"
-                "hello()\n"
-                "</parameter>\n"
-                "</function>\n"
-                "</tool_call>")
+            .tools({ run_in_terminal_tool })
             .expect_tool_calls({
-                { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        // ...including after the model has thought about it
+        tst.test(
+               "Need to inspect the current directory.\n"
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ run_in_terminal_tool })
+            .expect_reasoning("Need to inspect the current directory.")
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
             })
             .run();
 
@@ -2506,17 +2499,6 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_tool_calls({
                 { "run_in_terminal", R"({"command": "pwd"})", {} },
             })
-            .run();
-
-        tst.test(
-               "I might call <tool_call> later, but I am still thinking.\n"
-               "</think>\n\n"
-               "Final answer without tools.")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .enable_thinking(true)
-            .tools({ run_in_terminal_tool })
-            .expect_reasoning("I might call <tool_call> later, but I am still thinking.")
-            .expect_content("Final answer without tools.")
             .run();
 
         // Continuation tests
@@ -2823,49 +2805,6 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
-        // tool call segment in reasoning
-        tst.test(
-               "Let's call a tool: <tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Not the real call!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n</think>\n"
-               "<tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Hello, world!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n"
-            )
-            .enable_thinking(true)
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .tools({
-                python_tool
-        })
-            .expect_reasoning("Let's call a tool: <tool_call>\n"
-               "<function=python>\n"
-               "<parameter=code>\n"
-               "def hello():\n"
-               "    print(\"Not the real call!\")\n"
-               "\n"
-               "hello()\n"
-               "</parameter>\n"
-               "</function>\n"
-               "</tool_call>\n")
-            .expect_tool_calls({
-                { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
-            })
-            .run();
-
         // Continuation tests
         tst.test("world!\nWhat's up?")
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
@@ -3040,6 +2979,85 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .is_partial(true)
             .expect(message_assist_thoughts_partial_call)
+            .run();
+    }
+
+    {
+        // Inkling / TML typed content blocks: <|end_message|> separates blocks, <|content_model_end_sampling|> ends the turn.
+        auto tst = peg_tester("models/templates/Inkling.jinja", detailed_debug);
+
+        // reasoning + visible answer
+        tst.test("<|content_thinking|>I'm\nthinking<|end_message|>"
+                 "<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Visible answer only (reasoning_effort=0 -> no thinking block).
+        tst.test("<|content_text|>Hello, world!\nWhat's up?<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        // Empty thinking block, then the answer.
+        tst.test("<|content_thinking|><|end_message|>"
+                 "<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        // single tool call with reasoning; the bare tool-name echo and role opener are dropped
+        tst.test("<|content_thinking|>I'm\nthinking<|end_message|>"
+                 "<|message_model|>special_function<|content_invoke_tool_json|>"
+                 "{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_with_reasoning_and_tool_call("I'm\nthinking", "special_function", "{\"arg1\": 1}"))
+            .run();
+
+        // Tool call, no reasoning.
+        tst.test("<|message_model|>special_function<|content_invoke_tool_json|>"
+                 "{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // regression: the tool branch must not swallow a pure-text answer
+        tst.test("<|content_thinking|>I'm\nthinking<|end_message|>"
+                 "<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_thoughts)
+            .run();
+
+        // tools available, content only, no thinking (reasoning_effort=0 leak scenario)
+        tst.test("<|content_text|>Hello, world!\nWhat's up?<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist)
+            .run();
+
+        // parallel tool calls are separate marker-wrapped blocks
+        tst.test("<|message_model|>special_function<|content_invoke_tool_json|>"
+                 "{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|>"
+                 "<|message_model|>python<|content_invoke_tool_json|>"
+                 "{\"name\":\"python\",\"args\":{\"code\":\"print('hey')\"}}<|end_message|>"
+                 "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, python_tool })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "" },
+                { "python", "{\"code\": \"print('hey')\"}", "" },
+            })
             .run();
     }
 
@@ -3619,6 +3637,61 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // Some models skip the opening <tool_call> and go straight to <function=>
+        tst.test(
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "Let me call it.\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .expect_content("Let me call it.\n")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+            })
+            .run();
+
+        // Only the first call may omit it, the rest keep the </tool_call>\n<tool_call> separator
+        tst.test(
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n"
+               "<tool_call>\n"
+               "<function=special_function_with_opt>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "<parameter=arg2>\n"
+               "2\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
         tst.test(
                "<tool_call>\n"
                "<function=special_function>\n"
@@ -3723,6 +3796,37 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         })
             .expect_tool_calls({
                 { "todo_list", "{\"todos\": [{\"item\": \"Check stuff\", \"selected\": false}, {\"item\": \"Prepare stuff\", \"selected\": true}]}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test flexible required argument ordering (required args still come first, in any order)
+        tst.test(
+               "<tool_call>\n"
+               "<function=edit>\n"
+               "<parameter=newString>\n#include\n</parameter>\n"
+               "<parameter=filename>\nfoo.c\n</parameter>\n"
+               "<parameter=oldString>\n#iclunde\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ edit_tool })
+            .expect_tool_calls({
+                { "edit", R"({"newString": "#include", "filename": "foo.c", "oldString": "#iclunde"})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=tool_2req_4opt>\n"
+               "<parameter=req2>\n42\n</parameter>\n"
+               "<parameter=req1>\nhello\n</parameter>\n"
+               "<parameter=opt2>\n200\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ tool_2req_4opt })
+            .expect_tool_calls({
+                { "tool_2req_4opt", R"({"req2": 42, "req1": "hello", "opt2": 200})", {} },
             })
             .expect_reconstruction()
             .run();
