@@ -6194,12 +6194,15 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
+                                // Consume just_restored UNCONDITIONALLY, before the gate: the tail-aware threshold
+                                // makes the gate false for the restore-plus-suffix case, and this flag is never
+                                // cleared in server_slot::reset(), so a consume inside the gate leaks for the life
+                                // of the slot.
+                                const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
+                                (void) slot_was_restored;
+
                                 if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
-                                    // reuse a tail checkpoint (e.g. restored from disk) when genuinely-new tokens follow,
-                                    // which supply the required logits so the >=1-token guarantee still holds
-                                    const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
-                                    const bool has_new_suffix = (size_t) slot.task->n_tokens() > (size_t) n_past;
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
@@ -6210,7 +6213,11 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            return cur.pos_min == 0 || cur.pos_min < pos_min_thold || (slot_was_restored && has_new_suffix && cur.pos_min == pos_min_thold);
+                                            // NOTE: no `cur.pos_min == pos_min_thold` clause. With the tail-aware
+                                            // threshold, pos_min_thold == pos_next for tail memories, so such a
+                                            // checkpoint restores to p0 == cell.pos and the following partial seq_rm
+                                            // on a recurrent cache with n_rs_seq == 0 returns false -> GGML_ABORT.
+                                            return cur.pos_min == 0 || cur.pos_min < pos_min_thold;
                                         }
                                     );
 
