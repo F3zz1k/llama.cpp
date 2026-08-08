@@ -6006,7 +6006,15 @@ private:
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            // llama_memory_hybrid[_iswa]::seq_pos_min() returns max(attn_min, recr_min), and the
+                            // recurrent side keeps a single live cell whose pos is the LAST decoded position. So for
+                            // any memory with a recurrent component pos_min is a TAIL, not an oldest-available
+                            // position, and backing it off by n_swa makes the gate below fire even for a strict
+                            // extension that needs no rewind at all. Only apply the back-off when pos_min is a real
+                            // window start (PART, i.e. pure-SWA attention).
+                            const bool pos_min_is_tail = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+                            const auto pos_min_thold = std::max(0, pos_next - (pos_min_is_tail ? 0 : n_swa) - (has_new_tokens ? 0 : 1));
 
                             // ===== restore-continue (regenerate fast-path) ==============================
                             // A just-restored FULL/recurrent slot receiving the EXACT restored tokens (no
