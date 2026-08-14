@@ -6238,8 +6238,20 @@ struct ggml_backend_sycl_comm_context {
     // ONE persistent per-device byte buffer, 4*nelem bytes.  Both the
     // FP32 small-tensor path and the BF16 large-tensor path share it
     // by reinterpreting.
-    std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf0;
-    std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf1;
+    //
+    // These are DEDICATED device allocations rather than ggml_sycl_pool_alloc
+    // buffers.  The BF16 path cross-device-copies FROM the peer's buffer
+    // (src = outbox1).  When that memory comes from the VMM pool
+    // (ggml_sycl_pool_vmm, selected whenever the device advertises
+    // sycl::aspect::ext_oneapi_virtual_mem) and the allocation exceeds two
+    // physical pages, the peer copy never completes: it is enqueued but its
+    // event never signals, hanging the decode thread in dev2dev_memcpy.
+    // The buffer is 4*nelem bytes with nelem = n_embd*n_tokens, and the cutoff
+    // is exactly 4 MiB -- twice the 2 MiB granularity clamped above -- so it
+    // trips as soon as a third page is needed.  The FP32 small path is
+    // unaffected only because it peer-reads tensor data, never pool memory.
+    uint8_t * buf0 = nullptr;
+    uint8_t * buf1 = nullptr;
     int64_t buf_nelem = 0;
 };
 
@@ -6258,10 +6270,7 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
 
     auto * ctx = new ggml_backend_sycl_comm_context;
     ctx->backends.assign(backends, backends + n_backends);
-    auto * sctx0 = (ggml_backend_sycl_context *) backends[0]->context;
-    auto * sctx1 = (ggml_backend_sycl_context *) backends[1]->context;
-    ctx->buf0 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx0->pool());
-    ctx->buf1 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx1->pool());
+    // Buffers are allocated lazily in comm_allreduce_tensor, once nelem is known.
     return ctx;
 }
 catch (const sycl::exception &) { return nullptr; }
@@ -6281,6 +6290,14 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
         try {
             sctx0->stream()->wait();
             sctx1->stream()->wait();
+            if (comm_ctx->buf0 != nullptr) {
+                ggml_sycl_free_device(comm_ctx->buf0, *sctx0->stream());
+                comm_ctx->buf0 = nullptr;
+            }
+            if (comm_ctx->buf1 != nullptr) {
+                ggml_sycl_free_device(comm_ctx->buf1, *sctx1->stream());
+                comm_ctx->buf1 = nullptr;
+            }
         } catch (...) { /* best effort during shutdown */ }
     }
 
@@ -6328,12 +6345,26 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 
     // Grow per-device byte buffers if needed (4 * nelem bytes each).
     if (comm_ctx->buf_nelem < nelem) {
-        comm_ctx->buf0->realloc(nelem * 4);
-        comm_ctx->buf1->realloc(nelem * 4);
+        if (comm_ctx->buf0 != nullptr) {
+            q0->wait();
+            ggml_sycl_free_device(comm_ctx->buf0, *q0);
+            comm_ctx->buf0 = nullptr;
+        }
+        if (comm_ctx->buf1 != nullptr) {
+            q1->wait();
+            ggml_sycl_free_device(comm_ctx->buf1, *q1);
+            comm_ctx->buf1 = nullptr;
+        }
+        comm_ctx->buf0 = (uint8_t *) ggml_sycl_malloc_device((size_t) nelem * 4, *q0);
+        comm_ctx->buf1 = (uint8_t *) ggml_sycl_malloc_device((size_t) nelem * 4, *q1);
+        if (comm_ctx->buf0 == nullptr || comm_ctx->buf1 == nullptr) {
+            comm_ctx->buf_nelem = 0;
+            return false;
+        }
         comm_ctx->buf_nelem = nelem;
     }
-    uint8_t * buf0 = comm_ctx->buf0->get();
-    uint8_t * buf1 = comm_ctx->buf1->get();
+    uint8_t * buf0 = comm_ctx->buf0;
+    uint8_t * buf1 = comm_ctx->buf1;
 
     // F16 native path: direct 2-byte cross-device copy + add, skipping the
     // F32 round-trip the meta-backend fallback would force. Cross-device copies
