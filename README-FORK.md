@@ -318,3 +318,34 @@ whole prompt.
 - [`docs/kv-cache/02-auto-disk-cache.md`](docs/kv-cache/02-auto-disk-cache.md) — the automatic disk cache (indexing, fingerprinting, cross-process)
 - [`docs/kv-cache/03-multimodal-cache.md`](docs/kv-cache/03-multimodal-cache.md) — multimodal snapshots (media identity records, the v2 `.meta` format, verification order, manual `/slots` rehydration)
 - the "Automatic disk prompt cache" section of [`tools/server/README.md`](tools/server/README.md) — user-facing invariants, restore semantics and operational notes
+
+---
+
+## Carried upstream-bug workaround: SYCL tensor-parallel VMM hang
+
+**REMOVE THIS PATCH once upstream fixes it.** Commit: `sycl: fix hang in --split-mode
+tensor all-reduce with VMM pool`.
+
+Unlike the rest of this fork, that commit is **not a feature of ours**. It is a workaround
+for an upstream defect in `ggml_backend_sycl_comm_allreduce_tensor` (introduced by upstream
+PR #24152). The BF16 large path peer-copies from a `ggml_sycl_pool_alloc` buffer on the
+other device; when that comes from the VMM pool and exceeds 4 MiB (two 2 MiB pages), the
+peer copy is enqueued and its event never signals, hanging the decode thread.
+
+Measured on 2x Arc Pro B70: `-ub 200` (3.91 MiB) works, `-ub 208` (4.06 MiB) hangs, and
+everything larger hangs, on the first request. Reproduces on Qwen3.6-27B and Qwen3.8-27B.
+The fix allocates those two scratch buffers with `ggml_sycl_malloc_device` instead of from
+the pool.
+
+Tracking:
+- Upstream issue: ggml-org/llama.cpp#26409 (ours), and #25711 (independent report, same
+  hardware).
+- Candidate patch offered upstream from branch `sycl-tp-fix-vmm-peer-deadlock`.
+
+**When upstream lands a fix, drop our commit rather than merging both.** Check on each
+rebase: if `ggml_backend_sycl_comm_allreduce_tensor` no longer takes its scratch buffers
+from `ggml_sycl_pool_alloc`, upstream has fixed it and this patch is redundant.
+
+**Note this is dormant in our deployment** - no registry entry uses `--split-mode tensor`
+(layer split wins on B70 anyway), so it only matters if we start exploring tensor-parallel
+setups.
