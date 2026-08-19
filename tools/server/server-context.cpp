@@ -1736,6 +1736,28 @@ private:
         return params_base.slot_save_auto && !params_base.slot_save_path.empty();
     }
 
+    // Can a loaded snapshot of length L only ever be reused as a WHOLE prefix, never trimmed back
+    // to a shorter verified prefix v < L? Reuse lengths are block-aligned, so any v < L is at least
+    // one whole block short, and that is outside what these classes can do:
+    //   FULL - llama_memory_seq_rm refuses ANY partial range, so the legal resume points are
+    //          {0, L} and nothing in between.
+    //   RS   - partial seq_rm is legal only within llama_n_rs_seq(ctx) positions of the tail
+    //          (llama-memory-recurrent.cpp: the rollback must be in [1, n_rs_seq], typically 2-5;
+    //          outside it seq_rm returns false and common_context_seq_rm turns that into a
+    //          GGML_ABORT). A block-aligned v can never land inside that window, so we do not try
+    //          to exploit it.
+    //   SWA  - llama_kv_cache::state_write DROPS every SWA-masked cell at save time, so a snapshot
+    //          of length L persists only the window [L - n_swa_mem, L): a shorter prefix has no
+    //          cells behind it and re-decoding from there would attend over a hole.
+    // The one remaining class is PART with n_swa_mem == 0 (plain attention), which rewinds per
+    // token. Uses n_swa_mem, never n_swa: --swa-full zeroes n_swa for the batch planner but the
+    // engine keeps masking on save.
+    bool restore_is_whole_prefix_only() const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+               n_swa_mem > 0;
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -2039,10 +2061,13 @@ private:
     }
 
     // Longest-prefix lookup over the request's cell-aligned tokens. Returns candidate snapshots to
-    // try, BEST FIRST (deepest boundary first; within a boundary, longest first). For a
-    // FULL/recurrent/hybrid/SWA model, snapshots longer than the request are filtered out here — the
-    // whole snapshot must be a prefix of the request, so a longer one can never restore; PART models
-    // can rewind so all lengths are kept. The caller tries each in order until one restores (each
+    // try, BEST FIRST (deepest boundary first; within a boundary, longest first). For every class
+    // restore_is_whole_prefix_only() covers (FULL, RS and SWA), snapshots longer than the request are
+    // filtered out here: the whole snapshot must be a prefix of the request, so a longer one can never
+    // restore. Plain-attention PART can rewind, so all lengths are kept. That predicate is the single
+    // definition of the class set, named here so the prose and the filter cannot drift apart again
+    // (RS was missing from the filter while this comment already said "recurrent").
+    // The caller tries each in order until one restores (each
     // rejected candidate costs only a small .meta read + byte-compare; the multi-GB state loads only
     // once a candidate passes its gates) — this fall-through is what stops a longer superset from
     // shadowing a shorter usable one at the same boundary. Verification (byte-compare of the
@@ -2074,7 +2099,6 @@ private:
             SRV_WRN("auto-restore: lookup refused, %s\n", e.what());
             return out;
         }
-        const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
         const auto bhs = auto_block_hashes(req.get_cell_tokens(), media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -2096,13 +2120,15 @@ private:
                     if (!(c.fp == cur_fp)) {
                         continue; // invariant 3
                     }
-                    if ((full || n_swa_mem > 0) && c.n_tokens > req.size()) {
-                        // A FULL/recurrent snapshot longer than the request is never a whole prefix.
-                        // Same for SWA: its persisted window is anchored at its own end, so a longer
-                        // snapshot can only ever be refused by the restore gate — and because the store
-                        // is dominated by release-time (prompt+generated) snapshots, such siblings are
-                        // the COMMON case. Left unfiltered they exhaust AUTO_MAX_RESTORE_ATTEMPTS and
-                        // starve the shorter, usable mid-prefill base (which sorts last).
+                    if (restore_is_whole_prefix_only() && c.n_tokens > req.size()) {
+                        // A snapshot longer than the request is never a whole prefix of it, and every
+                        // class in restore_is_whole_prefix_only() (FULL, RS and SWA alike) can restore
+                        // only a whole prefix. For SWA specifically, its persisted window is anchored at
+                        // its own end, so a longer snapshot can only ever be refused by the restore gate,
+                        // and because the store is dominated by release-time (prompt+generated)
+                        // snapshots, such siblings are the COMMON case. Left unfiltered they exhaust
+                        // AUTO_MAX_RESTORE_ATTEMPTS and starve the shorter, usable mid-prefill base
+                        // (which sorts last).
                         continue;
                     }
                     if (!seen.insert(c.state_path).second) {
@@ -2227,9 +2253,20 @@ private:
         slot.prompt.tokens.insert(tokens);
         slot.just_restored = true;
 
-        // Reconstruct a context checkpoint at the restored position so hybrid/recurrent (and SWA)
-        // models — which cannot partially rewind — can reuse this state for the suffix; other
-        // models do not need it.
+        // FULL only. Reconstruct a context checkpoint at the restored position so a FULL model, which
+        // cannot partially rewind, can reuse this state for the suffix.
+        // RS is deliberately NOT included, and this is not an oversight, do not add it "for symmetry".
+        // With the whole-prefix rule in auto_restore_into_slot, an RS restore leaves n_past == pos_next
+        // == L while a recurrent pos_min is the TAIL (L-1), so: when the request EXTENDS,
+        // pos_min_thold == L and the consumer gate `pos_min >= pos_min_thold` is false, the checkpoint
+        // list is never iterated; on an exact resend, pos_min_thold == L-1 and the acceptance test
+        // `cur.pos_min < pos_min_thold` is L-1 < L-1, false. The checkpoint would be unreachable in one
+        // case and rejected in the other, while create_checkpoint pays a whole-sequence PARTIAL_ONLY
+        // state copy per restore. Adding it only becomes live if someone relaxes the consumer to accept
+        // cur.pos_min == pos_min_thold for tail memories, and that is exactly the GGML_ABORT the NOTE at
+        // the acceptance predicate documents. The same reasoning forbids extending the SWA synth in
+        // auto_restore_into_slot to RS.
+        // SWA gets its own synth there (it is a real window start, not a tail).
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
             const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
@@ -2544,45 +2581,29 @@ private:
         // Only WHOLE-block prefixes are valid reuse lengths (hash boundaries).
         const int B = params_base.slot_save_block;
         int n_keep_disk;
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-            // a FULL/recurrent/hybrid/SWA state cannot be PARTIALLY rewound —
-            // do_slot_restore loads the ENTIRE L-token snapshot, and a later keep_first(n_past<L)
-            // would issue a PARTIAL common_context_seq_rm that GGML_ABORTs the server (a FULL model's
-            // llama_memory_seq_rm refuses a partial range). So we ONLY auto-restore a FULL snapshot
-            // when the request diverges at or beyond the snapshot end (v == disk_toks.size(), i.e.
-            // the whole snapshot is a verified prefix of the request). If the request diverges INSIDE
-            // the snapshot, refuse and fall back to normal prefill — never restore a FULL snapshot we
-            // would have to partially unwind. (No block-boundary clamp for FULL: only the exact whole
-            // snapshot is a legal restore length here.)
-            if (v != disk_toks.size()) {
-                SLT_DBG(slot, "auto-restore: FULL snapshot is not a whole prefix of the request "
-                              "(verified %zu of %zu snapshot tokens; request %zu) — skipping %s\n",
-                        v, disk_toks.size(), req.size(), cand.state_path.c_str());
-                return 0;
-            }
-            n_keep_disk = (int) disk_toks.size();
-        } else if (n_swa_mem > 0) {
-            // SWA (PART + n_swa > 0): llama_kv_cache::state_write DROPS every SWA-masked cell
-            // (is_masked_swa against cells.seq_pos_max(seq_id) at SAVE time), so a snapshot of
-            // length L persists an SWA window anchored at ITS OWN end - only positions
-            // [L - n_swa, L). Restoring it and trimming back to a shorter verified prefix v < L can
-            // NEVER recreate positions [v - n_swa, L - n_swa): those bytes were never written, and
-            // re-decoding from there would attend over a hole. The ONLY sound reuse length on an SWA
-            // model is therefore the WHOLE snapshot (v == disk_toks.size(), i.e. the request
-            // strictly EXTENDS it) - the same rule the FULL branch above enforces. Refuse here,
-            // BEFORE the multi-GB read, so the candidate loop falls through to a SHORTER snapshot
+        if (restore_is_whole_prefix_only()) {
+            // FULL, RS and SWA can only ever resume a snapshot as a WHOLE prefix (see
+            // restore_is_whole_prefix_only): do_slot_restore loads the ENTIRE L-token snapshot, and a
+            // later keep_first(n_past < L) would issue a partial common_context_seq_rm that either
+            // GGML_ABORTs (FULL refuses any partial range; RS refuses a rollback beyond n_rs_seq) or
+            // attends over cells that were never persisted (SWA keeps only [L - n_swa_mem, L)).
+            // So auto-restore this snapshot ONLY when the request diverges at or beyond its end
+            // (v == disk_toks.size(), i.e. the request strictly extends it, or matches it exactly).
+            // No block-boundary clamp here: the whole snapshot is the only legal restore length.
+            // Refuse BEFORE the multi-GB read so the candidate loop falls through to a SHORTER snapshot
             // that IS a whole prefix of this request (e.g. the mid-prefill context base).
             if (v != disk_toks.size()) {
-                SLT_DBG(slot, "auto-restore: SWA snapshot is not a whole prefix of the request "
-                              "(verified %zu of %zu snapshot tokens; request %zu, n_swa = %d) - skipping %s\n",
-                        v, disk_toks.size(), req.size(), n_swa_mem, cand.state_path.c_str());
+                SLT_DBG(slot, "auto-restore: snapshot is not a whole prefix of the request "
+                              "(verified %zu of %zu snapshot tokens; request %zu, seq_rm_type = %d, n_swa = %d) - skipping %s\n",
+                        v, disk_toks.size(), req.size(), (int) ctx_tgt_seq_rm_type, n_swa_mem, cand.state_path.c_str());
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
         } else {
-            // Attention (PART) models support per-token partial seq_rm, so a mid-snapshot divergence
-            // is fine: claim the verified prefix clamped down to the last whole block boundary <= v.
-            // An exact full-snapshot match keeps the whole snapshot length.
+            // Reached only for PART with n_swa_mem == 0 (plain attention), which supports per-token
+            // partial seq_rm, so a mid-snapshot divergence is fine: claim the verified prefix clamped
+            // down to the last whole block boundary <= v. That is now exactly what the branch above
+            // lets through. An exact full-snapshot match keeps the whole snapshot length.
             if (v == disk_toks.size()) {
                 n_keep_disk = (int) disk_toks.size();
             } else {
@@ -2672,6 +2693,9 @@ private:
         // restores whole-snapshot extend-matches). Non-SWA attention models skip the checkpoint
         // machinery entirely and need none of this.
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa_mem > 0) {
+            // (this trim is dead since the whole-prefix gate above forces v == disk_toks.size();
+            // kept as a belt-and-braces guard. It was already dead before the gate was merged, the
+            // old SWA branch forced the same equality.)
             if (v < disk_toks.size()) {
                 if (disk_media.empty()) {
                     slot.prompt.tokens.keep_first(v); // media prompts were already rebuilt to exactly v cells
@@ -2694,11 +2718,11 @@ private:
             slot.prompt.checkpoints.clear();
             create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
         }
-        // do_slot_restore loaded the snapshot. For FULL models n_keep_disk == snapshot length (gated
-        // above), so the existing regenerate / suffix-reuse path takes over with no partial
-        // rewind. For attention models the request may diverge inside the snapshot; keep_first(n_past)
-        // + a PARTIAL seq_rm then reprefills the divergent tail (supported for PART). The verified
-        // prefix is what we claim as reused.
+        // do_slot_restore loaded the snapshot. For every restore_is_whole_prefix_only() class (FULL, RS
+        // and SWA) n_keep_disk == snapshot length (gated above), so the existing regenerate /
+        // suffix-reuse path takes over with no partial rewind. For plain-attention PART the request may
+        // diverge inside the snapshot; keep_first(n_past) + a PARTIAL seq_rm then reprefills the
+        // divergent tail (supported for PART). The verified prefix is what we claim as reused.
         // Bump every node on the chain's mtime so the LRU treats a reused-but-not-rewritten base (and
         // each shared delta) as recently-used (true LRU, not least-recently-written) — critical for
         // the fan-out case where many requests restore one hot base prefix, and so eviction keeps the
@@ -3120,13 +3144,13 @@ private:
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto it = auto_idx.by_boundary.find(full_hash);
             if (it != auto_idx.by_boundary.end()) {
-                const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
                 for (const auto_cache_entry & c : it->second) {
-                    // FULL: only an EXACT-length snapshot substitutes (a longer one is unusable, a
-                    // shorter one is a different resume point) — otherwise this incremental save would
-                    // be suppressed by a longer snapshot the model can never restore. PART: an
-                    // equal-or-longer snapshot already covers this prefix (it can rewind to it).
-                    if ((full || n_swa_mem > 0) ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
+                    // Whole-prefix classes (FULL, RS, SWA): only an EXACT-length snapshot substitutes,
+                    // a longer one can never be rewound to this prefix and a shorter one is a different
+                    // resume point, otherwise this save would be suppressed by a snapshot the model can
+                    // never restore. PART with n_swa_mem == 0: an equal-or-longer snapshot already
+                    // covers this prefix because it can rewind to it.
+                    if (restore_is_whole_prefix_only() ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
                         return; // a usable snapshot for this exact prefix already exists
                     }
                 }
