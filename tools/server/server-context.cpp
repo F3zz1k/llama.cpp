@@ -1753,22 +1753,36 @@ private:
     //   RS   - partial seq_rm is legal only within llama_n_rs_seq(ctx) positions of the tail
     //          (llama-memory-recurrent.cpp: the rollback must be in [1, n_rs_seq], typically 2-5;
     //          outside it seq_rm returns false and common_context_seq_rm turns that into a
-    //          GGML_ABORT). We do not attempt to exploit that window: nothing bounds
-    //          --slot-save-block below n_rs_seq (common/arg.cpp only rejects <= 0), so a
-    //          block-aligned v landing inside it cannot be ruled out by construction, and a
-    //          bounded-window rewind would have to be re-derived per request. RS is therefore
-    //          treated as whole-prefix-only unconditionally.
+    //          GGML_ABORT). That window is NOT merely un-exploited here, it is UNSOUND after a
+    //          restore, and this is a correctness requirement rather than conservatism: state_write
+    //          serializes only ONE row per cell (llama-memory-recurrent.cpp, cell_id = rs_idx_cur *
+    //          size + src) and state_read unconditionally resets rs_idx to 0, so the (1 + n_rs_seq)
+    //          rollback history rows a restored sequence would rewind INTO were never written.
+    //          seq_rm's rollback branch only range-checks `1 <= rollback <= n_rs_seq`; it does not
+    //          check the row exists, so such a rewind returns TRUE and reads an unwritten row —
+    //          silent garbage, not a GGML_ABORT that would announce itself. Do NOT "optimise" this
+    //          by bounding --slot-save-block below n_rs_seq: the block size is not what makes it
+    //          unsafe. RS is whole-prefix-only unconditionally.
     //   SWA  - llama_kv_cache::state_write DROPS every SWA-masked cell at save time, so a snapshot
     //          of length L persists only the window [L - n_swa_mem, L): a shorter prefix has no
     //          cells behind it and re-decoding from there would attend over a hole.
-    // The classes this returns false for are PART with n_swa_mem == 0 (plain attention), which
-    // rewinds per token, and NO with n_swa_mem == 0 (see the else-branch in auto_restore_into_slot:
-    // NO means the capability probe itself failed, not that per-token rewind is known to work, but a
-    // context in that state cannot serve a request at all). Uses n_swa_mem, never n_swa: --swa-full
+    //   NO   - the capability probe itself failed, so per-token rewind is NOT known to work. This is
+    //          a LIVE serving state, not a dead one: common_context_can_seq_rm returns NO both for a
+    //          context with no memory module and for one whose 2-token probe decode merely failed
+    //          (common/common.cpp), and the server only logs "speculative decoding not supported by
+    //          this context" and carries on loading. Before this was listed, a transient probe
+    //          failure on a per-token-rewindable model left NO with n_swa_mem == 0 falling into the
+    //          partial-rewind else-branch below, taking block-aligned mid-snapshot reuse, and then
+    //          GGML_ABORTing the server on the partial seq_rm. Fail CLOSED instead: refusing a
+    //          partial restore for a context we could not probe costs at most one cold prefill,
+    //          whereas guessing wrong aborts the process.
+    // The only class this returns false for is PART with n_swa_mem == 0 (plain attention), which
+    // rewinds per token. Uses n_swa_mem, never n_swa: --swa-full
     // zeroes n_swa for the batch planner but the engine keeps masking on save.
     bool restore_is_whole_prefix_only() const {
         return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO   ||
                n_swa_mem > 0;
     }
 
@@ -2646,11 +2660,10 @@ private:
             }
             n_keep_disk = (int) disk_toks.size();
         } else {
-            // Reached for every class restore_is_whole_prefix_only() rejects: PART with n_swa_mem == 0
-            // (plain attention), which supports per-token partial seq_rm, and NO with n_swa_mem == 0.
-            // NO is not special-cased because common_context_can_seq_rm returns it either for a context
-            // with no memory module (the restore faults on llama_get_memory long before this) or for
-            // one whose 2-token probe decode failed, which cannot serve a request at all.
+            // Reached for the ONE class restore_is_whole_prefix_only() rejects: PART with
+            // n_swa_mem == 0 (plain attention), which supports per-token partial seq_rm. NO used to
+            // land here too, which was a latent GGML_ABORT on a context whose capability probe had
+            // merely failed; it is now folded into the helper and fails closed. See the helper.
             // A mid-snapshot divergence is fine here: claim the verified prefix clamped down to the
             // last whole block boundary <= v. Every class that CANNOT do that is now diverted by the
             // branch above, which admits only v == disk_toks.size() and never clamps. An exact
@@ -6198,18 +6211,29 @@ private:
                                 // slot holds, and the difference is the whole reason the gate misfires
                                 // here: find_slot only marks an SWA-masked cell REUSABLE, it does not
                                 // erase it, and the SWA sub-cache is sized PAD(min(size_base, n_swa *
-                                // n_seq_max + n_ubatch), 256) > n_swa, so a live slot still physically
-                                // holds older positions and reports a pos_min strictly BELOW
-                                // pos_min_thold, which keeps the gate shut for it. A restored slot
-                                // reports pos_min == n_past - n_swa == pos_min_thold, so the gate opens.
+                                // (unified ? n_seq_max : 1) + n_ubatch), 256) — normally > n_swa, though
+                                // NOT when size_base < n_swa (a tiny --ctx-size), where the min clamps it.
+                                // In the normal case a live slot still physically holds older positions
+                                // and reports a pos_min strictly BELOW pos_min_thold, which keeps the gate
+                                // shut for it. A restored slot reports pos_min == n_past - n_swa ==
+                                // pos_min_thold, so the gate opens.
                                 // The search can only do harm here: the ONLY checkpoint such a slot has is the one
                                 // synthesised from the LIVE window after the restore (do_slot_restore
                                 // clears the list for every class, then auto_restore_into_slot and the
-                                // manual SWA branch each create exactly one), whose pos_min IS the window
+                                // manual SWA branch each create one — or NONE under --ctx-checkpoints 0,
+                                // where create_checkpoint now returns early), whose pos_min IS the window
                                 // start L - n_swa, the same expression as pos_min_thold when
-                                // has_new_tokens, so `cur.pos_min < pos_min_thold` is false BY
-                                // CONSTRUCTION, do_reset fires and every SWA disk restore is loaded and
-                                // then thrown away.
+                                // has_new_tokens. The acceptance test is
+                                // `cur.pos_min == 0 || cur.pos_min < pos_min_thold`, and the second
+                                // disjunct is then false, so do_reset fires and the SWA disk restore is
+                                // loaded and thrown away. NOT universal, and the first disjunct is why:
+                                // when L <= n_swa_mem nothing was masked at save time, pos_min == 0, and
+                                // the checkpoint IS accepted (losing one position rather than everything).
+                                // That regime is narrow — the save floor is
+                                // max(slot_save_block, slot_save_min_tokens), so on gemma-26b-a4b
+                                // (n_swa 1024, floor 1024) it needs L == 1024 exactly — and it widens only
+                                // for n_swa > 1024 or a lowered --slot-save-min-tokens. The measured
+                                // production case (13,611 tokens, n_swa 1024) is the regime above.
                                 // The four terms, exactly: (1) the slot carries a restore no earlier task
                                 // consumed, i.e. an auto-restore performed for THIS task or a manual
                                 // /slots restore with no task since (server_slot::reset() clears the flag,
@@ -6360,6 +6384,7 @@ private:
                             // Only when this request got essentially no reuse (n_past < floor), so a warm
                             // or restored slot arms nothing and pays nothing (the arm below additionally
                             // requires n_past < B_ctx).
+                            // ==== THE F4 NOTE (referred to from the fp_kv_full and whole-save sites) ====
                             // `n_swa_mem > 0` here is a COST gate, NOT a soundness gate. Do not read the
                             // sentence it replaced ("untouched by construction") as an argument that
                             // FULL/RS are unsound here: they are not, the whole-save is sound for dense,

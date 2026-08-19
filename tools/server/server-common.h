@@ -359,7 +359,11 @@ struct model_fp {
     uint32_t fp_cache_k    = 0; // ggml_type of K cache (enum int)
     uint32_t fp_cache_v    = 0; // ggml_type of V cache (enum int)
     uint32_t fp_n_ctx      = 0; // effective per-seq n_ctx
-    uint32_t fp_kv_full    = 0; // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0
+    // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0. Separates FULL from everything else; it does
+    // NOT encode the 4-valued class, so RS and PART share the 0 side. That is sound rather than a
+    // latent collision: an arch in llm_arch_supports_rs_rollback has recurrent memory, so without
+    // MTP it probes as FULL, not PART, and FULL and RS are exactly what this bit does separate.
+    uint32_t fp_kv_full    = 0;
     uint32_t fp_block      = 0; // slot_save_block this snapshot was hashed with
     uint64_t fp_rope_scale = 0; // bit-pattern of effective rope_freq_scale (position-critical)
     // rope_freq_base and ALL YaRN params also bake positions into the saved KV state exactly as
