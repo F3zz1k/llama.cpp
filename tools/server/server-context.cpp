@@ -1033,7 +1033,8 @@ struct server_slot {
 
     // --- KV restore-reuse (logits sidecar) ---
     // Full-vocab logits of this slot's most recently sampled token, captured at sample time
-    // (only populated for FULL/recurrent models when --slot-save-path is set). Serialized to the
+    // (only populated for FULL models when --slot-save-path is set; RS/recurrent contexts are
+    // excluded by that predicate, see the F4 note at the ARM fallback). Serialized to the
     // <state>.logits sidecar on SLOT_SAVE so a later exact-prompt "regenerate" can emit the first
     // token WITHOUT re-decoding into the (un-rewindable) restored recurrent state.
     std::vector<float> logits_last;     // size n_vocab when valid, else empty
@@ -1752,14 +1753,19 @@ private:
     //   RS   - partial seq_rm is legal only within llama_n_rs_seq(ctx) positions of the tail
     //          (llama-memory-recurrent.cpp: the rollback must be in [1, n_rs_seq], typically 2-5;
     //          outside it seq_rm returns false and common_context_seq_rm turns that into a
-    //          GGML_ABORT). A block-aligned v can never land inside that window, so we do not try
-    //          to exploit it.
+    //          GGML_ABORT). We do not attempt to exploit that window: nothing bounds
+    //          --slot-save-block below n_rs_seq (common/arg.cpp only rejects <= 0), so a
+    //          block-aligned v landing inside it cannot be ruled out by construction, and a
+    //          bounded-window rewind would have to be re-derived per request. RS is therefore
+    //          treated as whole-prefix-only unconditionally.
     //   SWA  - llama_kv_cache::state_write DROPS every SWA-masked cell at save time, so a snapshot
     //          of length L persists only the window [L - n_swa_mem, L): a shorter prefix has no
     //          cells behind it and re-decoding from there would attend over a hole.
-    // The one remaining class is PART with n_swa_mem == 0 (plain attention), which rewinds per
-    // token. Uses n_swa_mem, never n_swa: --swa-full zeroes n_swa for the batch planner but the
-    // engine keeps masking on save.
+    // The classes this returns false for are PART with n_swa_mem == 0 (plain attention), which
+    // rewinds per token, and NO with n_swa_mem == 0 (see the else-branch in auto_restore_into_slot:
+    // NO means the capability probe itself failed, not that per-token rewind is known to work, but a
+    // context in that state cannot serve a request at all). Uses n_swa_mem, never n_swa: --swa-full
+    // zeroes n_swa for the batch planner but the engine keeps masking on save.
     bool restore_is_whole_prefix_only() const {
         return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
@@ -2278,8 +2284,8 @@ private:
 
         // Drop the previous task's checkpoints UNCONDITIONALLY, for every class, before any synth
         // below. They snapshot a DIFFERENT prompt's ctx_tgt state and the sequence they described no
-        // longer exists. The auto path already clears the list before calling in, but the manual
-        // /slots restore does not, and it clears only inside its own SWA branch, so without this an RS
+        // longer exists. The auto path already clears the list before calling in; the manual /slots
+        // restore clears it only inside its own SWA branch, so without this an RS
         // (or plain-attention) manual restore carried the previous task's checkpoints forward: the next
         // request diverging at d < L gets pos_min_thold == d against a recurrent tail pos_min of L-1,
         // opens the consumer gate, and a surviving checkpoint with cur.pos_min == 0 is accepted and
@@ -2635,10 +2641,15 @@ private:
             }
             n_keep_disk = (int) disk_toks.size();
         } else {
-            // Reached only for PART with n_swa_mem == 0 (plain attention), which supports per-token
-            // partial seq_rm, so a mid-snapshot divergence is fine: claim the verified prefix clamped
-            // down to the last whole block boundary <= v. That is now exactly what the branch above
-            // lets through. An exact full-snapshot match keeps the whole snapshot length.
+            // Reached for every class restore_is_whole_prefix_only() rejects: PART with n_swa_mem == 0
+            // (plain attention), which supports per-token partial seq_rm, and NO with n_swa_mem == 0.
+            // NO is not special-cased because common_context_can_seq_rm returns it either for a context
+            // with no memory module (the restore faults on llama_get_memory long before this) or for
+            // one whose 2-token probe decode failed, which cannot serve a request at all.
+            // A mid-snapshot divergence is fine here: claim the verified prefix clamped down to the
+            // last whole block boundary <= v. Every class that CANNOT do that is now diverted by the
+            // branch above, which admits only v == disk_toks.size() and never clamps. An exact
+            // full-snapshot match keeps the whole snapshot length.
             if (v == disk_toks.size()) {
                 n_keep_disk = (int) disk_toks.size();
             } else {
@@ -3185,6 +3196,22 @@ private:
                     // resume point, otherwise this save would be suppressed by a snapshot the model can
                     // never restore. PART with n_swa_mem == 0: an equal-or-longer snapshot already
                     // covers this prefix because it can rewind to it.
+                    // COST, on the record: moving RS from the >= arm to the == arm makes it WRITE the
+                    // saves a longer sibling used to suppress. A snapshot is indexed at every boundary
+                    // it reaches, so the sibling is any already-saved prompt that agrees with this one
+                    // up to its deepest whole block and runs past it - in practice a branch, a
+                    // regenerate, or a second conversation whose first turns are shorter than an
+                    // existing release snapshot sharing the same preamble. Each such save is a delta
+                    // when --slot-save-incremental finds a strict-prefix parent (normally the
+                    // mid-prefill [0, B_ctx) base) and a whole multi-GB write when it does not.
+                    // slot_save_enforce_limits enumerates the whole --slot-save-path directory and
+                    // evicts by mtime with no fingerprint scoping, so in a SHARED store these writes
+                    // do compete with other models' units. The trade is taken deliberately: the
+                    // suppressed save is the ONLY snapshot an RS model could ever restore at this
+                    // prefix, so suppressing it buys the capacity by guaranteeing zero reuse, which is
+                    // the production miss this branch exists to fix. Give a shared store enough
+                    // --slot-save-max-mb headroom for both identities, or point each model at its own
+                    // directory.
                     if (restore_is_whole_prefix_only() ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
                         return; // a usable snapshot for this exact prefix already exists
                     }
@@ -6305,7 +6332,8 @@ private:
                             // SWA FALLBACK: on an SWA model a release-time snapshot (prompt + generated
                             // tail) is restorable ONLY by a request that STRICTLY EXTENDS it - its state
                             // file carries just the window [L - n_swa, L), so it can never be rewound to
-                            // a shorter prefix (see the SWA gate in auto_restore_into_slot). A repeat /
+                            // a shorter prefix (see restore_is_whole_prefix_only() and the whole-prefix
+                            // gate it drives in auto_restore_into_slot). A repeat /
                             // regenerate of the SAME prompt therefore gets ZERO reuse unless the store
                             // also holds a whole-state root STRICTLY INSIDE the prompt.
                             // CORRECTION (2026-08-19): this comment used to add "and, on a reasoning
@@ -6812,9 +6840,10 @@ private:
             }
 
             // Feature A: capture this slot's last-token full-vocab logits for a possible disk
-            // save. Cost: one ~n_vocab*4-byte copy per decoded token, incurred ONLY on
-            // FULL/recurrent models AND only when slot saving is enabled (--slot-save-path set);
-            // attention models and servers without slot-save pay nothing at all. The copy is
+            // save. Cost: one ~n_vocab*4-byte copy per decoded token, incurred ONLY on FULL models
+            // AND only when slot saving is enabled (--slot-save-path set); RS/recurrent contexts are
+            // excluded by the predicate below (see the F4 note at the ARM fallback), and attention
+            // models and servers without slot-save pay nothing at all. The copy is
             // unavoidable for correctness: ctx logits are overwritten by the next slot's decode,
             // so a lazy read at SLOT_SAVE would be wrong under --parallel>1. Captured per-slot
             // from this slot's own tok_idx so it is correct for any N/interleave (never read
