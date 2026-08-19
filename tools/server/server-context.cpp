@@ -4813,6 +4813,15 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // Checkpoints disabled: nothing to create. Gated HERE rather than at the call sites because
+        // the prefill caller checks it (do_checkpoint) but the three restore-time synth sites do not,
+        // and with n_ctx_checkpoints == 0 the make-room loop below is `size() >= 0`, always true, so it
+        // would take front() of an empty list. --ctx-checkpoints 0 is accepted unvalidated by
+        // common/arg.cpp, so a disk restore under it reached that.
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
+
         // slot.task is null when create_checkpoint is called from do_slot_restore (a restore has
         // no active task); use -1 so the restored checkpoint is simply not tied to a current task.
         const int id_task = slot.task ? slot.task->id : -1;
