@@ -6194,8 +6194,30 @@ private:
                             // whole-save is sound for SWA precisely because the resident sequence IS the
                             // true whole state at B_ctx, so its persisted window is anchored at B_ctx.
                             // Only when this request got essentially no reuse (n_past < floor), so a warm
-                            // continuation never pays a redundant whole-state write. n_swa == 0 (the
-                            // FULL/hybrid production path) is untouched by construction.
+                            // or restored slot arms nothing and pays nothing (the arm below additionally
+                            // requires n_past < B_ctx).
+                            // `n_swa_mem > 0` here is a COST gate, NOT a soundness gate. Do not read the
+                            // sentence it replaced ("untouched by construction") as an argument that
+                            // FULL/RS are unsound here: they are not, the whole-save is sound for dense,
+                            // SWA and recurrent/hybrid alike, for the same reason the outer arm above
+                            // states, because the resident sequence IS the true whole state at B_ctx.
+                            // What FULL and RS would pay is one extra whole-state write per COLD prefill
+                            // that got no reuse (multi-GB at f16 KV on a deep prompt) against an
+                            // LRU-bounded store, which is a measured perf/capacity decision, not a
+                            // correctness one.
+                            // The excuse that used to be offered for excluding FULL, "the regenerate
+                            // fast-path covers it", does NOT hold: that path (see the restore-continue
+                            // gate) requires n_past == task->n_tokens() AND n_past == prompt.n_tokens(),
+                            // i.e. a snapshot of EXACTLY the request's length, so it serves an exact
+                            // resend of prompt+generation, never a regenerate of the prompt alone. No
+                            // auto-save site routinely produces such a snapshot (release/idle/shutdown
+                            // save prompt+generated; the mid-prefill base is a strict prefix). Under RS
+                            // neither mechanism exists at all: that gate is FULL-only and the logits
+                            // sidecar is not even written under RS. After the whole-prefix restore rule,
+                            // the RS miss degrades to a correct cold reprefill, so this is a reuse-rate
+                            // question to revisit with measurements taken AFTER that rule lands (it
+                            // changes the very reuse distribution the decision depends on), not a defect
+                            // to widen blind.
                             if (n_swa_mem > 0 && n_past < floor &&
                                 !(B_ctx >= floor && B_ctx < slot.task->n_tokens())) {
                                 const int32_t e = slot.task->n_tokens() - 1; // -1 keeps B_ctx a STRICT prefix
