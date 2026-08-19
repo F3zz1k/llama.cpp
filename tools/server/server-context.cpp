@@ -2241,11 +2241,16 @@ private:
         // what this slot already holds (the manual /slots rollback: restore an earlier snapshot of the
         // conversation the slot is already serving). There ctx_dft held a valid [0, L+G) that the
         // suffix prefill's seq_rm at [p0, -1) would have trimmed to a warm, correct [0, L); after this
-        // it is empty and no draft impl rebuilds a gap below the live decode point (common/speculative
-        // .cpp only WARNS about it), so that conversation drafts cold from here on. We take that over
-        // the alternative, because the pre-load slot prompt is not known to agree with the snapshot
-        // past the auto path's verified margin, so "prefix of the current prompt" cannot be decided
-        // cheaply and safely before the load.
+        // it is empty and no draft impl rebuilds a gap below the live decode point, so that
+        // conversation drafts cold from here on. Note the gap is also SILENT: the nearest thing to a
+        // diagnostic, common_speculative_impl_draft_mtp::begin()'s `pos_max < N - 1` warning, cannot
+        // fire for it, because llama_memory_seq_pos_max returns the maximum POSITION rather than a
+        // count and the post-restore suffix prefill writes ctx_dft cells right up to N-1, so the test
+        // is false while [0, L) is still missing (measured: 0 warnings over 6 runs, on both this build
+        // and the pre-fix one). Do not rely on that warning to detect a draft-side hole. We take the
+        // loss over the alternative, because the pre-load slot prompt is not known to agree with the
+        // snapshot past the auto path's verified margin, so "prefix of the current prompt" cannot be
+        // decided cheaply and safely before the load.
         // Deliberately a direct llama_memory_seq_rm on ctx_dft, not slot.mem.seq_rm: the wrapper mirrors
         // onto both contexts and cannot express "load into one, reset the other". (-1, -1) is the rm_all
         // path, legal on every memory class, so the result is not checked (same style as
