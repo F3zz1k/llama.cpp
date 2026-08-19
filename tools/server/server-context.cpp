@@ -1169,6 +1169,14 @@ struct server_slot {
         // "last sampled distribution" and must survive into the idle state so a subsequent
         // SLOT_SAVE can serialize it.
         restored_logits.clear();
+
+        // Same one-shot rule for the restore flag, so it can outlive at most ONE task. Its consumers
+        // sit behind guards a task can miss entirely (cache_prompt == false forces n_past = 0, which
+        // skips the consume), and reset() runs from release(), i.e. AFTER the consumers of the task
+        // that owns the restore. A manual /slots restore is not a processing task and never reaches
+        // release(), so the flag still survives from that endpoint into the next request, which is
+        // what the regenerate fast-path relies on.
+        just_restored = false;
     }
 
     void init_sampler() const {
@@ -6134,24 +6142,37 @@ private:
                                 }
 
                                 // Consume just_restored UNCONDITIONALLY, before the gate: the tail-aware threshold
-                                // makes the gate false for the restore-plus-suffix case, and this flag is never
-                                // cleared in server_slot::reset(), so a consume inside the gate leaks for the life
-                                // of the slot.
+                                // makes the gate false for the restore-plus-suffix case, so a consume inside the
+                                // gate would leave the flag set. It is also cleared in server_slot::reset(), which
+                                // bounds an unconsumed flag to the task that owns it: this consume sits inside the
+                                // `n_past > 0 && n_past <= prompt.n_tokens()` block, which a fully divergent or
+                                // cache_prompt == false task never enters.
                                 const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
 
                                 // A just-restored WINDOW memory (PART, in practice SWA) that is being
                                 // strictly EXTENDED needs no rewind at all, so skip the search below
-                                // entirely. llama_kv_cache::state_write drops exactly the cells a live
-                                // slot would have evicted, so a restored slot whose KV ends at n_past is
-                                // equivalent to a live slot that has just decoded [0, n_past), and a live
-                                // slot extending forward never consults a checkpoint. The search can only
-                                // do harm here: the ONLY checkpoint such a slot has is the one
-                                // auto_restore_into_slot synthesised from the LIVE window (after clearing
-                                // the list), whose pos_min IS the window start L - n_swa, the same
-                                // expression as pos_min_thold when has_new_tokens, so
-                                // `cur.pos_min < pos_min_thold` is false BY CONSTRUCTION, do_reset fires
-                                // and every SWA disk restore is loaded and then thrown away.
-                                // The four terms, exactly: (1) this task consumed a restore; (2) the
+                                // entirely. Every position the model can attend to from n_past is
+                                // present: llama_kv_cache::state_write persists exactly the unmasked
+                                // window [n_past - n_swa, n_past). This is NOT the same cell set a live
+                                // slot holds, and the difference is the whole reason the gate misfires
+                                // here: find_slot only marks an SWA-masked cell REUSABLE, it does not
+                                // erase it, and the SWA sub-cache is sized PAD(min(size_base, n_swa *
+                                // n_seq_max + n_ubatch), 256) > n_swa, so a live slot still physically
+                                // holds older positions and reports a pos_min strictly BELOW
+                                // pos_min_thold, which keeps the gate shut for it. A restored slot
+                                // reports pos_min == n_past - n_swa == pos_min_thold, so the gate opens.
+                                // The search can only do harm here: the ONLY checkpoint such a slot has is the one
+                                // synthesised from the LIVE window after the restore (do_slot_restore
+                                // clears the list for every class, then auto_restore_into_slot and the
+                                // manual SWA branch each create exactly one), whose pos_min IS the window
+                                // start L - n_swa, the same expression as pos_min_thold when
+                                // has_new_tokens, so `cur.pos_min < pos_min_thold` is false BY
+                                // CONSTRUCTION, do_reset fires and every SWA disk restore is loaded and
+                                // then thrown away.
+                                // The four terms, exactly: (1) the slot carries a restore no earlier task
+                                // consumed, i.e. an auto-restore performed for THIS task or a manual
+                                // /slots restore with no task since (server_slot::reset() clears the flag,
+                                // which bounds it to one task); (2) the
                                 // request strictly extends it, so no rewind is needed; (3) pos_min is a
                                 // real window start, NOT a tail, so FULL and RS keep the unchanged path,
                                 // because for them the search is what keeps the NOTE's GGML_ABORT
