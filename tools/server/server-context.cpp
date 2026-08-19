@@ -6175,10 +6175,20 @@ private:
                             // tail) is restorable ONLY by a request that STRICTLY EXTENDS it - its state
                             // file carries just the window [L - n_swa, L), so it can never be rewound to
                             // a shorter prefix (see the SWA gate in auto_restore_into_slot). A repeat /
-                            // regenerate of the SAME prompt - and, on a reasoning model, EVERY follow-up
-                            // turn, since the generated thinking tokens are not replayed - therefore gets
-                            // ZERO reuse unless the store also holds a whole-state root STRICTLY INSIDE
-                            // the prompt. When the shared-context boundary does not arm one (absent, or
+                            // regenerate of the SAME prompt therefore gets ZERO reuse unless the store
+                            // also holds a whole-state root STRICTLY INSIDE the prompt.
+                            // CORRECTION (2026-08-19): this comment used to add "and, on a reasoning
+                            // model, EVERY follow-up turn, since the generated thinking tokens are not
+                            // replayed". That is NOT a property of reasoning models, it is a property of
+                            // the individual chat template, and it is false for current ones. Measured
+                            // via /apply-template with reasoning_content set on a history message:
+                            // Qwen3.6 family DROPS historical reasoning (a follow-up turn is then not an
+                            // extension of the release snapshot), Qwen3.8 RENDERS it as a full <think>
+                            // block (a follow-up turn CAN extend). Normal chat replays thinking; the
+                            // server even logs that a template supports it and suggests
+                            // --reasoning-preserve. Do not reason about reuse from "is it a reasoning
+                            // model", check what the deployed template actually renders.
+                            // When the shared-context boundary does not arm one (absent, or
                             // below the floor - the common single-user-message case), anchor it at the
                             // deepest block boundary below the prompt end instead. The mid-prefill
                             // whole-save is sound for SWA precisely because the resident sequence IS the
