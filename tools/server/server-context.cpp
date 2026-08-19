@@ -1757,7 +1757,10 @@ private:
     //          restore, and this is a correctness requirement rather than conservatism: state_write
     //          serializes only ONE row per cell (llama-memory-recurrent.cpp, cell_id = rs_idx_cur *
     //          size + src) and state_read unconditionally resets rs_idx to 0, so the (1 + n_rs_seq)
-    //          rollback history rows a restored sequence would rewind INTO were never written.
+    //          rollback history rows a restored sequence would rewind INTO are NOT RESTORED. They are
+    //          not zeroed either: they hold whatever that memory last had, i.e. plausible-looking
+    //          state from a previous conversation, which is why the failure is silent rather than
+    //          obviously broken.
     //          seq_rm's rollback branch only range-checks `1 <= rollback <= n_rs_seq`; it does not
     //          check the row exists, so such a rewind returns TRUE and reads an unwritten row —
     //          silent garbage, not a GGML_ABORT that would announce itself. Do NOT "optimise" this
@@ -1770,12 +1773,21 @@ private:
     //          a LIVE serving state, not a dead one: common_context_can_seq_rm returns NO both for a
     //          context with no memory module and for one whose 2-token probe decode merely failed
     //          (common/common.cpp), and the server only logs "speculative decoding not supported by
-    //          this context" and carries on loading. Before this was listed, a transient probe
-    //          failure on a per-token-rewindable model left NO with n_swa_mem == 0 falling into the
-    //          partial-rewind else-branch below, taking block-aligned mid-snapshot reuse, and then
-    //          GGML_ABORTing the server on the partial seq_rm. Fail CLOSED instead: refusing a
-    //          partial restore for a context we could not probe costs at most one cold prefill,
-    //          whereas guessing wrong aborts the process.
+    //          this context" and carries on loading. Before this was listed, NO with n_swa_mem == 0
+    //          fell into the partial-rewind else-branch below and took block-aligned mid-snapshot
+    //          reuse. Which way that went depended on what the model ACTUALLY was, which is exactly
+    //          what a failed probe leaves unknown:
+    //            - not per-token rewindable (would have probed FULL): the partial seq_rm GGML_ABORTs
+    //              the process.
+    //            - genuinely per-token rewindable: it simply worked.
+    //          So the old behaviour was a bet on "probably attention" that pays a crash when wrong.
+    //          Fail CLOSED instead. The price is real and is NOT one cold prefill: every request
+    //          that would have partially matched now gets whole-prefix-only reuse, for as long as
+    //          the context stays in the NO state. That is the correct trade against aborting the
+    //          server, but do not record it as free.
+    //          Only NO with n_swa_mem == 0 changes here: n_swa_mem comes from llama_model_n_swa(),
+    //          which is model-derived and independent of the probe, so an SWA model whose probe
+    //          failed was already taking this arm via the n_swa_mem term.
     // The only class this returns false for is PART with n_swa_mem == 0 (plain attention), which
     // rewinds per token. Uses n_swa_mem, never n_swa: --swa-full
     // zeroes n_swa for the batch planner but the engine keeps masking on save.
@@ -2256,12 +2268,18 @@ private:
         // conversation the slot is already serving). There ctx_dft held a valid [0, L+G) that the
         // suffix prefill's seq_rm at [p0, -1) would have trimmed to a warm, correct [0, L); after this
         // it is empty and no draft impl rebuilds a gap below the live decode point, so that
-        // conversation drafts cold from here on. Note the gap is also SILENT: the nearest thing to a
-        // diagnostic, common_speculative_impl_draft_mtp::begin()'s `pos_max < N - 1` warning, cannot
-        // fire for it, because llama_memory_seq_pos_max returns the maximum POSITION rather than a
-        // count and the post-restore suffix prefill writes ctx_dft cells right up to N-1, so the test
-        // is false while [0, L) is still missing (measured: 0 warnings over 6 runs, on both this build
-        // and the pre-fix one). Do not rely on that warning to detect a draft-side hole. We take the
+        // conversation drafts cold from here on. Note the gap is also SILENT: EVERY begin() override
+        // that tests for this at all checks it the same blind way — MTP `pos_max < N - 1`, EAGLE3
+        // `pos_max < N - 1`, draft-model `pos_max < N - 2` — and llama_memory_seq_pos_max returns the
+        // maximum POSITION rather than a count, so it cannot see a hole BELOW a populated tail. On
+        // this path the post-restore suffix prefill writes ctx_dft cells right up to N-1, so the test
+        // is false while [0, L) is still missing and no warning fires. Measured 0 warnings over 6
+        // runs on qwen3.8-27b + MTP, on this build and the pre-fix one — note those two are silent
+        // for DIFFERENT reasons: here the cells below are absent, pre-fix they were present but
+        // belonged to another conversation, and pos_max cannot distinguish absent from stale.
+        // Scoped deliberately: the warning CAN fire elsewhere, e.g. the restore-continue fast path
+        // calls common_speculative_begin with nothing decoded, so pos_max == -1 there (FULL target
+        // plus a separate draft model). Do not rely on it to detect a draft-side hole. We take the
         // loss over the alternative, because the pre-load slot prompt is not known to agree with the
         // snapshot past the auto path's verified margin, so "prefix of the current prompt" cannot be
         // decided cheaply and safely before the load.
