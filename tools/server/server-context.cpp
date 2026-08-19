@@ -2213,10 +2213,25 @@ private:
         // seq_rm at [p0, -1) that precedes it removes nothing below p0). Reset it: a COLD draft is
         // correct, only unaccelerated. This does NOT reconstruct draft state for [0, L), no snapshot
         // carries it, so drafting stays cold until generation refills ctx_dft.
-        // ORDER IS LOAD-BEARING: this must run BEFORE the load, not after. On a shared-memory draft
-        // context (common/speculative.cpp is_mem_shared, gemma4-class: llama_get_ctx_other(ctx_dft) ==
-        // ctx_tgt) a clear here is harmless because node [0] clears the destination seq anyway, whereas
-        // the same clear after the load could discard the state we just read.
+        // ORDER IS NOT LOAD-BEARING: placed before the load only for locality. ctx_dft and ctx_tgt
+        // always own DISTINCT memory objects (llama_context builds its own via model.create_memory,
+        // passing the other context's memory as mem_other rather than sharing the pointer), so a clear
+        // of ctx_dft can never touch cells the load just wrote, in either order. On a shared-CELLS
+        // draft (common/speculative.cpp is_mem_shared, gemma4-class: llama_get_ctx_other(ctx_dft) ==
+        // ctx_tgt) this call is a no-op by construction: llama_kv_cache::seq_rm returns true
+        // immediately when `other` is set, and none is needed there because the draft reads the
+        // target's own cells, which node [0] repopulates. The reset therefore only ever affects a
+        // genuinely separate draft KV (the qwen35 MTP case), which is exactly the stale-conversation
+        // case this is here for.
+        // ACCEPTED LOSS: the clear is unconditional, so it also fires when the snapshot is a PREFIX of
+        // what this slot already holds (the manual /slots rollback: restore an earlier snapshot of the
+        // conversation the slot is already serving). There ctx_dft held a valid [0, L+G) that the
+        // suffix prefill's seq_rm at [p0, -1) would have trimmed to a warm, correct [0, L); after this
+        // it is empty and no draft impl rebuilds a gap below the live decode point (common/speculative
+        // .cpp only WARNS about it), so that conversation drafts cold from here on. We take that over
+        // the alternative, because the pre-load slot prompt is not known to agree with the snapshot
+        // past the auto path's verified margin, so "prefix of the current prompt" cannot be decided
+        // cheaply and safely before the load.
         // Deliberately a direct llama_memory_seq_rm on ctx_dft, not slot.mem.seq_rm: the wrapper mirrors
         // onto both contexts and cannot express "load into one, reset the other". (-1, -1) is the rm_all
         // path, legal on every memory class, so the result is not checked (same style as
@@ -2253,25 +2268,37 @@ private:
         slot.prompt.tokens.insert(tokens);
         slot.just_restored = true;
 
+        // Drop the previous task's checkpoints UNCONDITIONALLY, for every class, before any synth
+        // below. They snapshot a DIFFERENT prompt's ctx_tgt state and the sequence they described no
+        // longer exists. The auto path already clears the list before calling in, but the manual
+        // /slots restore does not, and it clears only inside its own SWA branch, so without this an RS
+        // (or plain-attention) manual restore carried the previous task's checkpoints forward: the next
+        // request diverging at d < L gets pos_min_thold == d against a recurrent tail pos_min of L-1,
+        // opens the consumer gate, and a surviving checkpoint with cur.pos_min == 0 is accepted and
+        // loaded, i.e. a foreign conversation's state.
+        slot.prompt.checkpoints.clear();
+
         // FULL only. Reconstruct a context checkpoint at the restored position so a FULL model, which
         // cannot partially rewind, can reuse this state for the suffix.
         // RS is deliberately NOT included, and this is not an oversight, do not add it "for symmetry".
-        // With the whole-prefix rule in auto_restore_into_slot, an RS restore leaves n_past == pos_next
-        // == L while a recurrent pos_min is the TAIL (L-1), so: when the request EXTENDS,
-        // pos_min_thold == L and the consumer gate `pos_min >= pos_min_thold` is false, the checkpoint
-        // list is never iterated; on an exact resend, pos_min_thold == L-1 and the acceptance test
-        // `cur.pos_min < pos_min_thold` is L-1 < L-1, false. The checkpoint would be unreachable in one
-        // case and rejected in the other, while create_checkpoint pays a whole-sequence PARTIAL_ONLY
-        // state copy per restore. Adding it only becomes live if someone relaxes the consumer to accept
-        // cur.pos_min == pos_min_thold for tail memories, and that is exactly the GGML_ABORT the NOTE at
-        // the acceptance predicate documents. The same reasoning forbids extending the SWA synth in
-        // auto_restore_into_slot to RS.
+        // ON THE AUTO PATH, where the whole-prefix rule in auto_restore_into_slot holds, an RS restore
+        // leaves n_past == pos_next == L while a recurrent pos_min is the TAIL (L-1), so: when the
+        // request EXTENDS, pos_min_thold == L and the consumer gate `pos_min >= pos_min_thold` is
+        // false, the checkpoint list is never iterated; on an exact resend, pos_min_thold == L-1 and
+        // the acceptance test `cur.pos_min < pos_min_thold` is L-1 < L-1, false. The checkpoint would
+        // be unreachable in one case and rejected in the other, while create_checkpoint pays a
+        // whole-sequence PARTIAL_ONLY state copy per restore. On the MANUAL path no whole-prefix rule
+        // applies and the next request may diverge at any d < L, which would make such a checkpoint
+        // reachable, so the clear above is what keeps an RS slot from having one at all rather than
+        // this predicate. Adding an RS synth only becomes live if someone relaxes the consumer to
+        // accept cur.pos_min == pos_min_thold for tail memories, and that is exactly the GGML_ABORT the
+        // NOTE at the acceptance predicate documents. The same reasoning forbids extending the SWA
+        // synth in auto_restore_into_slot to RS.
         // SWA gets its own synth there (it is a real window start, not a tail).
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
             const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             if (ckpt_pos_min >= 0) {
-                slot.prompt.checkpoints.clear();
                 create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
             }
         }
