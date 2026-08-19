@@ -6069,9 +6069,41 @@ private:
                                 // cleared in server_slot::reset(), so a consume inside the gate leaks for the life
                                 // of the slot.
                                 const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
-                                (void) slot_was_restored;
 
-                                if (pos_min >= pos_min_thold) {
+                                // A just-restored WINDOW memory (PART, in practice SWA) that is being
+                                // strictly EXTENDED needs no rewind at all, so skip the search below
+                                // entirely. llama_kv_cache::state_write drops exactly the cells a live
+                                // slot would have evicted, so a restored slot whose KV ends at n_past is
+                                // equivalent to a live slot that has just decoded [0, n_past), and a live
+                                // slot extending forward never consults a checkpoint. The search can only
+                                // do harm here: the ONLY checkpoint such a slot has is the one
+                                // auto_restore_into_slot synthesised from the LIVE window (after clearing
+                                // the list), whose pos_min IS the window start L - n_swa, the same
+                                // expression as pos_min_thold when has_new_tokens, so
+                                // `cur.pos_min < pos_min_thold` is false BY CONSTRUCTION, do_reset fires
+                                // and every SWA disk restore is loaded and then thrown away.
+                                // The four terms, exactly: (1) this task consumed a restore; (2) the
+                                // request strictly extends it, so no rewind is needed; (3) pos_min is a
+                                // real window start, NOT a tail, so FULL and RS keep the unchanged path,
+                                // because for them the search is what keeps the NOTE's GGML_ABORT
+                                // unreachable; (4) the restored KV ends exactly at n_past, so nothing
+                                // above it needs removing (a diverging manual /slots restore has
+                                // n_past < prompt.n_tokens() and still takes the search).
+                                // Inert for PART with n_swa == 0 (no checkpoints are ever created for it,
+                                // and pos_min == 0 keeps the gate closed) and under --swa-full (n_swa == 0
+                                // makes pos_min_thold == pos_next, gate closed).
+                                // KNOWN GAP, deliberately not covered: the SWA EXACT-resend case
+                                // (has_new_tokens false) keeps today's behaviour, checkpoint rejected by
+                                // one position, cold reprefill. Covering it would need either an
+                                // off-by-one relaxation of the acceptance test or widening this skip to a
+                                // path a warm slot does not take, which is the class of change that
+                                // produced this file's incident history. Extension is the case with
+                                // production evidence.
+                                const bool restored_extend_only = slot_was_restored && has_new_tokens &&
+                                                                  !pos_min_is_tail &&
+                                                                  n_past == slot.prompt.n_tokens();
+
+                                if (pos_min >= pos_min_thold && !restored_extend_only) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
