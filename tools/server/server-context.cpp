@@ -2180,6 +2180,24 @@ private:
             if (out_token_count) { *out_token_count = 0; }
             return false;
         }
+        // A snapshot is a ctx_tgt state file: llama_state_seq_load_file_ext below writes ctx_tgt only,
+        // and nothing draft-side is ever persisted. So whatever ctx_dft holds for this seq belongs to
+        // the PREVIOUS prompt, and after the restore the MTP/EAGLE3 head would draft while attending
+        // over another conversation's cells (the post-restore prefill only decodes the SUFFIX, and the
+        // seq_rm at [p0, -1) that precedes it removes nothing below p0). Reset it: a COLD draft is
+        // correct, only unaccelerated. This does NOT reconstruct draft state for [0, L), no snapshot
+        // carries it, so drafting stays cold until generation refills ctx_dft.
+        // ORDER IS LOAD-BEARING: this must run BEFORE the load, not after. On a shared-memory draft
+        // context (common/speculative.cpp is_mem_shared, gemma4-class: llama_get_ctx_other(ctx_dft) ==
+        // ctx_tgt) a clear here is harmless because node [0] clears the destination seq anyway, whereas
+        // the same clear after the load could discard the state we just read.
+        // Deliberately a direct llama_memory_seq_rm on ctx_dft, not slot.mem.seq_rm: the wrapper mirrors
+        // onto both contexts and cannot express "load into one, reset the other". (-1, -1) is the rm_all
+        // path, legal on every memory class, so the result is not checked (same style as
+        // auto_restore_drop below).
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+        }
         // Load the chain in position order: node [0] clears the destination seq (a whole base/root
         // snapshot), nodes [1..] append their delta cells with NO_CLEAR so base + deltas compose.
         // A 1-element chain is exactly the previous single clearing load — byte-for-byte the same.
