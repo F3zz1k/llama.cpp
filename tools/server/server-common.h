@@ -410,6 +410,50 @@ struct model_fp {
                fp_mmproj == o.fp_mmproj;
     }
 
+    // Whether a snapshot carrying THIS fingerprint (read from disk) may be
+    // restored into a live context whose fingerprint is `live`.
+    //
+    // Identical to operator== in every field except fp_n_ctx, which is allowed
+    // to be SMALLER on disk when `allow_smaller_ctx`. A conversation that grows
+    // past a context rung migrates to a larger-ctx instance; without this it
+    // can reuse NONE of its own snapshots and pays a full cold prefill
+    // (measured ~197 s at 127k tokens on our rig).
+    //
+    // Safe because the serialised blob has no n_ctx dependence: positions come
+    // entirely from the blob, and n_ctx enters memory construction only as
+    // attn_kv_size = cparams.n_ctx_seq, which sets cells.size() and nothing
+    // else. The one size interaction is already guarded — state_read_data
+    // rejects cell_count > cells.size(), and find_slot rejects
+    // n_tokens > cells.size() — so the REVERSE direction (a large snapshot into
+    // a small context) fails loudly, which matters because routers legitimately
+    // downsize instances when idle.
+    //
+    // operator== stays EXACT on purpose: it is load-bearing for snapshot NAMING
+    // (identity_hash folds fp_n_ctx, so rungs keep disjoint filenames and cannot
+    // atomically rename over one another) and for the incremental-save
+    // parent-find, which must keep delta chains rung-local.
+    //
+    // `allow_smaller_ctx` must be false for iSWA/hybrid-iSWA models: their
+    // classes are unanalysed here, so they stay on exact matching.
+    bool restore_compatible(const model_fp & live, bool allow_smaller_ctx) const {
+        if (fp_n_ctx != live.fp_n_ctx) {
+            if (!allow_smaller_ctx || fp_n_ctx > live.fp_n_ctx) {
+                return false;
+            }
+        }
+        return fp_model == live.fp_model && fp_n_vocab == live.fp_n_vocab &&
+               fp_n_ctx_train == live.fp_n_ctx_train && fp_n_embd == live.fp_n_embd &&
+               fp_n_layer == live.fp_n_layer && fp_rope_type == live.fp_rope_type &&
+               fp_cache_k == live.fp_cache_k && fp_cache_v == live.fp_cache_v &&
+               fp_kv_full == live.fp_kv_full &&
+               fp_block == live.fp_block && fp_rope_scale == live.fp_rope_scale &&
+               fp_rope_base == live.fp_rope_base && fp_yarn_ext == live.fp_yarn_ext &&
+               fp_yarn_attn == live.fp_yarn_attn && fp_yarn_beta_fast == live.fp_yarn_beta_fast &&
+               fp_yarn_beta_slow == live.fp_yarn_beta_slow && fp_yarn_orig_ctx == live.fp_yarn_orig_ctx &&
+               fp_lora == live.fp_lora && fp_mmproj_loaded == live.fp_mmproj_loaded &&
+               fp_mmproj == live.fp_mmproj;
+    }
+
     // 64-bit digest of EVERY identity field above — the exact set operator== compares.
     // Used only to name the auto-snapshot files (auto_state_filename): two peers sharing
     // one --slot-save-path that agree on fp_model but differ in any geometry field

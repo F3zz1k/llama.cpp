@@ -1798,6 +1798,19 @@ private:
                n_swa_mem > 0;
     }
 
+    // Whether a snapshot taken at a SMALLER n_ctx may be restored into this
+    // context. Gated on n_swa_mem: for an iSWA / hybrid-iSWA model the SWA
+    // sub-cache classes are unanalysed for cross-ctx reuse, so they stay on
+    // exact fingerprint matching. n_swa_mem comes from llama_model_n_swa() and
+    // is NOT zeroed by --swa-full, unlike n_swa, so it is the reliable gate.
+    //
+    // NOTE n_swa_mem == 0 does NOT mean "plain attention" — for the hybrid
+    // recurrent models this is aimed at it means the recurrent tier, whose
+    // sizing is n_ctx-invariant outright.
+    bool auto_allow_smaller_ctx() const {
+        return n_swa_mem == 0;
+    }
+
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -2044,7 +2057,7 @@ private:
                 }
                 continue;
             }
-            if (!(fp == cur_fp)) {
+            if (!fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
             }
             // rehash from the sidecar's cells + media records (media empty on v1 => the
@@ -2157,7 +2170,7 @@ private:
                     continue;
                 }
                 for (const auto_cache_entry & c : it->second) { // longest first within the boundary
-                    if (!(c.fp == cur_fp)) {
+                    if (!c.fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
                         continue; // invariant 3
                     }
                     if (restore_is_whole_prefix_only() && c.n_tokens > req.size()) {
@@ -2415,6 +2428,8 @@ private:
             err = ".meta sidecar carries no media records for a media state file";
             return false;
         }
+        // EXACT on purpose: manual /slots restore, an operator-driven path where an
+        // exact fingerprint match is the documented contract.
         if (!(disk_fp == cur_fp)) {
             err = "snapshot fingerprint mismatch (model, projector or context geometry changed)";
             return false;
@@ -2553,6 +2568,11 @@ private:
                                 &parent_parent_id, &parent_lo, &parent_hi)) {
                 return false; // parent meta missing/corrupt -> cold prefill
             }
+            // EXACT on purpose. Delta parents resolve by FILENAME via auto_state_filename,
+            // whose identity_hash folds fp_n_ctx - so any parent found here necessarily
+            // shares our n_ctx and an exact compare is already the right test. Relaxing it
+            // would be dead code today, and would silently become load-bearing if
+            // identity_hash ever drops fp_n_ctx.
             if (!(parent_fp == cur_fp)) {
                 return false; // fingerprint drift on the parent -> cold prefill
             }
@@ -2607,8 +2627,15 @@ private:
                             &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
             return 0; // invariant 4
         }
-        if (!(disk_fp == cur_fp)) {
+        if (!disk_fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
             return 0; // invariant 3
+        }
+        if (disk_fp.fp_n_ctx != cur_fp.fp_n_ctx) {
+            // Cross-rung restore. Logged unconditionally: if the relaxed
+            // fingerprint is ever wrong the symptom is a CONFIDENT WRONG
+            // ANSWER, and this line is the only forensic trail.
+            SRV_INF("auto restore: cross-ctx reuse, snapshot n_ctx=%u into live n_ctx=%u\n",
+                    (unsigned) disk_fp.fp_n_ctx, (unsigned) cur_fp.fp_n_ctx);
         }
         // request-side identity: cell-aligned tokens plus media records (empty on a text-only
         // request). The extraction throws on an identity-less chunk (e.g. a placeholder
@@ -3287,6 +3314,12 @@ private:
                 if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
                     continue; // unreadable meta -> not a usable parent (invariant 4)
                 }
+                // EXACT on purpose - do NOT switch this to restore_compatible(). This is the
+                // incremental-save parent-find. Relaxing it would let an instance parent its
+                // delta on a snapshot taken at a DIFFERENT n_ctx, coupling the chains of two
+                // rungs: the link is unresolvable by name (identity_hash still folds fp_n_ctx,
+                // so rungs keep disjoint filenames) and the delta becomes permanent dead
+                // weight. Chains stay rung-local; that costs nothing and removes the class.
                 if (!(disk_fp == cur_fp)) {
                     continue; // invariant 3
                 }
