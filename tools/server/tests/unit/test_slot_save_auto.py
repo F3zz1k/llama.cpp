@@ -12,9 +12,19 @@ server = ServerPreset.tinyllama2()
 
 # Frozen golden fixture: an auto-cache unit (.bin state + v1 .meta sidecar) captured from
 # the pre-media base build (auto-disk-kvcache @ 9683b5b7b) with the server flags below and
-# GOLDEN_PROMPT. It must stay bit-frozen: restoring it under every future binary is the
-# regression lock for v1 compatibility (a v1 .meta carries no fp_mmproj — the reader
-# backfills it — and existing units must keep restoring unmodified).
+# GOLDEN_PROMPT. What it locks is the FORK's side of the format: the v1 .meta layout (a v1
+# .meta carries no fp_mmproj, the reader backfills it) and the fork's own cell-record
+# handling, so units written by an older build keep indexing and restoring unmodified.
+#
+# It cannot lock the .bin across a change of LLAMA_STATE_SEQ_VERSION (include/llama.h). That
+# word is the first thing llama_state_seq_load_file checks and a mismatch refuses the file
+# outright, so on an upstream bump the pair must be RECAPTURED (same flags, same
+# GOLDEN_PROMPT, graceful stop) and FIXTURE_SHA256, EMITTED_SHA256 and
+# fixtures/golden-v1/SHA256SUMS updated with it. The version word is asserted directly below
+# so that bump reports itself instead of surfacing as an opaque sha mismatch or, worse, as a
+# restore test that quietly cold-prefills.
+STATE_SEQ_VERSION = 3          # must track LLAMA_STATE_SEQ_VERSION in include/llama.h
+STATE_SEQ_MAGIC   = 0x67677371 # LLAMA_STATE_SEQ_MAGIC ("ggsq")
 FIXTURE_DIR = "./fixtures/golden-v1"
 FIXTURE_SHA256 = {
     "auto-f414107cff91a49e-5efede8f57f0c198-377.bin":
@@ -69,9 +79,28 @@ def create_server():
     os.makedirs(CACHE_DIR)
 
 
+def assert_state_seq_version(path: str):
+    """Check a state .bin's magic + version word against what this build reads. A .bin whose
+    version word is not LLAMA_STATE_SEQ_VERSION is refused outright by llama_state_seq_load_file,
+    which makes every assertion built on that file meaningless. Paths that are not a .bin (the
+    ".bin.meta" sidecar, which carries its own independent version) are ignored."""
+    if not path.endswith(".bin"):
+        return
+    with open(path, "rb") as f:
+        magic, version = struct.unpack("<II", f.read(8))
+    assert magic == STATE_SEQ_MAGIC, f"{path}: not a llama state-seq file"
+    assert version == STATE_SEQ_VERSION, (
+        f"{path}: state file is version {version}, this build reads only version "
+        f"{STATE_SEQ_VERSION}. LLAMA_STATE_SEQ_VERSION was bumped: recapture the golden fixture "
+        "(same flags, same GOLDEN_PROMPT, graceful stop) and update FIXTURE_SHA256, "
+        "EMITTED_SHA256 and fixtures/golden-v1/SHA256SUMS."
+    )
+
+
 def verify_and_copy_fixture(dst: str, names=None):
     for name, expected in FIXTURE_SHA256.items():
         path = os.path.join(FIXTURE_DIR, name)
+        assert_state_seq_version(path)
         with open(path, "rb") as f:
             actual = hashlib.sha256(f.read()).hexdigest()
         assert actual == expected, f"golden fixture {name} changed on disk — it must stay frozen"
@@ -97,6 +126,12 @@ def test_text_only_meta_byte_identical():
     # exact emitted filenames (identity-hash prefix, then the fp_model-salted block-chain hash
     # and the token count — a drift in any of them shows up here first)
     assert sorted(os.listdir(CACHE_DIR)) == sorted(EMITTED_SHA256)
+    # the sha comparison below is against the frozen fixture, so it only carries meaning while
+    # both files are readable by this build: name a version bump for what it is first
+    for name in FIXTURE_SHA256:
+        assert_state_seq_version(os.path.join(FIXTURE_DIR, name))
+    for name in EMITTED_SHA256:
+        assert_state_seq_version(os.path.join(CACHE_DIR, name))
     for name, expected in EMITTED_SHA256.items():
         with open(os.path.join(CACHE_DIR, name), "rb") as f:
             actual = hashlib.sha256(f.read()).hexdigest()
