@@ -4,6 +4,14 @@ This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). T
 `main-patched` branch is **upstream `master` plus a small set of llama-server patches**
 that make disk KV caching work for model types where it was previously broken or blocked.
 
+**Upstream baseline:** `main-patched` currently carries upstream `master` at `d7bd3bfca`
+(2026-08-28), absorbed by the merge of 2026-08-29. The previous baseline was `9d57ce456`
+(2026-08-14). That merge crossed an upstream **state-file format bump**
+(`LLAMA_STATE_SEQ_VERSION` 2 -> 3), so KV snapshots written by any earlier build of this
+fork are refused by this one; see
+[`docs/kv-cache/README.md`](docs/kv-cache/README.md#engine-state-file-format-bin-and-upstream-version-bumps)
+for who is affected and what an operator has to do at deploy time.
+
 Everything else is stock llama.cpp — see the upstream [README.md](README.md) to build and
 run normally. This document only covers what the fork adds.
 
@@ -327,10 +335,20 @@ whole prompt.
 tensor all-reduce with VMM pool`.
 
 Unlike the rest of this fork, that commit is **not a feature of ours**. It is a workaround
-for an upstream defect in `ggml_backend_sycl_comm_allreduce_tensor` (introduced by upstream
+for an upstream defect in the `--split-mode tensor` all-reduce (introduced by upstream
 PR #24152). The BF16 large path peer-copies from a `ggml_sycl_pool_alloc` buffer on the
 other device; when that comes from the VMM pool and exceeds 4 MiB (two 2 MiB pages), the
 peer copy is enqueued and its event never signals, hanging the decode thread.
+
+Since the note was first written, upstream has moved those two scratch buffers: they used
+to be allocated per all-reduce inside `ggml_backend_sycl_comm_allreduce_tensor`, and are
+now `buf0` / `buf1` members of the persistent `ggml_backend_sycl_comm_context` built by
+`ggml_backend_sycl_comm_init` (`ggml/src/ggml-sycl/ggml-sycl.cpp`). Our patch moved with
+them: on this branch `buf0` / `buf1` are raw `uint8_t *` from `ggml_sycl_malloc_device`,
+allocated lazily on the first all-reduce once `nelem` is known and released in
+`ggml_backend_sycl_comm_free`. Upstream still holds them as
+`std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>` constructed from `sctx0->pool()` /
+`sctx1->pool()`.
 
 Measured on 2x Arc Pro B70: `-ub 200` (3.91 MiB) works, `-ub 208` (4.06 MiB) hangs, and
 everything larger hangs, on the first request. Reproduces on Qwen3.6-27B and Qwen3.8-27B.
@@ -343,8 +361,14 @@ Tracking:
 - Candidate patch offered upstream from branch `sycl-tp-fix-vmm-peer-deadlock`.
 
 **When upstream lands a fix, drop our commit rather than merging both.** Check on each
-rebase: if `ggml_backend_sycl_comm_allreduce_tensor` no longer takes its scratch buffers
-from `ggml_sycl_pool_alloc`, upstream has fixed it and this patch is redundant.
+upstream merge (we merge, never rebase): if `ggml_backend_sycl_comm_init` no longer builds
+`ctx->buf0` / `ctx->buf1` from `sctx0->pool()` / `sctx1->pool()` (wherever the two scratch
+buffers have moved to by then, the test is whether they still come from a
+`ggml_sycl_pool_alloc`), upstream has fixed it and this patch is redundant.
+
+**Still needed as of the 2026-08-29 merge.** Checked against upstream `master` at
+`d7bd3bfca` (2026-08-28): `ggml_backend_sycl_comm_init` still constructs both buffers from
+the device pools, and issues #26409 and #25711 are both still open. Keep the patch.
 
 **Note this is dormant in our deployment** - no registry entry uses `--split-mode tensor`
 (layer split wins on B70 anyway), so it only matters if we start exploring tensor-parallel

@@ -108,6 +108,12 @@ feature dispatch is already funnelled through the two helpers above (not scatter
 and reader), that migration is a contained change to those helpers plus one new reader loop — it is
 structured for now and does not need to be built until the third tail exists.
 
+**This version map is the fork's `.meta` sidecar only.** The `.bin` next to it is libllama's own
+format, versioned independently by upstream through `LLAMA_STATE_SEQ_VERSION`, and the two never move
+together: a `.meta` can stay v1 while the `.bin` it names becomes unreadable. That happened at the
+2026-08-29 upstream merge (`LLAMA_STATE_SEQ_VERSION` 2 -> 3); see
+[`README.md`](README.md#engine-state-file-format-bin-and-upstream-version-bumps).
+
 ### Filename scheme is the tree
 
 Auto snapshots are named deterministically:
@@ -200,9 +206,46 @@ Two C API additions in `include/llama.h` back the scheme (backend-general; no ne
   (a full wipe); with it, the wipe is skipped so a delta appends into an existing sequence and
   base + deltas compose when loaded in position order.
 
+### Which memory classes honour a range (and what happens when they do not)
+
+`state_write_range` is declared on `llama_memory_i` with a **whole-sequence default**: a class that
+does not override it silently writes `[0, N)` and ignores `[p0, p1)`. That is safe by construction,
+because composing a root `[0, lo)` with a node that actually contains `[0, N)` under `NO_CLEAR` would
+duplicate cells, and the server never gets that far: the one-shot probe (`delta_capable`, first
+delta write only) writes both the range and the whole sequence and compares byte counts, latching
+`delta_cap::no` when they are equal. **Fails closed: no override means whole roots only.**
+
+Four classes genuinely honour a range: `llama_kv_cache`, `llama_kv_cache_iswa`,
+`llama_memory_hybrid` and `llama_memory_hybrid_iswa`.
+
+A fifth, upstream's `llama_memory_hybrid_idx` (block-sparse attention, built for `LLM_ARCH_QWEN4EXP`
+when `hparams.indexer_head_size > 0`), overrides it **only in order to fall back to that default**.
+Its `state_write` appends a third, indexer section that its `state_read` unconditionally reads back;
+`llama_memory_hybrid::state_write_range` would emit the attention delta and the whole recurrent state
+and drop that section, and neither of the fork's two guards would notice: the byte-count probe sees a
+legitimately smaller write, and `delta_bin_cell_count` stops at the attention delta's non-zero cell
+count. There is also an independent restore-side blocker: the indexer restore adopts the attention
+cache's slot layout (`[TAG_HYBRID_IDX_SINFO]`), and `llama_kv_cache::state_read_meta` rejects a
+mirrored `sinfo_in` layout combined with `NO_CLEAR` (they are mutually exclusive: `sinfo_in` needs the
+cells the preceding `seq_rm` released, and `NO_CLEAR` is exactly the flag that skips that `seq_rm`).
+So `llama_memory_hybrid_idx::state_write_range` ignores `[p0, p1)` and writes the whole sequence
+whenever `mem_idx` is present (`[TAG_HYBRID_IDX_STATE]`); the probe then latches `delta_cap::no` and
+the instance publishes whole roots only. A `qwen4exp` GGUF with no indexer tensors has a null
+`mem_idx` and gets normal deltas. The other indexer-bearing classes, `llama_kv_cache_msa`
+(`minimax_m3`) and `llama_kv_cache_dsa` / `llama_kv_cache_dsa_iswa` (`glm_dsa`, `deepseek32`), derive
+straight from `llama_memory_i` and never overrode `state_write_range`, so they have always taken the
+whole-write default and are safe for the same reason.
+
+Lifting the `qwen4exp`-with-indexer restriction means relaxing the `NO_CLEAR` + `sinfo_in` rule in
+`llama_kv_cache::state_read_meta` first; the two are not separable.
+
 ## Correctness invariants
 
-* Whole-snapshot (v1 root) bytes are byte-identical with the flag on vs off (golden lock).
+* Whole-snapshot (v1 root) bytes are byte-identical with the flag on vs off (golden lock). The lock
+  is against *our* changes only: an upstream `LLAMA_STATE_SEQ_VERSION` bump moves the `.bin` under it
+  and the frozen fixture must be recaptured.
+* A memory class that does not honour `state_write_range` never produces a delta at all: the probe
+  latches `delta_cap::no` and only whole roots are published (fail-closed).
 * Any missing / corrupt / non-contiguous node on the restore walk → cold prefill, never a partial or
   wrong-KV restore.
 * A base with a live delta child is never evicted; orphan deltas are reaped early.

@@ -59,7 +59,9 @@ The "use model default" cases (rope_freq_base==0, YaRN floats <0, yarn_orig_ctx<
 ## 5. On-disk format & atomicity
 
 Each snapshot is a 3-file unit sharing a base name `auto-<fp>-<chainhash>-<ntokens>.bin`, where `<fp>` is a fingerprint of the full runtime identity (`model_fp::identity_hash` — model plus cache-type/context/rope/YaRN/projector), so two instances that differ in any of those get disjoint names in a shared dir rather than clobbering each other:
-- `.bin` — the libllama state (unchanged format);
+- `.bin` (the libllama state; this fork does not change its format, but **upstream versions it**:
+  see [`README.md`](README.md#engine-state-file-format-bin-and-upstream-version-bumps) for what a
+  `LLAMA_STATE_SEQ_VERSION` bump does to an existing store, which happened at the 2026-08-29 merge);
 - `.logits` — PR 1's regenerate sidecar;
 - `.meta` — **new**: header + full fingerprint + `tok_count` + `chain_hash` + the raw int32 token IDs.
 
