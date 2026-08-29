@@ -1739,7 +1739,9 @@ private:
 
     // P0.1 (anchored-resume): does THIS model's memory class actually honour a position range in
     // state_write_range? The base-class default (src/llama-memory.h:132-136) IGNORES [p0,p1) and
-    // writes the WHOLE sequence, and only 4 of the 7+ memory implementations override it. On a
+    // writes the WHOLE sequence, and only 4 of the 7+ memory implementations honour it (a fifth,
+    // llama_memory_hybrid_idx, overrides it only to fall BACK to that default whenever the model
+    // carries an indexer, so this probe is what turns deltas off there; see [TAG_HYBRID_IDX_STATE]). On a
     // non-overriding class a "delta node" silently contains [0,N); composing root [0,lo) + that node
     // under NO_CLEAR yields DUPLICATE cells per position => wrong attention, silently.
     // We cannot ask the engine (no API reports what it serialised) and we cannot sniff the blob

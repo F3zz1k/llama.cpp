@@ -209,6 +209,28 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 
 }
 
+void llama_memory_hybrid_idx::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    if (!mem_idx) {
+        // no indexer section to lose, so the base class's attn-delta + whole-recurrent split is correct
+        llama_memory_hybrid::state_write_range(io, seq_id, p0, p1, flags);
+
+        return;
+    }
+
+    // [TAG_HYBRID_IDX_STATE] llama_memory_hybrid::state_write_range would emit the attention delta and
+    // the whole recurrent state, but NOT the indexer section that state_read above always reads back.
+    // Even written correctly, such a delta could not be composed: the indexer restore adopts the
+    // attention cache's slot layout ([TAG_HYBRID_IDX_SINFO]) and state_read_meta refuses a mirrored
+    // layout under NO_CLEAR. So ignore [p0, p1) and write the WHOLE sequence, exactly as the
+    // llama_memory_i base does for every class that does not override this. The server's delta
+    // capability probe then measures nwrite == nwhole and this instance only ever publishes whole
+    // roots. Revisit together with the NO_CLEAR + sinfo_in restriction, not before.
+    (void) p0;
+    (void) p1;
+
+    state_write(io, seq_id, flags);
+}
+
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
