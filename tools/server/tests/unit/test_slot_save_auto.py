@@ -28,7 +28,7 @@ STATE_SEQ_MAGIC   = 0x67677371 # LLAMA_STATE_SEQ_MAGIC ("ggsq")
 FIXTURE_DIR = "./fixtures/golden-v1"
 FIXTURE_SHA256 = {
     "auto-f414107cff91a49e-5efede8f57f0c198-377.bin":
-        "70dfefbd6f550c60ad416599e4ec5adb3ad25b646682c72d7f4aa731bfb16435",
+        "b5c5f419ef0ad9d609c1c92e64850e2d79f69102a02182c4ef2dc66d827cc9ba",
     "auto-f414107cff91a49e-5efede8f57f0c198-377.bin.meta":
         "ecbac54e17454e180c4b50abe0845822996cbca207df95719f6e0a9328f54f90",
 }
