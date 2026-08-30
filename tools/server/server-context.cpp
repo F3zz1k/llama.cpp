@@ -6676,8 +6676,6 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        slot.stats.n_prompt_processed++;
-
                         // mid-prefill shared-context base (Option A): stop this batch EXACTLY at the
                         // block-aligned first-user boundary B_ctx, never crossing it, so that once this
                         // batch is decoded the slot's resident sequence is precisely [0, B_ctx) — the
