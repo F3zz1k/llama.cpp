@@ -2399,6 +2399,19 @@ static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
     }
 }
 
+// largest k the SLM-resident selection kernel can serve: it allocates
+// block_size*k floats + ints of local memory, so 32 is the practical cap
+#define GGML_SYCL_TOP_K_SLM_MAX 32
+// argsort launches one workgroup per row, so a large-k sort only uses the
+// machine when there are many rows. At or above this many rows (prefill) the
+// GPU path always wins.
+#define GGML_SYCL_TOP_K_MIN_ROWS 32
+// With fewer rows than that (decode is exactly one) the per-row bitonic is
+// serialised onto a single workgroup, and beyond this width the host round-trip
+// plus a CPU partial_sort is cheaper. Measured crossover on B70 is between
+// 8192 and 32768.
+#define GGML_SYCL_TOP_K_FEW_ROWS_MAX_COLS 16384
+
 static void top_k_f32_sycl(
     const float * src,
     int32_t * dst_indices,
@@ -2896,10 +2909,39 @@ static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const int64_t ncols = src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
 
-    GGML_ASSERT(k > 0 && k <= 32);
+    GGML_ASSERT(k > 0);
     GGML_ASSERT(k <= ncols);
 
-    top_k_f32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    if (k <= GGML_SYCL_TOP_K_SLM_MAX) {
+        top_k_f32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+        return;
+    }
+
+    // top_k_f32_sycl sizes its SLM scratch as block_size*k, so it cannot serve
+    // large k (qwen4exp's sparse-attention indexer asks for 2048+). Fall back to
+    // a full descending argsort and keep the first k of each row, which is what
+    // the CUDA backend does for every k via CUB.
+    ggml_sycl_pool_alloc<int> sorted_alloc(ctx.pool(), (size_t) nrows * (size_t) ncols);
+    int * sorted = sorted_alloc.get();
+
+    argsort_f32_i32_sycl(src0_dd, sorted, ncols, nrows, GGML_SORT_ORDER_DESC,
+                         main_stream, ctx.device, ctx.pool());
+
+    const size_t    kk      = (size_t) k;
+    const size_t    stride  = (size_t) ncols;
+    const size_t    total   = (size_t) nrows * kk;
+    constexpr size_t block_size = 256;
+    const size_t    nblocks = (total + block_size - 1) / block_size;
+
+    main_stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(nblocks * block_size), sycl::range<1>(block_size)),
+        [=](sycl::nd_item<1> item_ct1) {
+            const size_t i = item_ct1.get_global_linear_id();
+            if (i >= total) {
+                return;
+            }
+            dst_dd[i] = sorted[(i / kk) * stride + (i % kk)];
+        });
 }
 
 inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -6292,11 +6334,28 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_TOP_K: {
             const ggml_tensor * src0 = op->src[0];
             const int k = op->ne[0];
-            return src0 &&
-                op->type == GGML_TYPE_I32 &&
-                src0->type == GGML_TYPE_F32 &&
-                ggml_is_contiguous(src0) &&
-                k > 0 && k <= 32;
+            if (!src0 ||
+                op->type != GGML_TYPE_I32 ||
+                src0->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src0) ||
+                k <= 0) {
+                return false;
+            }
+            if (k <= GGML_SYCL_TOP_K_SLM_MAX) {
+                return true;
+            }
+            // Large k is served by a full argsort, which launches one workgroup
+            // per row. With many rows (prefill) that saturates the device and is
+            // a large win over round-tripping the scores to the host.
+            if (ggml_nrows(src0) >= GGML_SYCL_TOP_K_MIN_ROWS) {
+                return true;
+            }
+            // With few rows the sort is serialised onto a single workgroup and
+            // its cost grows with width, so past a point the CPU is cheaper.
+            // Returning false here leaves the node on the CPU, which is exactly
+            // the pre-patch behaviour for that case.
+            GGML_UNUSED(device);
+            return next_power_of_2(src0->ne[0]) <= GGML_SYCL_TOP_K_FEW_ROWS_MAX_COLS;
         }
         case GGML_OP_POOL_2D:
         case GGML_OP_POOL_1D:
