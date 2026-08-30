@@ -3039,10 +3039,30 @@ static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const int64_t ncols = src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
 
-    GGML_ASSERT(k > 0 && k <= 32);
+    GGML_ASSERT(k > 0);
     GGML_ASSERT(k <= ncols);
 
-    top_k_f32_sycl(ctx, src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    if (k <= 32) {
+        top_k_f32_sycl(ctx, src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    } else {
+        // The dedicated top-k kernel caps at k <= 32. Larger k (e.g. the GLM-5.3-Flash DSA
+        // indexer selecting top_k/kpool = 512 pools per token) falls back to a descending
+        // argsort plus a copy of the first k indices per row, mirroring the CUDA fallback.
+        // Note: this is a full O(n log^2 n) sort, not a selection - fine up to the ctx where
+        // the single-launch bitonic path stays resident, but it dominates the 1M-ctx prefill
+        // indexer; a proper selection kernel is the follow-up if that matters.
+        ggml_sycl_pool_alloc<int32_t> idx_all(ctx.pool(), (size_t) ncols * (size_t) nrows);
+        int32_t * idx_all_dd = idx_all.get();
+
+        argsort_f32_i32_sycl(src0_dd, idx_all_dd, ncols, nrows, GGML_SORT_ORDER_DESC,
+                             main_stream, ctx.device, ctx.pool());
+
+        main_stream->parallel_for(sycl::range<1>((size_t) nrows * (size_t) k),
+                                  [=](sycl::id<1> idx) {
+                                      const size_t i = idx[0];
+                                      dst_dd[i] = idx_all_dd[(i / (size_t) k) * (size_t) ncols + (i % (size_t) k)];
+                                  });
+    }
 }
 
 inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
