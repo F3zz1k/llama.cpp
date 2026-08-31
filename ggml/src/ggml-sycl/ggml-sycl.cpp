@@ -2443,8 +2443,12 @@ static void top_k_f32_sycl(
                 float local_vals[32];
                 int local_idx[32];
 
+                // -INFINITY, not -FLT_MAX. The insert test below is a strict `>`, so a row
+                // value equal to the sentinel is never selectable; with -FLT_MAX that silently
+                // excludes the smallest finite float. This is independent of the unfilled-slot
+                // repair further down, which is what fixes the all -INFINITY row.
                 for (int i = 0; i < k; i++) {
-                    local_vals[i] = -FLT_MAX;
+                    local_vals[i] = -INFINITY;
                     local_idx[i] = -1;
                 }
 
@@ -2476,8 +2480,9 @@ static void top_k_f32_sycl(
                     float final_vals[32];
                     int final_idx[32];
 
+                    // see the note on the per-thread sentinel above
                     for (int i = 0; i < k; i++) {
-                        final_vals[i] = -FLT_MAX;
+                        final_vals[i] = -INFINITY;
                         final_idx[i] = -1;
                     }
 
@@ -2502,10 +2507,58 @@ static void top_k_f32_sycl(
                         }
                     }
 
+                    // A slot keeps its sentinel index whenever fewer than k of the row's
+                    // values compare greater than -INFINITY: an all -INFINITY row, or any row
+                    // with fewer than k finite values. Writing -1 out as though it were a
+                    // selected column is an out-of-range index that the consumer then uses
+                    // (ggml_get_rows / ggml_set_rows), which on a GPU is an out-of-bounds
+                    // device access, not a wrong number.
+                    //
+                    // ggml_top_k asserts k <= ne00, so there are always enough columns to
+                    // finish the row. What the op guarantees is k DISTINCT column indices in
+                    // [0, ne00); which of a set of tied columns is taken is not part of the
+                    // contract, and every column left unselected here is tied at the sentinel,
+                    // so the multiset of selected values is the same whichever of them is used.
+                    // Filling each hole with the lowest column not already selected satisfies
+                    // that with no extra state. k <= 32 here and only one work-item runs this,
+                    // so the O(k^2) scan costs nothing.
+                    //
+                    // Where ggml_compute_forward_top_k_f32's comparator additionally breaks
+                    // ties on the lower id, this reproduces the CPU result exactly. That
+                    // tie-break is not guaranteed by the op, so the repair does not rely on it.
+                    //
+                    // The largest column this can reach is k-1 (h holes take the h smallest
+                    // integers outside a set of k-h already-selected columns), so it is always
+                    // in range, and the result is always k distinct columns.
+                    int next_col = 0;
+                    for (int i = 0; i < k; i++) {
+                        if (final_idx[i] >= 0) {
+                            continue;
+                        }
+                        for (bool taken = true; taken; ) {
+                            taken = false;
+                            for (int j = 0; j < k; j++) {
+                                if (final_idx[j] == next_col) {
+                                    taken = true;
+                                    break;
+                                }
+                            }
+                            if (taken) {
+                                next_col++;
+                            }
+                        }
+                        final_idx[i] = next_col;
+                        next_col++;
+                    }
+
                     for (int i = 0; i < k; i++) {
                         dst_idx_row[i] = final_idx[i];
                     }
 
+                    // Mirrors ggml_compute_forward_top_k_f32: the order of the k indices is
+                    // not part of the op's contract, and swapping the first two keeps callers
+                    // from quietly depending on it. Not a bug, and not ours -- it is in
+                    // upstream's CPU and SYCL backends both.
                     if (k > 1) {
                         int32_t temp = dst_idx_row[0];
                         dst_idx_row[0] = dst_idx_row[1];
