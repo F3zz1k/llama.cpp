@@ -4,6 +4,8 @@
 #include "ggml-quants.h"
 
 #include <vector>
+#include <algorithm>
+#include <cstdint>
 
 namespace utils {
 template<typename T>
@@ -556,6 +558,38 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    // DEBUG INSTRUMENT (GGML_SYCL_SET_ROWS_CHECK=1): SET_ROWS writes dst row `idx`; an index
+    // outside [0, dst->ne[1]) is an out-of-bounds device write and shows up as a GPU page fault
+    // attributed to a later op. Report the range instead.
+    {
+        static const int check = ggml_sycl_get_env("GGML_SYCL_SET_ROWS_CHECK", 0);
+        if (check) {
+            const size_t n = ggml_nbytes(src1);
+            std::vector<char> h(n);
+            ctx.stream()->memcpy(h.data(), src1->data, n);
+            ctx.stream()->wait();
+            int64_t lo = INT64_MAX, hi = INT64_MIN, nbad = 0;
+            const int64_t nrow = dst->ne[1];
+            for (int64_t i2 = 0; i2 < src1->ne[2]; i2++) {
+                for (int64_t i1 = 0; i1 < src1->ne[1]; i1++) {
+                    for (int64_t i0 = 0; i0 < src1->ne[0]; i0++) {
+                        const char * p = h.data() + i0*src1->nb[0] + i1*src1->nb[1] + i2*src1->nb[2];
+                        const int64_t v = src1->type == GGML_TYPE_I64 ? *(const int64_t *) p : (int64_t) *(const int32_t *) p;
+                        lo = std::min(lo, v); hi = std::max(hi, v);
+                        if (v < 0 || v >= nrow) { nbad++; }
+                    }
+                }
+            }
+            fprintf(stderr, "[SET_ROWS_CHECK] dst='%s' ne=[%lld,%lld,%lld,%lld] idx='%s' ne=[%lld,%lld,%lld,%lld] "
+                            "idx_min=%lld idx_max=%lld nrow=%lld OOB=%lld\n",
+                    dst->name, (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                    src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                    (long long) lo, (long long) hi, (long long) nrow, (long long) nbad);
+            fflush(stderr);
+            if (nbad) { GGML_ABORT("SET_ROWS index out of range"); }
+        }
+    }
 
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I64 || dst->src[1]->type == GGML_TYPE_I32);
