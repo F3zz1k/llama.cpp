@@ -6110,29 +6110,65 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+//
+// fill_mode controls how initialize_tensors builds each row.
+//
+//   FILL_DENSE      a shuffled permutation of 0..ne0-1, optionally with duplicates (ties).
+//                   Every column is selectable, so top_k is fully determined up to ties.
+//
+//   FILL_SPARSE     n_sel columns hold distinct finite values, every other column holds
+//                   -INFINITY. When n_sel < k the correct answer needs k - n_sel columns
+//                   that are all tied at -INFINITY, which is the case a backend gets wrong
+//                   if it treats "no candidate beat my sentinel" as "no index".
+//
+//   FILL_TWO_FLOORS no finite values at all: n_sel columns hold -FLT_MAX and the rest hold
+//                   -INFINITY. -FLT_MAX is a perfectly ordinary float and must be selected
+//                   in preference to -INFINITY. A backend that seeds its running best with
+//                   -FLT_MAX and inserts on a strict `>` can never select it.
+//
+// ggml_top_k's contract, from ggml_compute_forward_top_k_f32 and ggml_top_k:
+//   - k <= ne0 is asserted at graph build time
+//   - the result is k of the row's column indices, so in [0, ne0) and all distinct
+//   - ties resolve to the lower id (cmp_top_k)
+//   - the ORDER of the k indices is explicitly not meaningful: the CPU reference swaps
+//     entries 0 and 1 on purpose to stop callers depending on it
+// So for any input with ties a backend result cannot be compared elementwise. err() below
+// compares the multiset of SELECTED VALUES instead, and separately asserts the structural
+// invariants (in range, distinct).
 struct test_top_k : public test_case {
+    enum fill_mode { FILL_DENSE, FILL_SPARSE, FILL_TWO_FLOORS };
+
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const int k;
     const bool ties;
+    const fill_mode fill;
+    const int n_sel;
     ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, k, ties);
+        const char * fill_str = fill == FILL_DENSE  ? "dense" :
+                                fill == FILL_SPARSE ? "sparse" : "two_floors";
+        return VARS_TO_STR4(type, ne, k, ties) +
+               ",fill=" + fill_str + ",n_sel=" + std::to_string(n_sel);
     }
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
-        : type(type), ne(ne), k(k), ties(ties) {}
+            int k = 4, bool ties = false,
+            fill_mode fill = FILL_DENSE, int n_sel = 0)
+        : type(type), ne(ne), k(k), ties(ties), fill(fill), n_sel(n_sel) {}
 
     double max_err() override {
         return 0.0;
     }
 
+    // Every non-dense fill has ties by construction.
+    bool has_ties() const { return ties || fill != FILL_DENSE; }
+
     // When there are ties, only validate the final result.
     // The logic in err can't handle the sentinel tensors.
-    bool run_whole_graph() override { return ties; }
+    bool run_whole_graph() override { return has_ties(); }
 
     double err(const float * a, const float * b, size_t n) override {
         // When there are no ties, we expect the exact same set of indices,
@@ -6140,7 +6176,7 @@ struct test_top_k : public test_case {
         // can be different but the input values they correspond to should be
         // the same. The logic for ties could work for non-ties, but only for
         // the output tensor, not for the sentinel tensors.
-        if (ties) {
+        if (has_ties()) {
             std::vector<float> src(ggml_nelements(input));
 
             ggml_backend_tensor_get(input, src.data(), 0, ggml_nelements(input) * ggml_type_size(type));
@@ -6158,6 +6194,17 @@ struct test_top_k : public test_case {
                 for (int64_t c = 0; c < k; c++) {
                     ia[c] = (int32_t)a[r * k + c];
                     ib[c] = (int32_t)b[r * k + c];
+                }
+                // Every index must be a column of the input. Check this BEFORE using it:
+                // a backend that emits its own sentinel (-1 is the obvious one) would
+                // otherwise make the comparison below read outside src.
+                bool in_range = true;
+                for (int64_t c = 0; c < k; c++) {
+                    if (ia[c] < 0 || ia[c] >= cols) { diff += 1; in_range = false; }
+                    if (ib[c] < 0 || ib[c] >= cols) { diff += 1; in_range = false; }
+                }
+                if (!in_range) {
+                    continue;
                 }
                 // The src values for each row should match.
                 for (int64_t c = 0; c < k; c++) {
@@ -6213,17 +6260,33 @@ struct test_top_k : public test_case {
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             int tie_denom = std::max(1, std::min(10, k / 2));
+            std::vector<int> perm(t->ne[0]);
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<float> data(t->ne[0]);
-                for (int i = 0; i < t->ne[0]; i++) {
-                    if (ties) {
-                        // integer division to introduce duplicates
-                        data[i] = i / tie_denom;
-                    } else {
-                        data[i] = i;
+                if (fill == FILL_DENSE) {
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        if (ties) {
+                            // integer division to introduce duplicates
+                            data[i] = i / tie_denom;
+                        } else {
+                            data[i] = i;
+                        }
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                } else {
+                    // scatter the n_sel selectable columns over the row so the answer does
+                    // not depend on which work-item happens to see them
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        perm[i] = i;
+                    }
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    std::fill(data.begin(), data.end(), -INFINITY);
+                    for (int i = 0; i < n_sel && i < t->ne[0]; i++) {
+                        // distinct so the top-n_sel set is unambiguous, except for
+                        // FILL_TWO_FLOORS where the whole point is that they are tied
+                        data[perm[i]] = fill == FILL_TWO_FLOORS ? -FLT_MAX : (float) (i + 1);
                     }
                 }
-                std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
             }
         }
@@ -9835,6 +9898,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2047, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
+    }
+
+    // Rows where fewer than k values are selectable. The SYCL SLM kernel used to leave the
+    // slots it never filled at its sentinel index -1 and write that out as a selected column,
+    // which the consumers (get_rows/set_rows) then dereference. k <= 32 exercises the SLM
+    // selection kernel, k > 32 the argsort fallback. nrows and cols are chosen so both stay
+    // on the SYCL backend: for k > 32 its supports_op needs nrows >= 32 or ne0 rounded up to
+    // a power of two <= 16384.
+    for (int k : {1, 2, 4, 7, 16, 32, 33, 64, 100}) {
+        for (int64_t cols : {128, 1024, 8192}) {
+            if (k > cols) {
+                continue;
+            }
+            for (int64_t nrows : {4, 32}) {
+                std::set<int> n_sel_cases = {0, 1, k / 2, k - 1, k};
+                for (int n_sel : n_sel_cases) {
+                    if (n_sel < 0 || n_sel > cols) {
+                        continue;
+                    }
+                    // n_sel finite values, every other column -INFINITY
+                    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k,
+                                                           false, test_top_k::FILL_SPARSE, n_sel));
+                    // no finite values at all: n_sel columns at -FLT_MAX, the rest -INFINITY
+                    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k,
+                                                           false, test_top_k::FILL_TWO_FLOORS, n_sel));
+                }
+            }
+        }
     }
 
     // exhaustive top_k tests
