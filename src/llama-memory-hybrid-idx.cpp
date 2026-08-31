@@ -537,9 +537,47 @@ void llama_memory_hybrid_idx_context::set_input_kpool(
 
         int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pool);
 
+        // Cells that no query should ever reach still have to hold SOMETHING, and it must be
+        // a cell the KQ mask rejects rather than merely an in-range one.
+        //
+        // pool_bias below scores an unpickable pool -INFINITY, but ggml_top_k returns k
+        // indices unconditionally: when fewer than n_sel pools are pickable, every remaining
+        // slot is tied at -INFINITY and the op is free to return any columns for them. Those
+        // surplus pool ids are then gathered through ggml_get_rows and their cells are
+        // UNMASKED by build_attn_mask_top_k, so a filler pool's cells are reachable even
+        // though its bias was -INFINITY. Cell 0 is the worst possible choice: in a cache that
+        // starts at position 0 it is live and causally visible to every query, so the query
+        // would attend to position 0 on top of what the indexer actually selected.
+        //
+        // This is a property of the op's contract, not of one backend: the CPU reference
+        // returns k in-range indices for an all -INFINITY row too.
+        llama_pos max_pos         = -1;
+        int32_t   pad_masked      = -1;
+        int32_t   cell_of_max_pos = -1;
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j) || !cells.seq_has(j, seq_of_stream)) {
+                pad_masked = (int32_t) j; // the KQ mask rejects it for every query below
+                continue;
+            }
+
+            const llama_pos p = cells.pos_get(j);
+
+            if (p > max_pos) {
+                max_pos         = p;
+                cell_of_max_pos = (int32_t) j;
+            }
+        }
+
+        // there is no rejected cell only when the cache is full and holds this sequence alone.
+        // Its highest position is then masked for every query but the last one of the ubatch,
+        // which is the same fallback the tail padding below settles for.
+        const int32_t pool_pad = pad_masked      >= 0 ? pad_masked :
+                                 cell_of_max_pos >= 0 ? cell_of_max_pos : 0;
+
         // pool b covers token positions [b*r, (b+1)*r)
         std::fill(filled.begin(), filled.end(), 0);
-        std::fill(cur_pool_cells, cur_pool_cells + r*n_pool, 0);
+        std::fill(cur_pool_cells, cur_pool_cells + r*n_pool, pool_pad);
 
         for (int64_t j = 0; j < n_kv; ++j) {
             // a unified cache holds every sequence in one cell array, so a cell from another
@@ -560,27 +598,16 @@ void llama_memory_hybrid_idx_context::set_input_kpool(
             filled[b]++;
         }
 
-        // an incomplete pool has no pool key: pool_bias below never lets a query pick it, and
-        // cell 0 in pool_cells only keeps the gather in range
+        // an incomplete pool has no pool key, so pool_bias never scores it above -INFINITY.
+        // Its cells are still reachable as a top_k filler, hence pool_pad and not 0: see the
+        // note above.
         for (int64_t b = 0; b < n_pool; ++b) {
             if (filled[b] < (int32_t) r) {
-                std::fill(cur_pool_cells + b*r, cur_pool_cells + (b + 1)*r, 0);
+                std::fill(cur_pool_cells + b*r, cur_pool_cells + (b + 1)*r, pool_pad);
             }
         }
 
-        llama_pos max_pos    = -1;
-        int32_t   pad_masked = -1;
-
         if (dst_tail_cells) {
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (cells.is_empty(j) || !cells.seq_has(j, seq_of_stream)) {
-                    pad_masked = (int32_t) j; // the KQ mask rejects it for every query below
-                    continue;
-                }
-
-                max_pos = std::max(max_pos, cells.pos_get(j));
-            }
-
             cell_of_pos.assign(max_pos + 1, -1);
 
             for (int64_t j = 0; j < n_kv; ++j) {
