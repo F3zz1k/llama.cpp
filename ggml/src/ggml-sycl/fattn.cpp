@@ -275,6 +275,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 }
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+
     ggml_sycl_set_device(ctx.device);
 
     // n_kv watchdog: log when n_kv differs from the last FA call with
