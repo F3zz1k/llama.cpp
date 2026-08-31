@@ -2944,6 +2944,33 @@ inline void ggml_sycl_op_argsort(ggml_backend_sycl_context & ctx, ggml_tensor * 
                          main_stream, ctx.device, ctx.pool());
 }
 
+// DEBUG INSTRUMENT, off unless GGML_SYCL_SET_ROWS_CHECK=1.
+// Reports the index range GGML_OP_TOP_K produced. Its consumers are ggml_get_rows and
+// ggml_set_rows, so an index outside [0, ne00) here becomes an out-of-bounds device access
+// several nodes later, where it is unattributable.
+static void ggml_sycl_top_k_check(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    static const int check = ggml_sycl_get_env("GGML_SYCL_SET_ROWS_CHECK", 0);
+    if (!check) {
+        return;
+    }
+    const size_t n = ggml_nbytes(dst);
+    std::vector<char> h(n);
+    ctx.stream()->memcpy(h.data(), dst->data, n);
+    ctx.stream()->wait();
+    const int32_t * v   = (const int32_t *) h.data();
+    const int64_t   cnt = (int64_t) (n / sizeof(int32_t));
+    int32_t lo = INT32_MAX, hi = INT32_MIN;
+    for (int64_t i = 0; i < cnt; i++) {
+        lo = std::min(lo, v[i]);
+        hi = std::max(hi, v[i]);
+    }
+    const int64_t ncols = dst->src[0] ? dst->src[0]->ne[0] : -1;
+    fprintf(stderr, "[TOP_K_CHECK] dst='%s' ne=[%lld,%lld,%lld,%lld] src0_ncols=%lld min=%d max=%d\n",
+            dst->name, (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+            (long long) dst->ne[3], (long long) ncols, lo, hi);
+    fflush(stderr);
+}
+
 static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
 
@@ -5467,6 +5494,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K:
             ggml_sycl_op_top_k(ctx, dst);
+            ggml_sycl_top_k_check(ctx, dst);
             break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             ggml_sycl_op_timestep_embedding(ctx, dst);
@@ -5740,7 +5768,36 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    // DEBUG INSTRUMENT, off unless GGML_SYCL_SYNC_EACH_OP=1.
+    // SYCL submission is asynchronous, so a kernel that faults or does not terminate is
+    // reported at the next hard sync point in the graph, not at the node that issued it.
+    // Synchronising after every dispatched node costs a full pipeline drain per node and is
+    // far too slow for normal use, but it turns "the graph died somewhere" into a node index.
+    // Pair it with UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1 so a copy enqueued onto a lost
+    // context returns DEVICE_LOST instead of spinning inside zeCommandListAppendMemoryCopy.
+    static const int sync_each_op = ggml_sycl_get_env("GGML_SYCL_SYNC_EACH_OP", 0);
+
+    ggml_tensor * pending_node = nullptr;
+    int           pending_i    = -1;
+
+    auto sync_pending = [&]() {
+        if (!sync_each_op || pending_node == nullptr) {
+            return;
+        }
+        fprintf(stderr, "[SYNC] wait  node %4d %-20s '%s' ne=[%lld,%lld,%lld,%lld]\n",
+                pending_i, ggml_op_name(pending_node->op), pending_node->name,
+                (long long) pending_node->ne[0], (long long) pending_node->ne[1],
+                (long long) pending_node->ne[2], (long long) pending_node->ne[3]);
+        fflush(stderr);
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->wait()));
+        fprintf(stderr, "[SYNC] ok    node %4d\n", pending_i);
+        fflush(stderr);
+        pending_node = nullptr;
+        pending_i    = -1;
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        sync_pending();
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
@@ -5748,6 +5805,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        pending_node = node;
+        pending_i    = i;
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
@@ -5796,6 +5856,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+
+    sync_pending();
 }
 
 #ifdef GGML_SYCL_GRAPH
