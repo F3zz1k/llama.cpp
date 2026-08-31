@@ -2945,6 +2945,8 @@ inline void ggml_sycl_op_argsort(ggml_backend_sycl_context & ctx, ggml_tensor * 
 }
 
 static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+
     const ggml_tensor * src0 = dst->src[0];
 
     GGML_ASSERT(src0);
