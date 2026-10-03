@@ -1168,8 +1168,8 @@ struct server_slot {
 
     // --- KV restore-reuse (logits sidecar) ---
     // Full-vocab logits of this slot's most recently sampled token, captured at sample time
-    // (only populated for FULL models when --slot-save-path is set; RS/recurrent contexts are
-    // excluded by that predicate, see the F4 note at the ARM fallback). Serialized to the
+    // (only populated for the FULL and RS classes when --slot-save-path is set, see
+    // logits_sidecar_class(); plain attention rewinds by one token instead). Serialized to the
     // <state>.logits sidecar on SLOT_SAVE so a later exact-prompt "regenerate" can emit the first
     // token WITHOUT re-decoding into the (un-rewindable) restored recurrent state.
     std::vector<float> logits_last;     // size n_vocab when valid, else empty
@@ -2159,6 +2159,17 @@ private:
                n_swa_mem > 0;
     }
 
+    // The memory classes whose disk units carry a regenerate logits sidecar: the ones that cannot rewind
+    // by one token (FULL refuses any partial seq_rm; RS keeps rollback rows only in memory, never in a
+    // saved state, so a restored RS sequence cannot rewind either). For them an exact resend of a saved
+    // unit would otherwise re-decode the whole prompt to obtain the last token's logits. RS is what a
+    // hybrid model becomes as soon as a draft (MTP) asks for rollback rows, so without it here the same
+    // request costs nothing with MTP off and a full prefill with MTP on.
+    bool logits_sidecar_class() const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    }
+
     // An SWA snapshot whose cells all fit inside one window was persisted WHOLE. state_write drops
     // only the cells masked against the snapshot's OWN pos_max, and while every position is below
     // n_swa_mem nothing is masked (STANDARD keeps p1 - p0 < n_swa, CHUNKED keeps the first chunk).
@@ -2747,10 +2758,10 @@ private:
         slot.logits_last.clear();
         slot.logits_last_n_tokens = -1;
 
-        // Load the regenerate logits sidecar (FULL only) so an exact-prompt regenerate can emit the
+        // Load the regenerate logits sidecar (FULL and RS) so an exact-prompt regenerate can emit the
         // first token without re-decoding into the restored recurrent state.
         slot.restored_logits.clear();
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        if (logits_sidecar_class()) {
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             if (slot_logits_read(node_paths.back(), nv, (uint32_t) token_count, slot.restored_logits)) {
                 SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
@@ -3450,9 +3461,9 @@ private:
                 }
             }
         }
-        // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
+        // 2) regenerate logits sidecar on the temp path (FULL and RS, and only when the captured
         //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+        if (logits_sidecar_class() &&
             slot.logits_last_n_tokens == (int32_t) snap_toks.size() && !slot.logits_last.empty()) {
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) snap_toks.size());
@@ -5837,7 +5848,7 @@ private:
                     // left over from a prior task on this slot object) from persisting a sidecar that
                     // does not match the saved state — which would otherwise emit a wrong first token
                     // on a later regenerate with nothing to catch it.
-                    if (nwrite > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                    if (nwrite > 0 && logits_sidecar_class()) {
                         if (slot->logits_last_n_tokens == (int32_t) token_count && !slot->logits_last.empty()) {
                             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
                             const size_t nwrite_logits =
@@ -6799,7 +6810,7 @@ private:
                             // needs no free context slot; a full-n_ctx no-suffix restore is handled
                             // here rather than falling through to a zero-token-added crash window.
                             if (slot.just_restored &&
-                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                                logits_sidecar_class() &&
                                 slot.task->need_sampling() &&
                                 slot.alora_invocation_start <= 0 &&
                                 n_past == slot.task->n_tokens() &&
@@ -7664,16 +7675,15 @@ private:
             }
 
             // Feature A: capture this slot's last-token full-vocab logits for a possible disk
-            // save. Cost: one ~n_vocab*4-byte copy per decoded token, incurred ONLY on FULL models
-            // AND only when slot saving is enabled (--slot-save-path set); RS/recurrent contexts are
-            // excluded by the predicate below (see the F4 note at the ARM fallback), and attention
-            // models and servers without slot-save pay nothing at all. The copy is
+            // save. Cost: one ~n_vocab*4-byte copy per decoded token, incurred ONLY on the FULL and RS
+            // classes (logits_sidecar_class) AND only when slot saving is enabled (--slot-save-path
+            // set); attention models and servers without slot-save pay nothing at all. The copy is
             // unavoidable for correctness: ctx logits are overwritten by the next slot's decode,
             // so a lazy read at SLOT_SAVE would be wrong under --parallel>1. Captured per-slot
             // from this slot's own tok_idx so it is correct for any N/interleave (never read
             // from the shared ctx at save time). common_sampler_sample already synchronized the
             // context above, so llama_get_logits_ith is valid here.
-            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && !params_base.slot_save_path.empty()) {
+            if (logits_sidecar_class() && !params_base.slot_save_path.empty()) {
                 const float * lg = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
                 if (lg) {
                     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
@@ -7768,9 +7778,12 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
-                slot.spec_i_batch.clear();
-
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // the row the last accepted token was sampled from, for the logits capture below
+                const int32_t i_row_last = accepted.size() <= slot.spec_i_batch.size() ?
+                    slot.spec_i_batch[accepted.size() - 1] : -1;
+                slot.spec_i_batch.clear();
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -7813,6 +7826,21 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                // the same last-token logits capture as the non-speculative path (see Feature A there):
+                // the last accepted token was sampled from row i_row_last, and once the accepted tokens
+                // are added below, prompt.tokens is exactly the state whose final token produced them
+                if (logits_sidecar_class() && !params_base.slot_save_path.empty()) {
+                    const float * lg = i_row_last >= 0 ? llama_get_logits_ith(slot.ctx_tgt, i_row_last) : nullptr;
+                    if (lg) {
+                        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                        slot.logits_last.assign(lg, lg + nv);
+                        slot.logits_last_n_tokens = (int32_t) (slot.prompt.n_tokens() - n_draft + accepted.size() - 1);
+                    } else {
+                        slot.logits_last.clear();
+                        slot.logits_last_n_tokens = -1;
+                    }
+                }
 
                 slot.spec_draft = std::move(accepted);
             }
