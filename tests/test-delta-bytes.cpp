@@ -5,11 +5,14 @@
 //   A  (n_ctx = nctx_a) decodes the prompt in segments; after segment 0 it saves a whole root, after
 //      every later segment a [prev_end, -1) range delta, and at the end a whole file
 //   W  (nctx_a)  loads the whole file                               -> control
-//   C  (nctx_a)  composes root + deltas                             -> must equal A byte for byte
-//   D  (nctx_b)  composes root + deltas at another context size     -> cross-rung restore
-//   G  (nctx_a)  composes root + deltas that a nctx_b instance wrote after restoring the root (rung chain)
-// Then every context decodes the same forced continuation; logits and final state blobs are compared
-// against A.
+//   C  (nctx_a)  composes root + deltas                             -> must equal W byte for byte
+//   D  (nctx_b)  composes root + deltas at another context size     -> cross-rung restore, must equal W
+//   F  (nctx_b)  restores the root, extends it and writes its own deltas (a chain written on another rung)
+//   G  (nctx_a)  composes F's chain                                 -> must equal F byte for byte
+//   N  (nctx_a)  composes A's chain while a second sequence decodes between the nodes (interleaved,
+//                fragmented cells; --noise, needs --seqmax 2)        -> must equal W byte for byte
+// Then every context decodes the same forced continuation; logits and final state blobs are compared.
+// Controls: A2 repeats A exactly (determinism), A1 decodes the prompt in one call (order noise floor).
 
 #include "llama.h"
 
@@ -19,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -26,7 +30,7 @@
 
 static int g_fail = 0;
 
-#define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); g_fail++; } } while (0)
+#define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); printf("FAIL: " __VA_ARGS__); printf("\n"); g_fail++; } } while (0)
 
 struct opts {
     std::string model;
@@ -43,6 +47,8 @@ struct opts {
     int seq_b = 0; // the sequence every restore loads into
     uint32_t n_rs = 0;   // n_rs_seq (rollback snapshots, what MTP serving sets)
     int rollback = 0;    // after the last segment, decode this many draft tokens and roll them back
+    int noise = 0;       // tokens a second sequence decodes between chain nodes in context N
+    bool holes = false;  // also free some of the other sequence's oldest cells so nodes land in holes
 };
 static opts g_o;
 
@@ -74,12 +80,15 @@ static llama_context * make_ctx(llama_model * model, const opts & o, uint32_t n_
     return ctx;
 }
 
-static void decode(llama_context * ctx, const std::vector<llama_token> & toks, int p_begin, int p_end, int seq) {
+static void decode(llama_context * ctx, const std::vector<llama_token> & toks, int p_begin, int p_end, int seq, int pos_off = 0) {
     const int n = p_end - p_begin;
+    if (n <= 0) {
+        return;
+    }
     llama_batch b = llama_batch_init(n, 0, 1);
     for (int i = 0; i < n; ++i) {
         b.token[i] = toks[p_begin + i];
-        b.pos[i] = p_begin + i;
+        b.pos[i] = pos_off + p_begin + i;
         b.n_seq_id[i] = 1;
         b.seq_id[i][0] = seq;
         b.logits[i] = i == n - 1;
@@ -88,7 +97,7 @@ static void decode(llama_context * ctx, const std::vector<llama_token> & toks, i
     const int rc = llama_decode(ctx, b);
     llama_batch_free(b);
     if (rc != 0) {
-        fprintf(stderr, "decode [%d, %d) failed rc=%d\n", p_begin, p_end, rc);
+        fprintf(stderr, "decode [%d, %d) seq %d failed rc=%d\n", p_begin, p_end, seq, rc);
         exit(3);
     }
 }
@@ -161,17 +170,38 @@ static double max_abs_diff(const std::vector<std::vector<float>> & a, const std:
     return m;
 }
 
-static void load_chain(llama_context * ctx, const std::vector<std::string> & files, int n_expected_last) {
+static std::string per_token(const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b) {
+    std::string s;
+    char buf[32];
+    for (size_t i = 0; i < a.size(); ++i) {
+        double m = 0;
+        for (size_t j = 0; j < a[i].size(); ++j) {
+            m = std::max(m, (double) std::fabs(a[i][j] - b[i][j]));
+        }
+        snprintf(buf, sizeof(buf), " %.2g", m);
+        s += buf;
+    }
+    return s;
+}
+
+// between(i) runs before node i is loaded (i >= 1) and once after the last node (i == files.size())
+static void load_chain(llama_context * ctx, const std::vector<std::string> & files, int n_expected_last,
+        const std::function<void(size_t)> & between = nullptr) {
     std::vector<llama_token> tok(65536);
     for (size_t i = 0; i < files.size(); ++i) {
+        if (i > 0 && between) {
+            between(i);
+        }
         size_t n_out = 0;
         const llama_state_seq_flags fl = i == 0 ? 0 : LLAMA_STATE_SEQ_FLAGS_NO_CLEAR;
         const size_t r = llama_state_seq_load_file_ext(ctx, files[i].c_str(), g_o.seq_b, fl, tok.data(), tok.size(), &n_out);
         if (r == 0) {
-            fprintf(stderr, "FAIL: loading %s (flags %u) failed\n", files[i].c_str(), fl);
-            g_fail++;
+            CHECK(false, "loading %s (flags %u) failed", files[i].c_str(), fl);
             return;
         }
+    }
+    if (between) {
+        between(files.size());
     }
     const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx), g_o.seq_b);
     CHECK(pmax == n_expected_last - 1, "composed seq ends at %d, expected %d", pmax, n_expected_last - 1);
@@ -196,7 +226,13 @@ int main(int argc, char ** argv) {
         else if (a == "--seq-b") o.seq_b = std::atoi(next());
         else if (a == "--rs") o.n_rs = std::atoi(next());
         else if (a == "--rollback") o.rollback = std::atoi(next());
+        else if (a == "--noise") o.noise = std::atoi(next());
+        else if (a == "--holes") o.holes = true;
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
+    }
+    if (o.noise > 0 && o.n_seq_max < 2) {
+        fprintf(stderr, "--noise needs --seqmax 2\n");
+        return 1;
     }
 
     g_o = o;
@@ -217,46 +253,53 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> toks(n_prompt + o.n_gen);
     for (auto & t : toks) t = dis(rng);
     const std::vector<llama_token> cont(toks.begin() + n_prompt, toks.end());
+    std::vector<llama_token> noise_toks(4096);
+    for (auto & t : noise_toks) t = dis(rng);
 
     printf("model %s  splits", o.model.c_str());
     for (int s : o.splits) printf(" %d", s);
-    printf("  nctx_a %u nctx_b %u seqmax %u unified %d ubatch %u seq_a %d seq_b %d\n", o.nctx_a, o.nctx_b, o.n_seq_max, o.unified, o.n_ubatch, o.seq_a, o.seq_b);
+    printf("  nctx_a %u nctx_b %u seqmax %u unified %d ubatch %u seq_a %d seq_b %d rs %u rollback %d noise %d holes %d\n",
+            o.nctx_a, o.nctx_b, o.n_seq_max, o.unified, o.n_ubatch, o.seq_a, o.seq_b, o.n_rs, o.rollback, o.noise, (int) o.holes);
 
     const std::string pfx = o.tmpdir + "/chain";
     std::vector<std::string> files_a, files_g;
 
-    // ---- A: reference, writes root + deltas + whole
-    llama_context * A = make_ctx(model, o, o.nctx_a);
-    size_t n_whole_seg = 0;
-    {
+    // A's prompt schedule, reused verbatim by the A2 determinism control
+    auto run_prompt = [&](llama_context * X, bool save) {
         int prev = 0;
         for (size_t s = 0; s < o.splits.size(); ++s) {
             if (o.rollback > 0 && s + 1 == o.splits.size()) {
                 // an MTP verify step: one accepted token plus `rollback` drafts in one ubatch, all drafts
                 // rejected and rolled back (the accepted token keeps the rollback plane inside the ubatch)
-                decode(A, toks, prev, o.splits[s] - 1, o.seq_a);
-                decode(A, toks, o.splits[s] - 1, o.splits[s] + o.rollback, o.seq_a);
-                const bool ok = llama_memory_seq_rm(llama_get_memory(A), o.seq_a, o.splits[s], -1);
-                printf("  rollback of %d draft tokens at %d: %s\n", o.rollback, o.splits[s], ok ? "ok" : "REFUSED");
+                decode(X, toks, prev, o.splits[s] - 1, o.seq_a);
+                decode(X, toks, o.splits[s] - 1, o.splits[s] + o.rollback, o.seq_a);
+                const bool ok = llama_memory_seq_rm(llama_get_memory(X), o.seq_a, o.splits[s], -1);
+                if (save) printf("  rollback of %d draft tokens at %d: %s\n", o.rollback, o.splits[s], ok ? "ok" : "REFUSED");
                 CHECK(ok, "rollback refused");
             } else {
-                decode(A, toks, prev, o.splits[s], o.seq_a);
+                decode(X, toks, prev, o.splits[s], o.seq_a);
             }
-            const std::string f = pfx + ".a" + std::to_string(s) + ".bin";
-            size_t n;
-            if (s == 0) {
-                n = llama_state_seq_save_file(A, f.c_str(), o.seq_a, toks.data(), o.splits[s]);
-            } else {
-                n = llama_state_seq_save_file_range(A, f.c_str(), o.seq_a, prev, -1, toks.data(), o.splits[s]);
-                n_whole_seg = llama_state_seq_get_size(A, o.seq_a);
-                printf("  node %zu [%d,%d): delta file %zu B vs whole state %zu B%s\n", s, prev, o.splits[s], n, n_whole_seg,
-                        n + 64 >= n_whole_seg ? "   <-- NOT INCREMENTAL" : "");
+            if (save) {
+                const std::string f = pfx + ".a" + std::to_string(s) + ".bin";
+                size_t n;
+                if (s == 0) {
+                    n = llama_state_seq_save_file(X, f.c_str(), o.seq_a, toks.data(), o.splits[s]);
+                } else {
+                    n = llama_state_seq_save_file_range(X, f.c_str(), o.seq_a, prev, -1, toks.data(), o.splits[s]);
+                    const size_t n_whole = llama_state_seq_get_size(X, o.seq_a);
+                    printf("  node %zu [%d,%d): delta file %zu B vs whole state %zu B (%.0f%%)%s\n", s, prev, o.splits[s], n, n_whole,
+                            100.0*n/n_whole, n + 64 >= n_whole ? "   <-- NOT INCREMENTAL" : "");
+                }
+                CHECK(n > 0, "save node %zu", s);
+                files_a.push_back(f);
             }
-            CHECK(n > 0, "save node %zu", s);
-            files_a.push_back(f);
             prev = o.splits[s];
         }
-    }
+    };
+
+    // ---- A: reference, writes root + deltas + whole
+    llama_context * A = make_ctx(model, o, o.nctx_a);
+    run_prompt(A, true);
     const std::string fw = pfx + ".whole.bin";
     CHECK(llama_state_seq_save_file(A, fw.c_str(), o.seq_a, toks.data(), n_prompt) > 0, "save whole");
     const auto BA = blob(A, o.seq_a);
@@ -265,27 +308,46 @@ int main(int argc, char ** argv) {
     llama_context * W = make_ctx(model, o, o.nctx_a);
     load_chain(W, {fw}, n_prompt);
     const auto BW = blob(W, o.seq_b);
-    const bool w_eq = cmp_blob(o, "W(whole restore) vs A", BA, BW, "A", "W");
+    if (o.seq_a == o.seq_b) {
+        cmp_blob(o, "W(whole restore) vs A", BA, BW, "A", "W");
+    }
 
     // ---- C: compose at the same n_ctx
     llama_context * C = make_ctx(model, o, o.nctx_a);
     load_chain(C, files_a, n_prompt);
-    const auto BC = blob(C, o.seq_b);
-    if (!cmp_blob(o, "C(compose) vs A", BA, BC, "A", "C")) {
-        g_fail++;
-        if (!w_eq) {
-            cmp_blob(o, "C(compose) vs W", BW, BC, "W", "C");
-        }
-    }
+    if (!cmp_blob(o, "C(compose) vs W", BW, blob(C, o.seq_b), "W", "C")) g_fail++;
 
     // ---- D: compose at another n_ctx
     llama_context * D = make_ctx(model, o, o.nctx_b);
     load_chain(D, files_a, n_prompt);
-    const auto BD = blob(D, o.seq_b);
-    if (!cmp_blob(o, "D(compose, nctx_b) vs A", BA, BD, "A", "D")) g_fail++;
+    if (!cmp_blob(o, "D(compose, nctx_b) vs W", BW, blob(D, o.seq_b), "W", "D")) g_fail++;
+
+    // ---- N: compose while another sequence decodes between the nodes
+    llama_context * N = nullptr;
+    const int seq_noise = o.seq_b == 0 ? 1 : 0;
+    int noise_pos = 0;
+    if (o.noise > 0) {
+        N = make_ctx(model, o, o.nctx_a);
+        decode(N, noise_toks, 0, o.noise, seq_noise);
+        noise_pos = o.noise;
+        load_chain(N, files_a, n_prompt, [&](size_t i) {
+            // grow the other sequence, then punch a hole in it so the next node lands in fragmented cells
+            decode(N, noise_toks, noise_pos, noise_pos + o.noise, seq_noise);
+            noise_pos += o.noise;
+            if (o.holes && i < files_a.size()) {
+                // free a few of its oldest cells: rm [0, k) is legal on attention caches; recurrent/DSV4
+                // caches may refuse a non-tail removal, which only means less fragmentation
+                llama_memory_seq_rm(llama_get_memory(N), seq_noise, 0, std::min(o.noise/2, 8));
+            }
+        });
+        // with holes the sequence's cells are no longer in position order, so its blob lists the same
+        // cells in another order: only the logits below are a valid criterion then
+        if (!cmp_blob(o, "N(compose, interleaved) vs W", BW, blob(N, o.seq_b), "W", "N") && !o.holes) g_fail++;
+    }
 
     // ---- rung chain: an nctx_b instance restores the root, extends it and writes the deltas, then an
     //      nctx_a instance composes that chain
+    std::vector<uint8_t> BF;
     {
         llama_context * F = make_ctx(model, o, o.nctx_b);
         load_chain(F, {files_a[0]}, o.splits[0]);
@@ -293,7 +355,6 @@ int main(int argc, char ** argv) {
         int prev = o.splits[0];
         for (size_t s = 1; s < o.splits.size(); ++s) {
             if (o.rollback > 0 && s + 1 == o.splits.size()) {
-                // same ubatch boundaries as A, without the drafts: the clean reference for the rolled-back state
                 decode(F, toks, prev, o.splits[s] - 1, o.seq_b);
                 decode(F, toks, o.splits[s] - 1, o.splits[s], o.seq_b);
             } else {
@@ -304,40 +365,58 @@ int main(int argc, char ** argv) {
             files_g.push_back(f);
             prev = o.splits[s];
         }
-        const auto BF = blob(F, o.seq_b);
-        if (!cmp_blob(o, "F(root@a, extended@b) vs A", BA, BF, "A", "F")) {
-            printf("    (F recomputed segments after the root, so a difference here is numeric, not a cache defect)\n");
-        }
+        BF = blob(F, o.seq_b);
         llama_free(F);
     }
     llama_context * G = make_ctx(model, o, o.nctx_a);
     load_chain(G, files_g, n_prompt);
     const auto BG = blob(G, o.seq_b);
-    cmp_blob(o, "G(chain written @b) vs A", BA, BG, "A", "G");
+    if (!cmp_blob(o, "G(chain written @nctx_b) vs F", BF, BG, "F", "G")) {
+        g_fail++;
+        dump(o, "W", BW);
+        cmp_blob(o, "F vs W (numeric only, F recomputed)", BW, BF, "W", "F");
+        cmp_blob(o, "G vs W", BW, BG, "W", "G");
+    }
+
+    // ---- controls
+    llama_context * A2 = make_ctx(model, o, o.nctx_a);
+    run_prompt(A2, false);
+    llama_context * A1 = nullptr;
+    if (o.rollback == 0 && n_prompt <= (int) o.n_ubatch * 4) {
+        A1 = make_ctx(model, o, o.nctx_a);
+        decode(A1, toks, 0, n_prompt, o.seq_a);
+    }
 
     // ---- forced continuation on every context
-    const auto LA = gen_forced(A, cont, n_prompt, o.seq_a);
-    // the delta-specific criterion: a composed chain must behave exactly like a whole restore (W). A vs W
-    // is reported separately: on a model whose SWA window is shorter than the prompt, a restored context
-    // holds the same cells in a different cell layout than the live one, so it is not expected bitwise.
-    const auto LW = gen_forced(W, cont, n_prompt, o.seq_b);
-    printf("  logits W vs A over %d forced tokens: max |diff| = %.3g%s\n", o.n_gen, max_abs_diff(LA, LW), max_abs_diff(LA, LW) == 0 ? " (bitwise)" : "");
-    struct { const char * name; llama_context * ctx; } others[] = { {"C", C}, {"D", D}, {"G", G} };
+    const auto LA  = gen_forced(A,  cont, n_prompt, o.seq_a);
+    const auto LA2 = gen_forced(A2, cont, n_prompt, o.seq_a);
+    const auto LW  = gen_forced(W,  cont, n_prompt, o.seq_b);
+    printf("  logits A2 vs A (determinism):      max %.3g  per token:%s\n", max_abs_diff(LA, LA2), per_token(LA, LA2).c_str());
+    CHECK(max_abs_diff(LA, LA2) == 0, "the run is not deterministic");
+    if (A1) {
+        const auto LA1 = gen_forced(A1, cont, n_prompt, o.seq_a);
+        printf("  logits A1 vs A (one-shot prompt):  max %.3g  per token:%s\n", max_abs_diff(LA, LA1), per_token(LA, LA1).c_str());
+    }
+    printf("  logits W vs A (whole restore):     max %.3g  per token:%s\n", max_abs_diff(LA, LW), per_token(LA, LW).c_str());
+    struct { const char * name; llama_context * ctx; bool must; } others[] = { {"C", C, true}, {"D", D, true}, {"G", G, false}, {"N", N, true} };
     for (auto & x : others) {
+        if (!x.ctx) continue;
         const auto L = gen_forced(x.ctx, cont, n_prompt, o.seq_b);
         const double d = max_abs_diff(LW, L);
-        printf("  logits %s vs W over %d forced tokens: max |diff| = %.3g%s\n", x.name, o.n_gen, d, d == 0 ? " (bitwise)" : "");
-        if (x.ctx == C || x.ctx == D) {
+        printf("  logits %s vs W:                     max %.3g%s  per token:%s\n", x.name, d, d == 0 ? " (bitwise)" : "", per_token(LW, L).c_str());
+        if (x.must) {
             CHECK(d == 0, "%s logits differ from a whole restore by %.3g", x.name, d);
         }
     }
-    const auto BA2 = blob(A, o.seq_a);
     const auto BW2 = blob(W, o.seq_b);
-    cmp_blob(o, "after-gen W vs A", BA2, BW2, "A2", "W2");
+    if (o.seq_a == o.seq_b) {
+        cmp_blob(o, "after-gen W vs A", blob(A, o.seq_a), BW2, "A2", "W2");
+    }
     if (!cmp_blob(o, "after-gen C vs W", BW2, blob(C, o.seq_b), "W2", "C2")) g_fail++;
     if (!cmp_blob(o, "after-gen D vs W", BW2, blob(D, o.seq_b), "W2", "D2")) g_fail++;
+    if (N && !cmp_blob(o, "after-gen N vs W", BW2, blob(N, o.seq_b), "W2", "N2") && !o.holes) g_fail++;
 
-    for (auto * c : {A, W, C, D, G}) llama_free(c);
+    for (auto * c : {A, A2, A1, W, C, D, G, N}) if (c) llama_free(c);
     llama_model_free(model);
 
     printf("RESULT %s: %s (%d failures)\n", o.model.c_str(), g_fail ? "FAIL" : "PASS", g_fail);
