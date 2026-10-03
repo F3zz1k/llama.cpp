@@ -13,6 +13,11 @@ from utils import *
 # every greedy token and accepts everything, while a cold one drafts from the restored suffix alone.
 # The same request is replayed against a copy of the cache with the .dft sidecars deleted, as the
 # control. Uses the generate-models dummy GGUFs, found as in test_slot_save_nodelta.py.
+#
+# What this can and cannot show: the warm/cold counters and the identical output are the
+# discriminating checks. The acceptance comparison is weak on these dummies: their random weights
+# make greedy decoding nearly context-insensitive, so a cold draft also accepted 24/24 when this was
+# written. Measure the acceptance gain on a real MTP model before quoting one.
 
 
 def _default_models_dir() -> str:
