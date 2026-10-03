@@ -23,6 +23,7 @@ enum class test_status {
     PASS,
     FAIL,
     SKIP,
+    WHOLE, // delta test only: the memory type ignores position ranges, so it can only publish whole roots
 };
 
 static const char * test_status_str(test_status status) {
@@ -30,6 +31,7 @@ static const char * test_status_str(test_status status) {
         case test_status::PASS: return "\033[1;32mPASS\033[0m";
         case test_status::FAIL: return "\033[1;31mFAIL\033[0m";
         case test_status::SKIP: return "\033[1;33mSKIP\033[0m";
+        case test_status::WHOLE: return "\033[1;36mWHOL\033[0m";
     }
     return "";
 }
@@ -748,13 +750,134 @@ struct test_suite {
     std::vector<test_status> results;
 
     bool all_passed() const {
-        return std::all_of(results.begin(), results.end(), [](test_status s) { return s == test_status::PASS; });
+        // WHOLE is a classification, not a failure: that memory type is correct, just not incremental
+        return std::all_of(results.begin(), results.end(), [](test_status s) { return s == test_status::PASS || s == test_status::WHOLE; });
     }
 };
 
+// Test 10: incremental delta compose (the disk KV cache's base + delta chain)
+// - decode the first half of the prompt (all but the last token) and save it whole (the root)
+// - decode the rest and save only positions [L, -1) with the range API (the delta)
+// - a delta that is not smaller than a whole save of the same sequence means the memory type ignores
+//   the range: report WHOLE (correct, whole roots only) and never compose it, as the server does
+// - otherwise load root (clearing) + delta (NO_CLEAR) into a fresh context, replay the last prompt
+//   token and compare the generation against the baseline
+static test_status test_state_delta_compose(struct llama_model * model, const struct common_params & params,
+                                            const llama_tokens & tokens, const generation_result & expected_result) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+
+    LOGV(LOG_LEVEL_INFO, "\n=== Test 10: incremental delta compose ===\n");
+
+    if (tokens.size() < 4) {
+        LOG_ERR("%s: prompt too short\n", __func__);
+        return test_status::FAIL;
+    }
+
+    const size_t n_prefix = tokens.size() - 1;      // the state the baseline saves: all but the last token
+    const size_t n_root   = n_prefix / 2;
+    const llama_tokens tok_root (tokens.begin(),          tokens.begin() + n_root);
+    const llama_tokens tok_delta(tokens.begin() + n_root, tokens.begin() + n_prefix);
+
+    const std::string base = "state-delta." + std::filesystem::path(params.model.path).filename().string();
+    const std::string path_root  = base + ".root.tmp.bin";
+    const std::string path_delta = base + ".delta.tmp.bin";
+    const std::string path_whole = base + ".whole.tmp.bin";
+    struct cleanup_t {
+        std::vector<std::string> paths;
+        ~cleanup_t() { std::error_code ec; for (const auto & p : paths) { std::filesystem::remove(p, ec); } }
+    } cleanup { { path_root, path_delta, path_whole } };
+
+    size_t n_delta = 0;
+    size_t n_whole = 0;
+    {
+        auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+        if (!ctx) {
+            LOG_ERR("%s: failed to create context\n", __func__);
+            return test_status::FAIL;
+        }
+        if (llama_get_memory(ctx.get()) == nullptr) {
+            LOGV(LOG_LEVEL_INFO, "PASS (model has no memory)\n");
+            return test_status::PASS;
+        }
+
+        common_batch batch_root = common_batch_get_one(ctx.get(), tok_root);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_root.get())) {
+            LOG_ERR("%s: failed to decode the root prefix\n", __func__);
+            return test_status::FAIL;
+        }
+        if (llama_state_seq_save_file(ctx.get(), path_root.c_str(), 0, tokens.data(), n_root) == 0) {
+            LOG_ERR("%s: failed to save the root\n", __func__);
+            return test_status::FAIL;
+        }
+
+        common_batch batch_delta = common_batch_get_one(ctx.get(), tok_delta);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_delta.get())) {
+            LOG_ERR("%s: failed to decode the delta suffix\n", __func__);
+            return test_status::FAIL;
+        }
+        n_delta = llama_state_seq_save_file_range(ctx.get(), path_delta.c_str(), 0, (llama_pos) n_root, -1, tokens.data(), n_prefix);
+        n_whole = llama_state_seq_save_file(ctx.get(), path_whole.c_str(), 0, tokens.data(), n_prefix);
+        if (n_delta == 0 || n_whole == 0) {
+            LOG_ERR("%s: failed to save the delta (%zu B) or the whole sequence (%zu B)\n", __func__, n_delta, n_whole);
+            return test_status::FAIL;
+        }
+    }
+
+    if (n_delta > n_whole) {
+        LOG_ERR("%s: the delta (%zu B) is larger than a whole save (%zu B)\n", __func__, n_delta, n_whole);
+        return test_status::FAIL;
+    }
+    if (n_delta == n_whole) {
+        LOGV(LOG_LEVEL_INFO, "WHOLE (range ignored: delta %zu B == whole %zu B)\n", n_delta, n_whole);
+        return test_status::WHOLE;
+    }
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx) {
+        LOG_ERR("%s: failed to create context\n", __func__);
+        return test_status::FAIL;
+    }
+
+    llama_tokens tok_out(tokens.size());
+    size_t n_out = 0;
+    if (llama_state_seq_load_file_ext(ctx.get(), path_root.c_str(), 0, 0, tok_out.data(), tok_out.size(), &n_out) == 0 || n_out != n_root) {
+        LOG_ERR("%s: failed to load the root (%zu tokens)\n", __func__, n_out);
+        return test_status::FAIL;
+    }
+    if (llama_state_seq_load_file_ext(ctx.get(), path_delta.c_str(), 0, LLAMA_STATE_SEQ_FLAGS_NO_CLEAR,
+                                      tok_out.data(), tok_out.size(), &n_out) == 0 || n_out != n_prefix) {
+        LOG_ERR("%s: failed to compose the delta (%zu tokens)\n", __func__, n_out);
+        return test_status::FAIL;
+    }
+
+    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0);
+    if (pos_max != (llama_pos) n_prefix - 1) {
+        LOG_ERR("%s: composed sequence ends at %d, expected %zu\n", __func__, pos_max, n_prefix - 1);
+        return test_status::FAIL;
+    }
+
+    auto sparams = llama_sampler_chain_default_params();
+    auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
+    llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
+
+    int n_past = (int) n_prefix;
+    if (!common_replay_last_token(ctx.get(), tokens.back(), n_past)) {
+        return test_status::FAIL;
+    }
+    n_past++;
+
+    if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, params.n_predict, 0, expected_result)) {
+        return test_status::FAIL;
+    }
+
+    LOGV(LOG_LEVEL_INFO, "\nPASS (delta %zu B vs whole %zu B)\n", n_delta, n_whole);
+    return test_status::PASS;
+}
+
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "delta",
 };
 
 // Run the full save/load test suite (tests 1-9) for a single model.
@@ -835,6 +958,10 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+
+    // Test 10: incremental delta compose (depends on the baseline generation)
+    suite.results.push_back(result_baseline.empty() ? test_status::SKIP
+                                                    : test_state_delta_compose(model, params, tokens, result_baseline));
 
     return suite;
 }
