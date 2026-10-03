@@ -1687,7 +1687,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 
     // a scoped pedantic request overrides the process-wide compute type, for F32 weights only
-    if (src0->type == GGML_TYPE_F32 && prec_acc == GGML_PREC_F32_PEDANTIC) {
+    if (src0->type == GGML_TYPE_F32 && prec == GGML_PREC_F32_PEDANTIC) {
         compute_type = GGML_TYPE_F32;
     }
 
