@@ -170,8 +170,20 @@ void llama_kv_cache_msa::state_write_range(llama_io_write_i & io, llama_seq_id s
 }
 
 void llama_kv_cache_msa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_base->state_read(io, seq_id, flags);
-    kv_idx ->state_read(io, seq_id, flags);
+    // the indexer cache must agree with the base cache cell for cell: adopt the base layout instead of
+    // a second find_slot() (see llama_kv_cache_dsa::state_read)
+    llama_kv_cache::slot_info_vec_t sinfos_base;
+
+    // a failure in either cache drops the sequence from both (see llama_kv_cache_dsa::state_read)
+    try {
+        kv_base->state_read_sinfo(io, seq_id, flags, &sinfos_base, nullptr);
+        kv_idx ->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_base);
+    } catch (...) {
+        kv_base->state_clear(seq_id);
+        kv_idx ->state_clear(seq_id);
+
+        throw;
+    }
 }
 
 llama_kv_cache * llama_kv_cache_msa::get_base() const {

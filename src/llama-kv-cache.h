@@ -361,7 +361,8 @@ private:
     // flags carries LLAMA_STATE_SEQ_FLAGS_NO_CLEAR, which appends to the destination sequence instead
     //   of replacing it, so that a base snapshot and its deltas compose into one sequence
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    // note: NO_CLEAR and sinfo_in are mutually exclusive, see the guard at the top of state_read_meta()
+    // NO_CLEAR and sinfo_in compose: a mirrored cache appending a delta takes the cells its primary just
+    //   allocated for that delta, each checked usable here, see the comment at the top of state_read_meta()
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, llama_state_seq_flags flags = 0, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 

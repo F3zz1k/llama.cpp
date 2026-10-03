@@ -174,13 +174,20 @@ void llama_kv_cache_dsa::state_write_range(llama_io_write_i & io, llama_seq_id s
 }
 
 void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_mla->state_read(io, seq_id, flags);
+    // the indexer top-k picks MLA cells BY INDEX, so the two caches must agree cell for cell. two
+    // independent find_slot() calls agree only while both caches hold the same occupancy and head; adopt
+    // the MLA layout instead, so parity holds by construction and a drift fails the restore loudly
+    llama_kv_cache::slot_info_vec_t sinfos_mla;
 
+    // a failure in EITHER cache drops the sequence from both: with NO_CLEAR the other cache still holds
+    // the base cells (and the MLA part may already hold the delta), so clearing only the failing cache
+    // would leave the two disagreeing cell for cell
     try {
-        kv_lid->state_read(io, seq_id, flags);
+        kv_mla->state_read_sinfo(io, seq_id, flags, &sinfos_mla, nullptr);
+        kv_lid->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_mla);
     } catch (...) {
-        // the MLA part is already restored - undo it, so that a failed restore leaves nothing behind
         kv_mla->state_clear(seq_id);
+        kv_lid->state_clear(seq_id);
 
         throw;
     }

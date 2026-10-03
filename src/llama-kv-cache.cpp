@@ -2521,10 +2521,19 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             // without NO_CLEAR, seq_rm above freed exactly the cells this sequence held; with NO_CLEAR the
             //   layout names only the cells the mirrored cache just allocated for the appended delta
             // anything else in the way is a cache that had already drifted, which this restore must not hide
+            // "free" is find_slot()'s own test: an empty cell, or a single-sequence cell that sequence's SWA
+            //   window already masks. the primary may have picked the latter (n_swa > 0), and while the two
+            //   caches agree cell for cell this cache holds the same cell in the same state
             for (uint32_t i = 0; i < cell_count; ++i) {
                 const uint32_t idx = sinfo.idxs[0][i];
 
-                if (idx >= cells.size() || !cells.is_empty(idx)) {
+                bool usable = idx < cells.size() && cells.is_empty(idx);
+                if (!usable && idx < cells.size() && cells.seq_count(idx) == 1) {
+                    const llama_seq_id seq_id_cell = cells.seq_get(idx);
+                    usable = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(idx), cells.seq_pos_max(seq_id_cell) + 1);
+                }
+
+                if (!usable) {
                     LLAMA_LOG_ERROR("%s: cell %u of the mirrored slot layout is not free\n", __func__, idx);
                     return false;
                 }
