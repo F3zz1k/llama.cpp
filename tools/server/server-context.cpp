@@ -2970,9 +2970,9 @@ private:
     // rename (meta last) publish invariant, the capacity pre-flight and the per-boundary index
     // insert live in ONE place. Persists KV cells [lo, hi) of slot.id's sequence as one disk unit
     // named auto_state_filename(hash, hi):
-    //   - a ROOT snapshot when lo == 0 (v1 text / v2 media, `media` selecting which); either the
-    //     WHOLE prompt (hi == toks.size(), byte-identical to the pre-refactor save_file path) or a
-    //     PARTIAL [0, hi) root — the shared-context checkpoint — persisted via the range API;
+    //   - a ROOT snapshot when lo == 0 (v1 text / v2 media, `media` selecting which) of the WHOLE
+    //     prompt, byte-identical to the pre-refactor save_file path. hi must equal toks.size():
+    //     partial [0, hi < N) roots are refused (see the guard at the top of the body);
     //   - a v3 DELTA node when lo > 0 (lo == parent_hi): cells [lo, hi=N) parented on `parent_id`.
     // `hash` is the chain hash that names the file and commits the prefix; the index is populated at
     // boundaries bhs[0..kb] inclusive. Behaviour-preserving for the whole-save and delta callers.
@@ -2989,12 +2989,18 @@ private:
                                uint64_t parent_id = 0) {
         bool     is_node   = lo > 0;      // lo > 0 <=> a delta parented at parent_hi == lo
         uint32_t parent_hi = (uint32_t) lo; // both cleared below if the U6 delta cell-count check fails
-        // the snapshot's own token prefix [0, hi): equals `toks` for a whole/delta save (hi == N),
-        // a strict prefix for a partial-root checkpoint. Avoid the copy in the common hi == N path.
-        const llama_tokens   snap_owned = ((size_t) hi == toks.size())
-                                          ? llama_tokens{}
-                                          : llama_tokens(toks.begin(), toks.begin() + hi);
-        const llama_tokens & snap_toks  = ((size_t) hi == toks.size()) ? toks : snap_owned;
+        // Only whole-prefix units exist: hi must equal toks.size(). A PARTIAL [0, hi < N) root would
+        // go through the range save, which every class that ignores [p0, p1) (hybrid_idx with an
+        // indexer, dsa, dsa_iswa, dsv4, msa, and any recurrent state, which is always "the state
+        // after N") serialises as all N cells under a header claiming hi tokens: a mislabelled
+        // snapshot that neither the delta probe (is_node only) nor the cell-count check would catch.
+        // No caller asks for one (both pass hi == toks.size()), so refuse it outright, loudly.
+        if ((size_t) hi != toks.size()) {
+            SLT_WRN(slot, "auto-save: refusing a partial [0, %d) root of a %zu-token sequence "
+                          "(partial roots are not supported)\n", (int) hi, toks.size());
+            return;
+        }
+        const llama_tokens & snap_toks = toks;
 
         // capacity pre-flight (statvfs via std::filesystem::space): refuse to START a multi-GB
         // write the filesystem cannot hold — on btrfs an ENOSPC mid-write can flip the whole
@@ -3031,9 +3037,8 @@ private:
         // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
         //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
         //    crash mid-write never leaves a corrupt state file the index would trust.
-        //    A DELTA node (lo > 0) writes only cells [lo, N) via the range save; a PARTIAL root
-        //    (checkpoint, hi < N) writes cells [0, hi) via the range save; the WHOLE root takes the
-        //    byte-identical save_file path.
+        //    A DELTA node (lo > 0) writes only cells [lo, N) via the range save; a ROOT takes the
+        //    byte-identical whole save_file path.
         size_t nwrite;
         // P0.1: a class that does not honour ranges must never publish a delta. Probe once, here,
         // where real resident state exists and the range save is about to happen anyway.
@@ -3055,11 +3060,8 @@ private:
             nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
                                                      slot.prompt.tokens.pos_next((llama_pos) lo), -1,
                                                      snap_toks.data(), snap_toks.size());
-        } else if ((size_t) hi == toks.size()) {
-            nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
         } else {
-            nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
-                                                     0, (llama_pos) hi, snap_toks.data(), snap_toks.size());
+            nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
         }
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
