@@ -2430,15 +2430,12 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, llama_state_seq_flags flags, const slot_info * sinfo_in) {
-    // NO_CLEAR and sinfo_in are mutually exclusive and the combination is rejected here rather than
-    // left to fail deeper in. sinfo_in adopts a layout whose cells this cache must find free, which
-    // only holds because the seq_rm below has just released exactly the cells the sequence held.
-    // NO_CLEAR deliberately skips that seq_rm so the sequence keeps its cells and the incoming ones
-    // are appended, so the cells sinfo_in names are still occupied. No caller needs both.
-    if (sinfo_in && (flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR)) {
-        LLAMA_LOG_ERROR("%s: a NO_CLEAR restore cannot adopt a mirrored slot layout\n", __func__);
-        return false;
-    }
+    // NO_CLEAR and sinfo_in compose: the mirrored cache (the hybrid_idx indexer) reads after the cache
+    // it mirrors, and sinfo_in is that cache's layout for THIS read only, i.e. the cells it just found
+    // free for the incoming delta, never the cells the sequence already held. Both caches hold the same
+    // occupancy cell for cell (every earlier node was restored through the same mirrored layout), so
+    // those cells are free here too. That is checked cell by cell below rather than assumed: any cell in
+    // the way means the two caches had drifted, and the restore fails instead of hiding it.
 
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
@@ -2521,8 +2518,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             sinfo.s1 = strm;
             sinfo.strm[0] = strm;
 
-            // seq_rm above freed exactly the cells this sequence held (the guard at the top of this
-            //   function rules out NO_CLEAR, which is the only way that seq_rm gets skipped)
+            // without NO_CLEAR, seq_rm above freed exactly the cells this sequence held; with NO_CLEAR the
+            //   layout names only the cells the mirrored cache just allocated for the appended delta
             // anything else in the way is a cache that had already drifted, which this restore must not hide
             for (uint32_t i = 0; i < cell_count; ++i) {
                 const uint32_t idx = sinfo.idxs[0][i];
