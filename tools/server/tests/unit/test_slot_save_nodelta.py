@@ -171,11 +171,13 @@ def test_nodelta_parented_save_is_whole_root(model_name, tmp_path):
         f"timings.cache_disk_n must report the disk-restored prefix, got {res.body['timings']}"
 
 
-# llama_kv_cache_dsa (glm-dsa, deepseek32), llama_kv_cache_msa (minimax-m3), llama_kv_cache_dsv4
-# (deepseek4) and llama_memory_hybrid_idx with an indexer (glm5-next, qwen4exp) used to write whole
-# only. deepseek4 also exercises the server's DSV4-prefix skip in the delta cell-count check.
+# llama_kv_cache_dsa (glm-dsa, deepseek32, hy_v4), llama_kv_cache_dsa_iswa (dots3note, the only
+# DSA-iSWA class), llama_kv_cache_msa (minimax-m3), llama_kv_cache_dsv4 (deepseek4) and
+# llama_memory_hybrid_idx with an indexer (glm5-next, qwen4exp) used to write whole only. deepseek4
+# also exercises the server's DSV4-prefix skip in the delta cell-count check.
 @pytest.mark.parametrize("model_name", [
-    "glm-dsa-moe", "deepseek32-moe", "minimax-m3-moe", "deepseek4-moe", "glm5-next-moe", "qwen4exp-moe",
+    "glm-dsa-moe", "deepseek32-moe", "hy_v4-moe", "dots3note-moe", "minimax-m3-moe", "deepseek4-moe",
+    "glm5-next-moe", "qwen4exp-moe",
 ])
 def test_delta_capable_parented_saves_are_deltas(model_name, tmp_path):
     model = os.path.join(MODELS_DIR, f"{model_name}.gguf")
