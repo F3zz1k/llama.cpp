@@ -1575,11 +1575,6 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_draft_verif_steps
         },
         {
-            "auto_cache_restore_skipped_shared_total",
-            "Auto disk KV cache: restores skipped because a decision-task child only shares a prefix",
-            (double) metrics.n_auto_restore_skipped_shared
-        },
-        {
             "auto_cache_save_whole_fallback_total",
             "Auto disk KV cache: parented saves published as whole roots because this memory type cannot write deltas",
             (double) metrics.n_auto_save_whole_fallback

@@ -6243,17 +6243,10 @@ private:
                                 // gated this block on !slot.prompt.tokens.has_media() — which tested the
                                 // slot's STALE PREVIOUS prompt, not the request; no request property replaces
                                 // it, media requests are simply first-class now.)
-                                // a decision-task child (n_tokens_shared > 0) is clamped to the shared prefix just
-                                // below, which would throw any deeper restore away, so it does not auto-restore.
-                                // That is a skipped cache opportunity, so it is never silent: WRN plus a counter.
-                                const bool auto_restore_shared_skip = auto_cache_enabled() && slot.task->n_tokens_shared > 0;
-                                if (auto_restore_shared_skip) {
-                                    metrics.n_auto_restore_skipped_shared++;
-                                    SLT_WRN(slot, "auto-restore skipped: decision-task child shares only its first %d tokens (n_past = %d, skipped so far = %" PRIu64 ")\n",
-                                            slot.task->n_tokens_shared, (int) n_past, metrics.n_auto_restore_skipped_shared);
-                                }
+                                // Decision tasks (the only ones that set n_tokens_shared, on the group
+                                // PARENT) never reach this block: need_sampling() is false for them, and
+                                // auto-save excludes them as well, so they neither restore nor publish.
                                 if (auto_cache_enabled()
-                                        && !auto_restore_shared_skip
                                         && slot.task->need_sampling()        // generative only (not embed/rerank)
                                         && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
                                         && are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures global LoRA (invariant 3)
