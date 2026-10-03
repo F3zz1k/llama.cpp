@@ -720,6 +720,7 @@ json format_response_rerank(
 struct server_slot_stats {
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_cached_disk = 0; // part of n_prompt_cached restored from the auto disk cache
+    uint64_t n_prompt_cached_ram  = 0; // part of n_prompt_cached loaded from the RAM prompt cache (--cache-ram)
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
 
@@ -859,7 +860,8 @@ struct server_metrics {
     uint64_t n_auto_restore_miss           = 0; // eligible requests with >= 1 block beyond the in-memory match and no restore
     uint64_t n_auto_restore_failed         = 0; // restores that failed after clearing the slot
     uint64_t n_auto_restore_not_prefix     = 0; // misses where a snapshot of the prefix existed but the class could not rewind into it
-    uint64_t n_auto_restore_tokens         = 0; // tokens restored from disk
+    uint64_t n_auto_restore_tokens         = 0; // tokens restored from disk and kept by the prompt
+    uint64_t n_auto_restore_discarded      = 0; // restores whose tokens a later n_past clamp threw away (counted as misses)
     uint64_t n_auto_save_draft             = 0; // draft-context (.dft) sidecars written next to a unit
     uint64_t n_auto_save_draft_skipped     = 0; // units published without one (no cells, or the range was ignored)
     uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars

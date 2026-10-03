@@ -1413,6 +1413,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    // Target position p that pending_h[seq] is h_p of, -1 when unknown. Lets get_state() stamp the
+    // carry-over so a restore (context checkpoint, disk cache) can put back the h that belongs to
+    // the restored tail instead of whatever this sequence processed last.
+    std::vector<llama_pos> pending_pos;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1421,6 +1425,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<llama_pos> verify_pos_first; // target position of verify_h row 0, -1 when unknown
+
+    static constexpr uint32_t STATE_TAG = 0x4d545048; // "MTPH": tags get_state() blobs as this impl's
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1492,6 +1499,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
+        verify_pos_first.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1640,6 +1649,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            verify_pos_first[seq_id] = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+            pending_pos[seq_id]      = batch_in.tokens[i_batch_end[seq_id]].pos[0];
         }
 
         return true;
@@ -1824,6 +1835,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_pos_first[seq_id] < 0 ? -1 : verify_pos_first[seq_id] + i_h;
+    }
+
+    // The carry-over is part of the draft state: the first token of the next process() batch pairs with
+    // pending_h, so a restored draft KV without it computes that cell from another position's h. Blob:
+    // [u32 STATE_TAG][i32 pos][n_embd f32]. A shared-cells draft (gemma4) needs it too, for its first
+    // draft after a restore that decodes nothing.
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
+            return false;
+        }
+        const llama_pos pos = pending_pos[seq_id];
+        const size_t    hb  = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(uint32_t) + sizeof(llama_pos) + hb);
+        std::memcpy(data.data(),                                        &STATE_TAG, sizeof(uint32_t));
+        std::memcpy(data.data() + sizeof(uint32_t),                     &pos,       sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(uint32_t) + sizeof(llama_pos), pending_h[seq_id].data(), hb);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const size_t hb = (size_t) n_embd * sizeof(float);
+        uint32_t tag = 0;
+        if (data.size() != sizeof(uint32_t) + sizeof(llama_pos) + hb) {
+            return;
+        }
+        std::memcpy(&tag, data.data(), sizeof(uint32_t));
+        if (tag != STATE_TAG) {
+            return;
+        }
+        llama_pos pos = -1;
+        std::memcpy(&pos, data.data() + sizeof(uint32_t), sizeof(llama_pos));
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(uint32_t) + sizeof(llama_pos), hb);
+        pending_pos[seq_id]   = pos;
+        verify_h_rows[seq_id] = 0; // the verify rows belong to the state this replaced
     }
 };
 

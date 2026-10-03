@@ -1630,6 +1630,11 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_auto_restore_tokens
         },
         {
+            "auto_cache_restore_discarded_total",
+            "Auto disk KV cache: restores whose tokens were re-prefilled before use (also counted as misses)",
+            (double) metrics.n_auto_restore_discarded
+        },
+        {
             "auto_cache_save_draft_total",
             "Auto disk KV cache: draft-context (.dft) sidecars written next to a unit",
             (double) metrics.n_auto_save_draft

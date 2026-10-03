@@ -273,6 +273,50 @@ static std::string slot_draft_sidecar_path(const std::string & state_filepath) {
     return state_filepath + ".dft";
 }
 
+// The draft's per-sequence carry-over (common_speculative_get_state: MTP's pending h of the unit's
+// last cell) rides at the END of the .dft, after the llama_state_seq payload, which the state loader
+// never reads past: [blob][i32 tail_pos][u32 blob_size][u32 SLOT_DRAFT_TRAILER_MAGIC]. tail_pos is
+// the target position the blob belongs to, so a restore only applies it to a tail that ends there.
+static constexpr uint32_t SLOT_DRAFT_TRAILER_MAGIC = 0x44465431; // "DFT1"
+
+static bool slot_draft_trailer_append(const std::string & path, llama_pos tail_pos, const std::vector<uint8_t> & blob) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    if (!f) {
+        return false;
+    }
+    const uint32_t n = (uint32_t) blob.size();
+    f.write((const char *) blob.data(), blob.size());
+    f.write((const char *) &tail_pos, sizeof(tail_pos));
+    f.write((const char *) &n, sizeof(n));
+    f.write((const char *) &SLOT_DRAFT_TRAILER_MAGIC, sizeof(SLOT_DRAFT_TRAILER_MAGIC));
+    return (bool) f;
+}
+
+static bool slot_draft_trailer_read(const std::string & path, llama_pos & tail_pos, std::vector<uint8_t> & blob) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        return false;
+    }
+    const std::streamoff sz = f.tellg();
+    const std::streamoff ft = (std::streamoff) (sizeof(llama_pos) + 2 * sizeof(uint32_t));
+    if (sz < ft) {
+        return false;
+    }
+    uint32_t n = 0;
+    uint32_t magic = 0;
+    f.seekg(sz - ft);
+    f.read((char *) &tail_pos, sizeof(tail_pos));
+    f.read((char *) &n, sizeof(n));
+    f.read((char *) &magic, sizeof(magic));
+    if (!f || magic != SLOT_DRAFT_TRAILER_MAGIC || (std::streamoff) n > sz - ft) {
+        return false;
+    }
+    blob.resize(n);
+    f.seekg(sz - ft - (std::streamoff) n);
+    f.read((char *) blob.data(), n);
+    return (bool) f;
+}
+
 // Best-effort "touch": bump the mtime of an auto-cache snapshot's 3-file unit (state + .logits +
 // .meta) to now, so a snapshot that is REUSED (read/restored) but never rewritten is treated as
 // recently-used by the mtime LRU. Without this, the LRU is least-recently-WRITTEN, which would
@@ -1100,6 +1144,12 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
     bool just_restored  = false; // set on disk slot-restore; one-shot, gates restored-slot KV reuse
+    // tokens the auto disk cache restored for the current task, not yet accounted as hit or discard
+    // (auto_restore_account consumes it where n_prompt_cached is final)
+    int32_t n_auto_restored_pending = 0;
+    // prompt-prefix tokens the RAM prompt cache (--cache-ram) brought into this slot for the current
+    // task, beyond what the slot already held; accounted with the disk ones in auto_restore_account
+    int32_t n_ram_loaded_pending = 0;
 
     // --- mid-prefill shared-context base save (Option A) ---
     // When > 0, this cold-prefilling slot is ARMED to whole-save the leading shared preamble
@@ -1258,6 +1308,8 @@ struct server_slot {
         // release(), so the flag still survives from that endpoint into the next request, which is
         // what the regenerate fast-path relies on.
         just_restored = false;
+        n_auto_restored_pending = 0;
+        n_ram_loaded_pending    = 0;
     }
 
     void init_sampler() const {
@@ -1865,6 +1917,32 @@ private:
         }
     }
 
+    // Disk-restore accounting, at the point where the request's cached prefix is final. A restore whose
+    // tokens the prompt did not keep (a later n_past clamp re-prefilled them) is a MISS, not a hit:
+    // llamacpp:auto_cache_restore_discarded_total counts those, each with a WRN.
+    void auto_restore_account(server_slot & slot, int32_t n_past) {
+        const int32_t n     = slot.n_auto_restored_pending;
+        const int32_t n_ram = slot.n_ram_loaded_pending;
+        slot.n_auto_restored_pending = 0;
+        slot.n_ram_loaded_pending    = 0;
+        // a disk restore replaces whatever the RAM cache loaded, so only one of the two can be the source
+        slot.stats.n_prompt_cached_ram = n <= 0 && n_ram > 0 ? (uint64_t) std::max(0, std::min(n_ram, n_past)) : 0;
+        if (n <= 0) {
+            return;
+        }
+        const int32_t kept = std::max(0, std::min(n, n_past));
+        slot.stats.n_prompt_cached_disk = (uint64_t) kept;
+        if (kept > 0) {
+            metrics.n_auto_restore_hit++;
+            metrics.n_auto_restore_tokens += (uint64_t) kept;
+        } else {
+            metrics.n_auto_restore_miss++;
+            metrics.n_auto_restore_discarded++;
+            SLT_WRN(slot, "auto-restore: the %d restored tokens were discarded before use (n_past = %d), "
+                          "the prompt is re-prefilled\n", n, n_past);
+        }
+    }
+
     // DRAFT SIDECAR (see slot_draft_sidecar_path). Writes the draft context's cells for [cell_lo, N) of
     // this slot, bounded by POSITION on both ends: the draft may hold drafted-but-rejected cells past
     // the target's end, and those must never reach a sidecar or a later delta would duplicate them.
@@ -1887,6 +1965,16 @@ private:
             std::filesystem::remove(path, ec);
             metrics.n_auto_save_draft_skipped++;
             SLT_DBG(slot, "auto-save: no draft sidecar for [%u, %zu) (%zu B, %u cells)\n", cell_lo, n_cells, nwrite, cells);
+            return;
+        }
+        // the draft's carry-over for the unit's last cell (MTP: h of that cell, which the first cell
+        // decoded after a restore pairs with); without it that cell is built from a stale h
+        std::vector<uint8_t> st;
+        if (common_speculative_get_state(spec.get(), slot.id, st) &&
+            !slot_draft_trailer_append(path, p1 - 1, st)) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            metrics.n_auto_save_draft_skipped++;
             return;
         }
         metrics.n_auto_save_draft++;
@@ -1931,6 +2019,16 @@ private:
         } else {
             llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
             metrics.n_auto_restore_draft_cold++;
+        }
+        // The carry-over of the tip's last cell, independent of the draft KV: a cold draft still pairs
+        // the first suffix cell with it. Applied only when the tip's tail is the restored target tail;
+        // a draft type or width that does not match ignores it (set_state checks the blob).
+        llama_pos tail = -1;
+        std::vector<uint8_t> st;
+        if (spec && !node_paths.empty() &&
+            slot_draft_trailer_read(slot_draft_sidecar_path(node_paths.back()), tail, st) &&
+            tail == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id)) {
+            common_speculative_set_state(spec.get(), slot.id, st);
         }
     }
 
@@ -2140,7 +2238,12 @@ private:
         fp.fp_cache_k     = (uint32_t) params_base.cache_type_k;
         fp.fp_cache_v     = (uint32_t) params_base.cache_type_v;
         fp.fp_n_ctx       = (uint32_t) llama_n_ctx_seq(ctx_tgt);
-        fp.fp_kv_full     = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ? 1u : 0u;
+        // FULL and RS share a value: on a recurrent/hybrid model the class is RS only because MTP (or
+        // any draft) asked for n_rs_seq > 0 rollback rows, which are never serialised (state_write
+        // writes the current row, state_read resets rs_idx to 0), so the blob is the same and turning
+        // speculation on or off must not split the store. Restore semantics follow the LIVE class.
+        fp.fp_kv_full     = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) ? 1u : 0u;
         fp.fp_block       = (uint32_t) params_base.slot_save_block;
         // effective rope scale (positions are baked into the saved state). rope_freq_scale==0 means
         // "use the model's trained value", so fall back to that for a stable comparison.
@@ -4628,9 +4731,12 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                const size_t n_lcp_before = ret->prompt.tokens.get_common_prefix(task.tokens);
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
+                const size_t n_lcp_after = ret->prompt.tokens.get_common_prefix(task.tokens);
+                ret->n_ram_loaded_pending = n_lcp_after > n_lcp_before ? (int32_t) n_lcp_after : 0;
 
                 prompt_cache->update();
 
@@ -6498,10 +6604,11 @@ private:
                                     // at least one whole block beyond its in-memory match and got nothing
                                     // from disk: that includes genuinely new prompts no cache could hold,
                                     // so read it next to auto_cache_evicted_total, not as a ratio alone.
+                                    // A restore is only a HIT once the prompt actually keeps it: it is counted
+                                    // where n_prompt_cached is final (auto_restore_account), because a later
+                                    // n_past clamp can still discard it (e.g. an RS exact resend re-prefills).
                                     if (n_restored > 0) {
-                                        metrics.n_auto_restore_hit++;
-                                        metrics.n_auto_restore_tokens += (uint64_t) n_restored;
-                                        slot.stats.n_prompt_cached_disk = (uint64_t) n_restored;
+                                        slot.n_auto_restored_pending = n_restored;
                                     } else if ((int) input_tokens.size() >= n_past + params_base.slot_save_block) {
                                         metrics.n_auto_restore_miss++;
                                         if (auto_not_prefix_skips > 0) {
@@ -6647,6 +6754,7 @@ private:
                                     // --- fast path: emit first token from saved logits, no decode ---
                                     slot.stats.n_prompt_cached    = n_past; // entire prompt "reused"
                                     slot.stats.n_prompt_processed = 0;      // prompt_n = 0 => observable reuse signal
+                                    auto_restore_account(slot, n_past);
 
                                     // prime the sampler over the full restored prompt (penalties/grammar
                                     // history), exactly as the normal DONE_PROMPT transition (init_sampler) would.
@@ -6927,8 +7035,7 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
-                        // the disk-restored share can only shrink after the restore (n_past clamps)
-                        slot.stats.n_prompt_cached_disk = std::min<uint64_t>(slot.stats.n_prompt_cached_disk, (uint64_t) n_past);
+                        auto_restore_account(slot, n_past);
 
                         metrics.add_prompt_cached(n_past);
 
