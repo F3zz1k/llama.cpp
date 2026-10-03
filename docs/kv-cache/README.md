@@ -1,5 +1,8 @@
 # Disk KV cache — what this fork adds
 
+For the copy-paste quick start (command lines, every flag with its default, the checkpoint triggers,
+hits and misses), see [`../disk-cache.md`](../disk-cache.md). This page is the design overview.
+
 This fork extends llama.cpp's slot state save/restore into a **transparent, cross-process disk
 KV cache** for `llama-server`: prompt prefixes are automatically persisted to a shared directory
 and restored on a later request — even from a *different* server process sharing the directory —
@@ -172,6 +175,8 @@ With `--metrics`, `GET /metrics` carries these cumulative counters (prefix `llam
 |---|---|
 | `auto_cache_restore_hit_total` | requests that restored a prefix from disk |
 | `auto_cache_restore_miss_total` | requests with at least one whole block beyond the in-memory match that restored nothing |
+| `auto_cache_restore_not_prefix_total` | misses where a saved unit shared the prefix but the memory class cannot rewind into it (needs a node at or before the divergence, see `--slot-save-node-prompt`) |
+| `auto_cache_restore_discarded_total` | restores whose tokens a later clamp threw away before use (counted as misses) |
 | `auto_cache_restore_failed_total` | restores whose load failed after clearing the slot (fell back to a shorter snapshot or cold) |
 | `auto_cache_restore_tokens_total` | prompt tokens restored from disk |
 | `auto_cache_save_root_total` / `auto_cache_save_delta_total` | whole roots / delta nodes published |
@@ -184,7 +189,8 @@ With `--metrics`, `GET /metrics` carries these cumulative counters (prefix `llam
 A miss includes prompts no cache could have held (a brand-new conversation), so read it next to
 `auto_cache_evicted_total`: misses that climb together with evictions are the sign the store is too
 small. Per request, `timings.cache_disk_n` (present only when non-zero) is the part of `cache_n`
-that came from disk rather than from the resident slot, which a router can forward to its clients:
+that came from disk rather than from the resident slot, and `timings.cache_ram_n` the part loaded
+from the RAM prompt cache; a router can forward both to its clients:
 
 ```sh
 curl -s localhost:8080/metrics | grep auto_cache_
