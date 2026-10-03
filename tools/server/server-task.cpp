@@ -1496,6 +1496,17 @@ json server_task_result_rerank::to_json() {
 }
 
 //
+// server_task_result_decision
+//
+json server_task_result_decision::to_json() {
+    return json {
+        {"index",            index},
+        {"scores",           scores},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {
@@ -1562,6 +1573,11 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        },
+        {
+            "auto_cache_restore_skipped_shared_total",
+            "Auto disk KV cache: restores skipped because a decision-task child only shares a prefix",
+            (double) metrics.n_auto_restore_skipped_shared
         },
     };
 

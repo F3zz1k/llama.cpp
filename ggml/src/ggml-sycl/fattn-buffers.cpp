@@ -31,10 +31,12 @@ sycl::half * ggml_sycl_fattn_kv_buffers::kv_buffer::ensure_half(size_t n_elems) 
         cap += CHUNK_SIZE;
     }
 
+    // the helper takes the Level Zero device-alloc path (no host-RAM mirror on xe) and records the
+    // allocation (or the failure) in the memtrace itself, so it is not traced again here
     void * dev_ptr;
     SYCL_CHECK(
         CHECK_TRY_ERROR(dev_ptr = ggml_sycl_malloc_device(
-                        cap, *qptr)));
+                        cap, *qptr, GGML_SYCL_MEM_FATTN_KV)));
 
     if (!dev_ptr) {
         GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, cap);
