@@ -1820,10 +1820,10 @@ private:
     int32_t n_swa;
 
     // P0.1 (anchored-resume): does THIS model's memory class actually honour a position range in
-    // state_write_range? The base-class default (src/llama-memory.h:132-136) IGNORES [p0,p1) and
-    // writes the WHOLE sequence, and only 4 of the 7+ memory implementations honour it (a fifth,
-    // llama_memory_hybrid_idx, overrides it only to fall BACK to that default whenever the model
-    // carries an indexer, so this probe is what turns deltas off there; see [TAG_HYBRID_IDX_STATE]). On a
+    // state_write_range? The base-class default in src/llama-memory.h IGNORES [p0,p1) and writes the
+    // WHOLE sequence. Every memory class that can compose a delta overrides it (the plain, iSWA, hybrid,
+    // hybrid-iSWA, hybrid_idx, DSA, DSA-iSWA, MSA and DSV4 caches as of this writing), but a class added
+    // later may not, and the probe is what keeps such a class on whole roots. On a
     // non-overriding class a "delta node" silently contains [0,N); composing root [0,lo) + that node
     // under NO_CLEAR yields DUPLICATE cells per position => wrong attention, silently.
     // We cannot ask the engine (no API reports what it serialised) and we cannot sniff the blob
