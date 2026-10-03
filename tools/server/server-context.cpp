@@ -2531,7 +2531,10 @@ private:
                 ctx_tgt, node_paths[i].c_str(), slot.id, flags,
                 tokens.data(), tokens.size(), &node_token_count);
             if (nread == 0) {
-                slot.prompt.tokens.clear(); // KV may already have been invalidated by the partial load
+                // a failed node may leave cells behind: node [0] clears the seq first, but a NO_CLEAR node that
+                // fails keeps everything the earlier nodes appended (and a composite cache may hold them in one
+                // of its halves only), so drop the seq on both contexts rather than only forgetting the tokens
+                auto_restore_drop(slot);
                 if (out_nread)       { *out_nread = total_nread; }
                 if (out_token_count) { *out_token_count = 0; }
                 return false;
@@ -2995,7 +2998,7 @@ private:
         slot.prompt.checkpoints.clear();
 
         if (!do_slot_restore(slot, chain)) {
-            // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
+            // restore failed -> do_slot_restore dropped the slot's seq on both contexts; caller reprefills (invariant 4).
             metrics.n_auto_restore_failed++;
             SLT_WRN(slot, "auto-restore: loading %s failed after the slot was cleared; trying a shorter "
                           "candidate or prefilling cold (failed so far = %" PRIu64 ")\n",
