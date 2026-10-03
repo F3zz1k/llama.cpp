@@ -312,6 +312,12 @@ def test_exact_resend_counts(tmp_path, spec):
         print(f"spec={spec} {name}: n_prompt={len(prompt)} hit={hit} restored_tokens={tok} miss={miss} "
               f"cache_n={t.get('cache_n')} cache_disk_n={t.get('cache_disk_n')} prompt_n={t.get('prompt_n')} "
               f"usage={r.get('tokens_cached')}")
+        # parity with and without MTP: the restore is a kept hit either way, an exact resend of the
+        # saved unit emits its first token from the logits sidecar (nothing prefilled), and one more
+        # token prefills exactly that token
+        assert hit == 1 and miss == 0
+        assert t.get("cache_disk_n", 0) == len(saved)
+        assert t["prompt_n"] == (0 if name == "exact" else 1)
 
 
 def test_ram_disk_warm_classification(tmp_path):
