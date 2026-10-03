@@ -2670,7 +2670,7 @@ private:
             return true; // text snapshot: nothing to rehydrate
         }
         if (!mctx) {
-            err = "state file contains media cells but the server has no multimodal projector loaded";
+            err = "Cannot restore media tokens without an mmproj (the state file contains media cells)";
             return false;
         }
         model_fp disk_fp;
