@@ -162,6 +162,13 @@ void llama_kv_cache_msa::state_write(llama_io_write_i & io, llama_seq_id seq_id,
     kv_idx ->state_write(io, seq_id, flags);
 }
 
+void llama_kv_cache_msa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    // the base cache and the indexer key cache are both full-size, one cell per position, so each
+    // takes the same [p0, p1) filter and a delta composes onto its base with NO_CLEAR
+    kv_base->state_write_range(io, seq_id, p0, p1, flags);
+    kv_idx ->state_write_range(io, seq_id, p0, p1, flags);
+}
+
 void llama_kv_cache_msa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     kv_base->state_read(io, seq_id, flags);
     kv_idx ->state_read(io, seq_id, flags);
