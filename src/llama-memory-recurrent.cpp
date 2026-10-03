@@ -785,8 +785,18 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
-    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
     uint32_t cell_count = 0;
+
+    // [RS_RING_SERIALIZE] persist every rollback plane, not just the live one, so a loaded
+    // context can arm a bounded rewind with seq_rm afterwards. Plane d holds the state as of
+    // (live_pos - d). With a pending rollback armed at save time (rs_idx_cur = k > 0) the live
+    // state lives in plane k and depths re-root there: serialized depth d takes physical plane
+    // min(k + d, n_rs_seq). Depths past the end of the available ring therefore duplicate the
+    // oldest snapshot; a writer with a pending rollback (speculative checkpoint paths only)
+    // must not rewind deeper than n_rs_seq - k. The auto disk-cache writers always save with no
+    // pending rollback, so in practice depths map 1:1 onto planes.
+    const uint32_t n_planes = 1 + n_rs_seq;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> cell_ranges_data(n_planes); // per-depth source row ranges
 
     // Count the number of cells with the specified seq_id
     // Find all the ranges of cells with this seq id (or all, when -1)
@@ -818,11 +828,15 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
-            if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
-                cell_ranges_data.emplace_back(cell_id, cell_id + 1);
-            } else {
-                cell_ranges_data.back().second++;
+            for (uint32_t d = 0; d < n_planes; ++d) {
+                const uint32_t plane   = std::min(rs_idx_cur + d, n_rs_seq);
+                const uint32_t cell_id = plane * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+                auto & ranges = cell_ranges_data[d];
+                if (ranges.empty() || ranges.back().second != cell_id) {
+                    ranges.emplace_back(cell_id, cell_id + 1);
+                } else {
+                    ranges.back().second++;
+                }
             }
 
             if (cell_range_begin == size) {
@@ -851,10 +865,13 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     GGML_ASSERT(cell_count == cell_count_check);
 
     cell_count_check = 0;
-    for (const auto & range : cell_ranges_data) {
-        cell_count_check += range.second - range.first;
+    for (const auto & ranges : cell_ranges_data) {
+        uint32_t plane_count = 0;
+        for (const auto & range : ranges) {
+            plane_count += range.second - range.first;
+        }
+        GGML_ASSERT(plane_count == cell_count); // every depth must cover every live cell exactly once
     }
-    GGML_ASSERT(cell_count == cell_count_check);
 
     io.write(&cell_count, sizeof(cell_count));
 
@@ -920,6 +937,15 @@ void llama_memory_recurrent::state_skip(llama_io_read_i & io) const {
         throw std::runtime_error("failed to skip recurrent state: layer count or s layout mismatch");
     }
 
+    // [RS_RING_SERIALIZE] the plane count field written by state_write_data; the blob must carry
+    // this context's ring geometry, exactly as state_read_data requires, or skipping would desync
+    uint32_t n_planes_ref;
+    io.read(&n_planes_ref, sizeof(n_planes_ref));
+    const uint32_t n_planes = 1 + n_rs_seq;
+    if (n_planes_ref != n_planes) {
+        throw std::runtime_error("failed to skip recurrent state: mismatched rollback plane count");
+    }
+
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il] == nullptr) {
             continue;
@@ -931,7 +957,7 @@ void llama_memory_recurrent::state_skip(llama_io_read_i & io) const {
         if (type_ref != (int32_t) r_l[il]->type || row_ref != ggml_row_size(r_l[il]->type, hparams.n_embd_r())) {
             throw std::runtime_error("failed to skip recurrent state: r type or row size mismatch");
         }
-        io.skip((size_t) cell_count * row_ref);
+        io.skip((size_t) cell_count * row_ref * n_planes); // one block per depth plane
 
         if (p_l[il] != nullptr) {
             uint64_t p_row_ref;
@@ -939,7 +965,7 @@ void llama_memory_recurrent::state_skip(llama_io_read_i & io) const {
             if (p_row_ref != ggml_row_size(p_l[il]->type, hparams.ple_conv_state())) {
                 throw std::runtime_error("failed to skip recurrent state: ple row size mismatch");
             }
-            io.skip((size_t) cell_count * p_row_ref);
+            io.skip((size_t) cell_count * p_row_ref * n_planes);
         }
     }
 
@@ -954,7 +980,7 @@ void llama_memory_recurrent::state_skip(llama_io_read_i & io) const {
         if (type_ref != (int32_t) s_l[il]->type || row_ref != ggml_row_size(s_l[il]->type, hparams.n_embd_s())) {
             throw std::runtime_error("failed to skip recurrent state: s type or row size mismatch");
         }
-        io.skip((size_t) cell_count * row_ref);
+        io.skip((size_t) cell_count * row_ref * n_planes);
     }
 }
 
@@ -977,12 +1003,17 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::vector<std::pair<uint32_t, uint32_t>>> & cell_ranges) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
+
+    // [RS_RING_SERIALIZE] plane count is recorded so a reader with different ring geometry
+    // rejects the blob instead of desyncing on it (state_read_data compares and bails).
+    const uint32_t n_planes = (uint32_t) cell_ranges.size();
+    io.write(&n_planes, sizeof(n_planes));
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
@@ -998,12 +1029,15 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
         io.write(&r_size_row, sizeof(r_size_row));
 
-        // Write each logical cell row range. With pending recurrent rollback,
-        // the logical current state may live in a rollback snapshot plane.
-        for (const auto & range : cell_ranges) {
-            const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * r_size_row;
-            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+        // Write each depth (plane 0 first = live state), each plane's cell row ranges.
+        // With pending recurrent rollback, the logical current state may live in a rollback
+        // snapshot plane; depths are re-rooted there by the caller.
+        for (const auto & ranges : cell_ranges) {
+            for (const auto & range : ranges) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * r_size_row;
+                io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+            }
         }
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
@@ -1011,9 +1045,11 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             const uint64_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
             io.write(&p_size_row, sizeof(p_size_row));
 
-            for (const auto & range : cell_ranges) {
-                const size_t range_size = range.second - range.first;
-                io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
+            for (const auto & ranges : cell_ranges) {
+                for (const auto & range : ranges) {
+                    const size_t range_size = range.second - range.first;
+                    io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
+                }
             }
         }
     }
@@ -1031,12 +1067,14 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             io.write(&s_size_row, sizeof(s_size_row));
 
-            // Write each logical cell row range. With pending recurrent rollback,
+            // Write each depth plane's cell row ranges. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane.
-            for (const auto & range : cell_ranges) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+            for (const auto & ranges : cell_ranges) {
+                for (const auto & range : ranges) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t buf_size = range_size * s_size_row;
+                    io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                }
             }
         }
     } else {
@@ -1060,12 +1098,16 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&n_embd_s, sizeof(n_embd_s));
 
             // For each row, we get the element values of each logical cell
+            // (note: s_trans blobs are rejected by state_read_data; this branch is kept only
+            //  for format symmetry and iterates depth planes like the non-transposed path)
             for (uint32_t j = 0; j < n_embd_s; ++j) {
-                for (const auto & range : cell_ranges) {
-                    const size_t range_size = range.second - range.first;
-                    const size_t src_offset = (range.first + j * mem_size) * s_size_el;
-                    const size_t buf_size = range_size * s_size_el;
-                    io.write_tensor(s_l[il], src_offset, buf_size);
+                for (const auto & ranges : cell_ranges) {
+                    for (const auto & range : ranges) {
+                        const size_t range_size = range.second - range.first;
+                        const size_t src_offset = (range.first + j * mem_size) * s_size_el;
+                        const size_t buf_size = range_size * s_size_el;
+                        io.write_tensor(s_l[il], src_offset, buf_size);
+                    }
                 }
             }
         }
@@ -1192,6 +1234,16 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         return false;
     }
 
+    // [RS_RING_SERIALIZE] plane count recorded by state_write_data; the stream must carry exactly
+    // this context's ring geometry (1 live + n_rs_seq snapshots) or the layout desyncs -> reject.
+    uint32_t n_planes_ref;
+    io.read(&n_planes_ref, sizeof(n_planes_ref));
+    const uint32_t n_planes = 1 + n_rs_seq;
+    if (n_planes_ref != n_planes) {
+        LLAMA_LOG_ERROR("%s: mismatched rollback plane count (%u instead of %u)\n", __func__, n_planes_ref, n_planes);
+        return false;
+    }
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (uint32_t il = 0; il < n_layer; ++il) {
         // skip null layers
@@ -1216,8 +1268,11 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         }
 
         if (cell_count) {
-            // Read and set the keys for the whole cell range
-            io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+            // Read and set the keys for the whole cell range, one block per depth plane
+            // (depth d lands in physical rows [d*size + head, d*size + head + cell_count))
+            for (uint32_t d = 0; d < n_planes; ++d) {
+                io.read_tensor(r_l[il], (d * size + head) * r_size_row, cell_count * r_size_row);
+            }
         }
 
         if (p_l[il] != nullptr) {
@@ -1230,7 +1285,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                io.read_tensor(p_l[il], head * p_size_row, cell_count * p_size_row);
+                for (uint32_t d = 0; d < n_planes; ++d) {
+                    io.read_tensor(p_l[il], (d * size + head) * p_size_row, cell_count * p_size_row);
+                }
             }
         }
     }
@@ -1260,8 +1317,10 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                // Read and set the values for the whole cell range, one block per depth plane
+                for (uint32_t d = 0; d < n_planes; ++d) {
+                    io.read_tensor(s_l[il], (d * size + head) * s_size_row, cell_count * s_size_row);
+                }
             }
         }
     } else {
@@ -1327,21 +1386,28 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
     }
 
     const uint32_t n_layer = hparams.n_layer();
+    const uint32_t n_planes = 1 + n_rs_seq; // [RS_RING_SERIALIZE] mirror the per-plane write pattern of state_read_data
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il] != nullptr) {
             const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            llama_clear_tensor_data(r_l[il], cell_head * r_size_row, cell_count * r_size_row);
+            for (uint32_t d = 0; d < n_planes; ++d) {
+                llama_clear_tensor_data(r_l[il], (d * size + cell_head) * r_size_row, cell_count * r_size_row);
+            }
         }
 
         if (s_l[il] != nullptr) {
             const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
+            for (uint32_t d = 0; d < n_planes; ++d) {
+                llama_clear_tensor_data(s_l[il], (d * size + cell_head) * s_size_row, cell_count * s_size_row);
+            }
         }
 
         if (p_l[il] != nullptr) {
             const size_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
-            llama_clear_tensor_data(p_l[il], cell_head * p_size_row, cell_count * p_size_row);
+            for (uint32_t d = 0; d < n_planes; ++d) {
+                llama_clear_tensor_data(p_l[il], (d * size + cell_head) * p_size_row, cell_count * p_size_row);
+            }
         }
     }
 }

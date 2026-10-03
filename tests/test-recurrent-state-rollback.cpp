@@ -489,6 +489,8 @@ struct test_results {
     test_status replay   = test_status::SKIP;
 };
 
+static test_status test_ring_save_load_rewind(const common_params & params, llama_model * model, uint8_t fill);
+
 // Run every test for an initialized model over both cache fills.
 static test_results run_tests(const common_params & params, llama_model * model) {
     test_results res;
@@ -496,9 +498,12 @@ static test_results run_tests(const common_params & params, llama_model * model)
         LOG_INF("%s: testing with cache fill 0x%02x\n", __func__, fill);
         const test_status rb = test_rollback(params, model, fill);
         const test_status rp = test_multi_seq_split_replay(params, model, fill);
-        res.rollback = merge_status(res.rollback, rb);
+        // the save/load/rewind round trip is a rollback test over a deserialized ring — reported
+        // under the rollback column; a failure names itself via LOG_ERR(__func__)
+        const test_status rg = test_ring_save_load_rewind(params, model, fill);
+        res.rollback = merge_status(merge_status(res.rollback, rb), rg);
         res.replay   = merge_status(res.replay,   rp);
-        if (rb == test_status::FAIL || rp == test_status::FAIL) {
+        if (rb == test_status::FAIL || rp == test_status::FAIL || rg == test_status::FAIL) {
             break;
         }
     }
@@ -533,6 +538,108 @@ static void print_usage(int /* argc */, char ** argv) {
     LOG("\n  %s -m your_model.gguf\n", argv[0]);
     LOG("\n  %s --models tests/test-models\n", argv[0]);
     LOG("\n");
+}
+
+// [RS_RING_SERIALIZE] save -> load -> rewind round trip: decode a prompt on src, snapshot the
+// WHOLE state (ring included), load it into a fresh context, then arm a rollback via a partial
+// seq_rm — which is only sound if the depth planes travelled with the blob. Replay from the
+// rewind point on both contexts and compare logits. Without ring serialization the arming would
+// still "succeed" mechanically (rs_idx is just an index), but the deep planes in the destination
+// would hold whatever the destination last decoded, so the replay comparison is what actually
+// proves the round trip.
+//
+// Depth 1 only: that is the production case this serialization exists for (the generation-
+// suffix mismatch re-renders exactly one token differently). The tolerance matches the split-
+// replay test — a restored ring consumes depth-d snapshots on the first decode, so any drift is
+// the same fused-op non-determinism bound as elsewhere, not a serialization error.
+static test_status test_ring_save_load_rewind(const common_params & params, llama_model * model, uint8_t fill) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto ctx_src = make_ctx(params, model, fill);
+    auto ctx_dst = make_ctx(params, model, fill);
+    if (!ctx_src || !ctx_dst) {
+        LOG_ERR("%s: failed to init contexts\n", __func__);
+        return test_status::FAIL;
+    }
+
+    const uint32_t n_rs_seq = llama_n_rs_seq(ctx_src.get());
+    constexpr uint32_t n_rollback = 1;
+    if (n_rs_seq < n_rollback) {
+        LOG_INF("%s: skipping because n_rs_seq is too small\n", __func__);
+        return test_status::SKIP;
+    }
+
+    std::vector<llama_token> tokens(n_rs_seq + 1, 0);
+    const uint32_t  n_tokens     = tokens.size();
+    const llama_pos rollback_pos = (llama_pos) n_tokens - n_rollback;
+
+    // Decode the full prompt on src with NO pending rollback, so the ring depths map 1:1 onto
+    // physical planes in the saved blob (the auto disk-cache writer's exact situation).
+    if (!decode_tokens(ctx_src.get(), tokens)) {
+        LOG_ERR("%s: failed to decode prompt\n", __func__);
+        return test_status::FAIL;
+    }
+
+    common_prompt_checkpoint ckpt;
+    ckpt.update_tgt(ctx_src.get(), 0, 0);
+
+    // Dirty the destination's ring rows BEFORE loading: decode a different prompt so its buffers
+    // hold states of DIFFERENT positions. Without ring serialization those dirty rows are exactly
+    // what a restored rewind would read back (only plane 0 travels), making the replay below
+    // diverge from the reference; with serialization the blob overwrites them with src's real
+    // depth planes. A pristine destination could match on both formats, so this is what makes
+    // the test discriminate.
+    if (!decode_tokens(ctx_dst.get(), std::vector<llama_token>(n_rs_seq + 1, 1))) {
+        LOG_ERR("%s: failed to dirty destination cache\n", __func__);
+        return test_status::FAIL;
+    }
+
+    ckpt.load_tgt(ctx_dst.get(), 0, 0);
+
+    // Arm the rewind on the DESTINATION only, purely from the restored ring: a partial seq_rm
+    // within n_rs_seq of the loaded position. This is the server's auto-restore ring path.
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, rollback_pos, -1)) {
+        LOG_ERR("%s: ring rewind on restored context failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // Reference: rewind the source by the same depth through its own live ring.
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, rollback_pos, -1)) {
+        LOG_ERR("%s: reference rewind failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // Replay both sides from the rewind point; the pending rollbacks are consumed by the first
+    // decoded token. Identical buffers produce bit-identical logits; the bound only absorbs fused-op
+    // non-determinism. It is deliberately TIGHTER than the split-replay test's 1e-4: measured on the
+    // dummy models, a format that drops the depth planes (only plane 0 travels) diverges here by
+    // ~3e-5..1e-4 against the dirty destination, while a format that carries them matches at <=1e-11.
+    // 1e-6 sits between the two regimes so this test actually fails when ring serialization is absent.
+    constexpr double nmse_eps = 1e-6;
+    for (uint32_t i = 0; i < n_rollback; ++i) {
+        const llama_pos pos = rollback_pos + i;
+        if (!decode_one(ctx_dst.get(), tokens[pos], pos) ||
+            !decode_one(ctx_src.get(), tokens[pos], pos)) {
+            LOG_ERR("%s: replay failed at position %d\n", __func__, pos);
+            return test_status::FAIL;
+        }
+
+        const float * logits_dst = llama_get_logits_ith(ctx_dst.get(), 0);
+        const float * logits_src = llama_get_logits_ith(ctx_src.get(), 0);
+        if (logits_dst == nullptr || logits_src == nullptr) {
+            LOG_ERR("%s: missing logits at position %d\n", __func__, pos);
+            return test_status::FAIL;
+        }
+
+        const double nmse_val = nmse(logits_src, logits_dst, n_vocab);
+        if (nmse_val > nmse_eps) {
+            LOG_ERR("%s: restored-ring replay mismatch at position %d, nmse %g\n", __func__, pos, nmse_val);
+            return test_status::FAIL;
+        }
+    }
+
+    LOG_INF("%s: ring save/load/rewind round trip OK\n", __func__);
+    return test_status::PASS;
 }
 
 int main(int argc, char ** argv) {
