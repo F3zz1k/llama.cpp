@@ -233,6 +233,38 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # Byte-level disk-cache chain checks: a whole root plus [p0, -1) range deltas composed with NO_CLEAR
+    # must give the same state blob (and bitwise-equal logits) as a whole restore, also into a context of
+    # another n_ctx and for a chain written at another n_ctx. One run per delta-capable memory class.
+    set(DELTA_BYTES_TMP "${CMAKE_CURRENT_BINARY_DIR}/test-delta-bytes-tmp")
+    set(DELTA_BYTES_CLASSES
+        llama-dense gemma3-dense qwen35-dense glm-dsa-moe deepseek32-moe hy_v4-moe
+        minimax-m3-moe dots3note-moe glm5-next-moe qwen4exp-moe)
+    foreach(model ${DELTA_BYTES_CLASSES})
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/${model}")
+        llama_test(test-delta-bytes NAME test-delta-bytes-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/${model}"
+                 --splits 130,200,300,401 --nctx-a 1024 --nctx-b 2048)
+        set_tests_properties(test-delta-bytes-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # DeepSeek-V4: chains long enough for HCA rows (ratio 128) to be written by deltas starting past row
+    # 0, at block-aligned and unaligned starts, across a rung where the HCA cache size itself changes,
+    # and with an MTP-style rollback whose drafts complete an HCA block
+    set(DELTA_BYTES_DSV4
+        "hca|--splits|100,256,300,700,1030,1500|--nctx-a|2048|--nctx-b|4096"
+        "hca-unaligned|--splits|127,128,129,383,384,385,1100|--nctx-a|2048|--nctx-b|1280|--ubatch|64"
+        "hca-rung|--splits|130,257,700|--nctx-a|1024|--nctx-b|40960"
+        "hca-rollback|--splits|300,638|--nctx-a|1024|--nctx-b|2048|--rs|3|--rollback|3")
+    foreach(case ${DELTA_BYTES_DSV4})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 case_name)
+        list(REMOVE_AT case_args 0)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deepseek4-${case_name}")
+        llama_test(test-delta-bytes NAME test-delta-bytes-deepseek4-${case_name} LABEL main
+            ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf" --tmp "${DELTA_BYTES_TMP}/deepseek4-${case_name}" ${case_args})
+        set_tests_properties(test-delta-bytes-deepseek4-${case_name} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+
     llama_build(test-fusion.cpp)
 endif()
 

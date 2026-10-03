@@ -322,6 +322,37 @@ int main(int argc, char ** argv) {
     load_chain(D, files_a, n_prompt);
     if (!cmp_blob(o, "D(compose, nctx_b) vs W", BW, blob(D, o.seq_b), "W", "D")) g_fail++;
 
+    // ---- R: a node that does not continue the sequence it is appended to must be refused by the cache
+    //         itself, not only by the server's chain-contiguity check
+    if (files_a.size() >= 3 && o.rollback == 0) {
+        std::vector<llama_token> tok(65536);
+        size_t n_out = 0;
+        auto load = [&](llama_context * X, const std::string & f, llama_state_seq_flags fl) {
+            return llama_state_seq_load_file_ext(X, f.c_str(), o.seq_b, fl, tok.data(), tok.size(), &n_out);
+        };
+        // the same delta twice: its cells overlap what the sequence already holds
+        llama_context * R = make_ctx(model, o, o.nctx_a);
+        CHECK(load(R, files_a[0], 0) > 0, "R: root");
+        CHECK(load(R, files_a[1], LLAMA_STATE_SEQ_FLAGS_NO_CLEAR) > 0, "R: delta 1");
+        const size_t r_dup = load(R, files_a[1], LLAMA_STATE_SEQ_FLAGS_NO_CLEAR);
+        printf("  R: delta 1 appended twice                 %s\n", r_dup == 0 ? "REFUSED (ok)" : "ACCEPTED");
+        CHECK(r_dup == 0, "a delta overlapping its base was accepted");
+        llama_free(R);
+
+        // a skipped node: the plain caches accept the gap (M-RoPE media legitimately spends fewer positions
+        // than cells), the DeepSeek-V4 compressed sections must not, their rows would no longer line up
+        char arch[64] = {0};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        if (std::string(arch) == "deepseek4") {
+            llama_context * S = make_ctx(model, o, o.nctx_a);
+            CHECK(load(S, files_a[0], 0) > 0, "S: root");
+            const size_t r_skip = load(S, files_a[2], LLAMA_STATE_SEQ_FLAGS_NO_CLEAR);
+            printf("  S: root + delta 2 (delta 1 skipped)      %s\n", r_skip == 0 ? "REFUSED (ok)" : "ACCEPTED");
+            CHECK(r_skip == 0, "a DSV4 delta that does not continue its base was accepted");
+            llama_free(S);
+        }
+    }
+
     // ---- N: compose while another sequence decodes between the nodes
     llama_context * N = nullptr;
     const int seq_noise = o.seq_b == 0 ? 1 : 0;
