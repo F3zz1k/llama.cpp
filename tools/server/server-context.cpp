@@ -1809,6 +1809,21 @@ private:
         }
     }
 
+    // A save that is DROPPED (nothing published) is never silent either: a WRN naming the reason,
+    // rate-limited to one line per minute so a full disk cannot flood the journal, plus a cumulative
+    // counter (llamacpp:auto_cache_save_failed_total). Generation is unaffected (invariant 4).
+    int64_t auto_save_fail_last_wrn_ms = -1;
+    void auto_save_note_failure(const server_slot & slot, const char * reason, size_t n_tokens) {
+        metrics.n_auto_save_failed++;
+        const int64_t now_ms = ggml_time_ms();
+        if (auto_save_fail_last_wrn_ms < 0 || now_ms - auto_save_fail_last_wrn_ms >= 60 * 1000) {
+            auto_save_fail_last_wrn_ms = now_ms;
+            SLT_WRN(slot, "auto-save: dropped a %zu-token save: %s (dropped so far = %" PRIu64 "; "
+                          "this line is rate-limited to one per minute, see llamacpp:auto_cache_save_failed_total)\n",
+                    n_tokens, reason, metrics.n_auto_save_failed);
+        }
+    }
+
     // The value the ENGINE masks with (llama_model_n_swa), NEVER zeroed by --swa-full. Every disk
     // save/restore soundness decision must use THIS, not n_swa: --swa-full enlarges the SWA cache but
     // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
@@ -2996,8 +3011,7 @@ private:
         // snapshot that neither the delta probe (is_node only) nor the cell-count check would catch.
         // No caller asks for one (both pass hi == toks.size()), so refuse it outright, loudly.
         if ((size_t) hi != toks.size()) {
-            SLT_WRN(slot, "auto-save: refusing a partial [0, %d) root of a %zu-token sequence "
-                          "(partial roots are not supported)\n", (int) hi, toks.size());
+            auto_save_note_failure(slot, "partial [0, hi < N) roots are not supported", (size_t) hi);
             return;
         }
         const llama_tokens & snap_toks = toks;
@@ -3016,6 +3030,7 @@ private:
             if (sec || sinfo.available < sz_need + sz_need / 10) {
                 SLT_DBG(slot, "auto-save: skipped, insufficient free space (need %zu bytes + 10%% slack, available %zu)\n",
                         sz_need, sec ? 0 : (size_t) sinfo.available);
+                auto_save_note_failure(slot, sec ? "free-space query failed" : "insufficient free space", snap_toks.size());
                 return;
             }
         }
@@ -3065,6 +3080,7 @@ private:
         }
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
+            auto_save_note_failure(slot, "state write failed (disk full or IO error)", snap_toks.size());
             return; // invariant 4: disk full / IO error -> generation unaffected
         }
 
@@ -3080,6 +3096,7 @@ private:
                 std::error_code ec;
                 std::filesystem::remove(probe, ec);
                 std::filesystem::remove(tmp, ec);
+                auto_save_note_failure(slot, "delta probe whole-save failed (disk full or IO error)", snap_toks.size());
                 return; // could not probe; try again on the next save rather than guess
             }
             delta_capable = (nwrite < nwhole) ? delta_cap::yes : delta_cap::no;
@@ -3099,6 +3116,7 @@ private:
                     nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
                     if (nwrite == 0) {
                         std::filesystem::remove(tmp, ec);
+                        auto_save_note_failure(slot, "whole-root rewrite after the delta probe failed", snap_toks.size());
                         return; // invariant 4
                     }
                 } else {
@@ -3125,6 +3143,7 @@ private:
                         "(%zu B for %zu tokens) - the memory type serialised nothing\n",
                         nwrite, snap_toks.size());
                 std::error_code ec; std::filesystem::remove(tmp, ec);
+                metrics.n_auto_save_failed++;
                 return;
             }
         }
@@ -3149,6 +3168,7 @@ private:
                 nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
                 if (nwrite == 0) {
                     std::filesystem::remove(tmp, ec);
+                    auto_save_note_failure(slot, "whole-root rewrite after a failed delta cell-count check failed", snap_toks.size());
                     return; // invariant 4
                 }
             }
@@ -3175,6 +3195,7 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            auto_save_note_failure(slot, ".meta sidecar write failed", snap_toks.size());
             return; // invariant 4
         }
         // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
@@ -3185,6 +3206,7 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            auto_save_note_failure(slot, "rename of the state file into place failed", snap_toks.size());
             return; // invariant 4
         }
         std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
@@ -3200,6 +3222,7 @@ private:
             std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+            auto_save_note_failure(slot, "rename of the .meta sidecar into place failed", snap_toks.size());
             return; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
 

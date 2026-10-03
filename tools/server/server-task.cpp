@@ -1579,6 +1579,11 @@ std::string server_task_result_metrics::to_metrics() {
             "Auto disk KV cache: parented saves published as whole roots because this memory type cannot write deltas",
             (double) metrics.n_auto_save_whole_fallback
         },
+        {
+            "auto_cache_save_failed_total",
+            "Auto disk KV cache: saves dropped with nothing published (no space, IO error, refused); each logs a rate-limited WRN with the reason",
+            (double) metrics.n_auto_save_failed
+        },
     };
 
     const std::vector<metric_item> gauges = {

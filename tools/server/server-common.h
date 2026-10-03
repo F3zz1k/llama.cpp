@@ -846,6 +846,7 @@ struct server_metrics {
 
     // auto disk KV cache: opportunities that were skipped or degraded (never silent, each also logs a WRN)
     uint64_t n_auto_save_whole_fallback    = 0; // parented saves published as whole roots because the class cannot write deltas
+    uint64_t n_auto_save_failed            = 0; // saves dropped with nothing published (no space, IO error, refused)
 
     void init() {
         t_start = ggml_time_us();
