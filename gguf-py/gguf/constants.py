@@ -625,7 +625,6 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     INKLING          = auto()
     QWEN3TTS         = auto()
-    INSTELLA_MOE     = auto()
     POCKETTTS        = auto()
 
 
@@ -1384,7 +1383,6 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.INKLING:          "inkling",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
-    MODEL_ARCH.INSTELLA_MOE:     "instella-moe",
     MODEL_ARCH.POCKETTTS:        "pockettts",
 }
 
@@ -5424,32 +5422,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
-    ],
-
-    MODEL_ARCH.INSTELLA_MOE: [
-        MODEL_TENSOR.TOKEN_EMBD,
-        MODEL_TENSOR.OUTPUT_NORM,
-        MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.ATTN_Q,
-        MODEL_TENSOR.ATTN_KV_A_MQA,
-        MODEL_TENSOR.ATTN_KV_A_NORM,
-        MODEL_TENSOR.ATTN_K_B,
-        MODEL_TENSOR.ATTN_V_B,
-        MODEL_TENSOR.ATTN_GATE,
-        MODEL_TENSOR.ATTN_OUT,
-        MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.FFN_GATE,
-        MODEL_TENSOR.FFN_DOWN,
-        MODEL_TENSOR.FFN_UP,
-        MODEL_TENSOR.FFN_GATE_INP,
-        MODEL_TENSOR.FFN_EXP_PROBS_B,
-        MODEL_TENSOR.FFN_GATE_EXP,
-        MODEL_TENSOR.FFN_DOWN_EXP,
-        MODEL_TENSOR.FFN_UP_EXP,
-        MODEL_TENSOR.FFN_GATE_SHEXP,
-        MODEL_TENSOR.FFN_DOWN_SHEXP,
-        MODEL_TENSOR.FFN_UP_SHEXP,
     ],
 }
 
