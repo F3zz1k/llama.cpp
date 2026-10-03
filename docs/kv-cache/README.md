@@ -35,7 +35,8 @@ The cache is model-general, but the **sub-range** features depend on how a model
 | Dense / full attention (`PART`, `n_swa == 0`) | Qwen3.x dense | ✅ full (save **and** restore reuse) | ✅ write-side win¹ | ✅ |
 | SWA / iSWA (`PART`, `n_swa > 0`) | Gemma | ✅ (attention delta + window saved whole) | ✅ (+ restore reuse) | ✅² |
 | Recurrent / hybrid (`FULL`/`RS`) | Mamba / GDN (a3b-class) | ✅ attention delta + recurrent state whole; restore is extend-only | ✅ | ✅² |
-| Sparse-attention hybrid **with an indexer cache** | `qwen4exp` (QSA) with indexer tensors | ❌ whole roots only, by design³ | ❌ (same reason) | ✅² |
+| Sparse attention with an indexer or compressed KV | `qwen4exp`, `glm5-next`, `glm-dsa`, `deepseek32`, `minimax-m3`, `deepseek4` | ✅ every section takes the range³ | ✅ | ✅² |
+| Pure recurrent | Mamba / Mamba-2 / RWKV | whole roots only (the state is a fold of the whole prefix) | n/a | ✅² |
 
 ¹ On dense models a **multimodal delta** cuts the per-turn write (no more re-writing the whole KV),
 but restore still needs the whole verified prefix — the restore-reuse upside is on SWA.
@@ -48,21 +49,11 @@ saved a `[0, B)` **sub-range** with the slot sitting at `N`, which mislabelled t
 `B`-length prefix and was therefore hard-gated to dense-only; the mid-prefill whole-save removes that
 gate — the production qwen3.6-27b, a `qwen35` hybrid, now writes and reuses a base.) Later chats sharing
 the preamble RESTORE this base (longest-prefix restore) instead of re-prefilling it.
-³ `llama_memory_hybrid_idx` (upstream's block-sparse-attention memory, built for `LLM_ARCH_QWEN4EXP`
-when `hparams.indexer_head_size > 0`) appends a **third** indexer section to `state_write` that its
-`state_read` unconditionally reads back. A position-range write cannot carry that section, and even if
-it could the composed restore would be rejected: the indexer restore adopts the attention cache's slot
-layout, which `llama_kv_cache::state_read_meta` refuses under `LLAMA_STATE_SEQ_FLAGS_NO_CLEAR`. So
-`llama_memory_hybrid_idx::state_write_range` **fails closed**: whenever an indexer cache is present it
-ignores `[p0, p1)` and writes the whole sequence, exactly as the `llama_memory_i` base default does.
-The server's one-shot delta-capability probe then measures `nwrite == nwhole` and latches
-`delta_cap::no`, so such an instance only ever publishes whole roots: correct, just not incremental.
-A `qwen4exp` GGUF carrying **no** indexer tensors has a null `mem_idx`, falls through to
-`llama_memory_hybrid::state_write_range`, and gets normal deltas. (The other indexer-bearing memory
-classes, `llama_kv_cache_msa` for `minimax_m3` and `llama_kv_cache_dsa` / `llama_kv_cache_dsa_iswa`
-for `glm_dsa` and `deepseek32`, derive straight from `llama_memory_i` and never overrode
-`state_write_range` at all, so they have always inherited the same whole-write default and are
-likewise safe.)
+³ Since 2026-10-03. Before that, `llama_memory_hybrid_idx` with an indexer (`qwen4exp`, `glm5-next`)
+deliberately wrote whole, and the DSA, MSA and DSV4 caches had no `state_write_range` at all, so every
+save on those models was a full multi-GB root. The per-class detail and the test that checks each
+composition against an uncached run are in
+[`incremental-disk-cache.md`](incremental-disk-cache.md#which-memory-classes-honour-a-range-and-what-happens-when-they-do-not).
 
 ## Quick start (the common case: a dense chat model)
 
@@ -114,6 +105,91 @@ default `0` changes nothing until you measure your own restore-vs-reprocess cros
    prefix of turn *N+1*. A per-turn timestamp/date injected into the system prompt changes the prefix
    every turn and defeats the cache — keep volatile tokens out of the cached prefix (or after the
    first user message).
+
+## Recommended configurations
+
+These are starting points; every flag is explained in the table under Quick start.
+
+**A pool of identical instances of one model, sharing one store** (the usual production shape):
+
+```sh
+llama-server -m model.gguf -c 131072 -ngl 999 -fa on --parallel 1 \
+    --slot-save-path /mnt/nvme/kvcache/shared \
+    --slot-save-auto --slot-save-incremental \
+    --slot-save-block 256 \
+    --slot-save-idle-seconds 30 \
+    --slot-save-context-min-tokens 4096 \
+    --slot-save-max-mb 100000 \
+    --metrics
+```
+
+* One directory and **one cap for every pool**. `--slot-save-max-mb` is enforced over the whole
+  directory by whichever instance saves, so a pool with a tighter cap would govern eviction for
+  everyone. Raise the cap only when the miss counters below show evictions costing hits.
+* Put the store on NVMe. A restore reads the whole chain, and a spinning disk turns a sub-second
+  restore into minutes.
+* `--metrics` exposes the counters described under "Observing the cache".
+
+**The same, with speculative decoding.** Nothing changes on the cache side; add the draft as usual:
+
+```sh
+    --spec-type draft-mtp --spec-draft-n-max 3            # MTP head inside the model GGUF
+    --model-draft draft.gguf --spec-draft-n-max 4          # or a separate draft model
+```
+
+Each unit then also gets a `.dft` draft sidecar, so a restored conversation drafts warm (see
+"Speculative decoding and the cache"). Snapshots stay interchangeable between instances with and
+without speculation: the target `.bin` is the same either way, and an instance without a draft
+simply ignores the sidecars.
+
+**Context rungs (the same model at several context sizes, e.g. 1 GPU at 131072 and 2 GPUs at
+262144).** A conversation that outgrows the small rung restores its snapshots into the larger one,
+provided every rung uses identical fingerprint fields apart from `-c`: same model file, same
+`--cache-type-k/v`, same `--slot-save-block`, and the **same RoPE/YaRN settings**
+(`--rope-scaling`, `--rope-scale`, `--yarn-orig-ctx`, ...). The GPU count and tensor split are not
+part of the fingerprint. The reverse direction (a large snapshot into a smaller context) is refused,
+and models with a sliding window (iSWA) only restore at an identical `-c`.
+
+## Speculative decoding and the cache
+
+With a separate draft context (`draft-mtp`, `draft-eagle3`, `draft-simple` with `--model-draft`),
+every auto-save also writes `<unit>.dft`: the draft context's cells for the same `[lo, N)` split as
+the unit. A restore loads the chain's `.dft` files in the same order and with the same `NO_CLEAR`
+composition as the target, all or nothing. Without them the draft would attend over a hole `[0, L)`
+for the rest of the restored conversation, silently lowering acceptance.
+
+Draft KV only changes how many drafted tokens are accepted, never the output (the target verifies
+every token), so a stale or missing sidecar costs speed, never correctness. A shared-cells draft
+(Gemma-4 class) serialises nothing and needs none. `.dft` files are accounted, evicted and reaped
+with their unit. Check `llamacpp:auto_cache_restore_draft_warm_total` against
+`auto_cache_restore_draft_cold_total` to see how often a restore came back warm.
+
+## Observing the cache (hits, misses, saves)
+
+With `--metrics`, `GET /metrics` carries these cumulative counters (prefix `llamacpp:`):
+
+| Counter | Meaning |
+|---|---|
+| `auto_cache_restore_hit_total` | requests that restored a prefix from disk |
+| `auto_cache_restore_miss_total` | requests with at least one whole block beyond the in-memory match that restored nothing |
+| `auto_cache_restore_failed_total` | restores whose load failed after clearing the slot (fell back to a shorter snapshot or cold) |
+| `auto_cache_restore_tokens_total` | prompt tokens restored from disk |
+| `auto_cache_save_root_total` / `auto_cache_save_delta_total` | whole roots / delta nodes published |
+| `auto_cache_save_bytes_total` | state bytes published |
+| `auto_cache_save_whole_fallback_total` | parented saves published whole because the memory type cannot write deltas |
+| `auto_cache_save_failed_total` | saves dropped with nothing published (each logs a rate-limited WRN with the reason) |
+| `auto_cache_evicted_total` | units this instance evicted to stay under the caps |
+| `auto_cache_save_draft_total`, `auto_cache_restore_draft_{warm,cold}_total` | draft sidecars, see above |
+
+A miss includes prompts no cache could have held (a brand-new conversation), so read it next to
+`auto_cache_evicted_total`: misses that climb together with evictions are the sign the store is too
+small. Per request, `timings.cache_disk_n` (present only when non-zero) is the part of `cache_n`
+that came from disk rather than from the resident slot, which a router can forward to its clients:
+
+```sh
+curl -s localhost:8080/metrics | grep auto_cache_
+curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prompt":true}' | jq .timings
+```
 
 ## Engine state-file format (`.bin`) and upstream version bumps
 

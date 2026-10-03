@@ -100,6 +100,9 @@ upstream.
 | `--slot-save-idle-seconds N` | 60 | Also flush an idle slot to disk after `N` seconds of inactivity, not only when the slot is reused — so a single request survives a restart or is picked up by another instance without waiting for more traffic. `-1` disables. Requires `--slot-save-auto`. |
 | `--slot-save-max-count N` | 0 (unlimited) | Bound the **`--slot-save-auto` cache** to at most `N` snapshots; oldest are deleted first. `0` = unlimited. No effect without `--slot-save-auto`. |
 | `--slot-save-max-mb N` | 0 (unlimited) | Bound the **`--slot-save-auto` cache** to `N` MiB total; oldest deleted first. `0` = unlimited. A single snapshot larger than this is refused (not allowed to wipe the rest). No effect without `--slot-save-auto`. |
+| `--slot-save-incremental` | off | Save a growing conversation as a small delta node chained to its previous snapshot instead of a whole snapshot each time. Every memory type except pure recurrent supports it (see `docs/kv-cache/incremental-disk-cache.md`). Requires `--slot-save-auto`. |
+| `--slot-save-context-min-tokens N` | 4096 | Whole-save a shared preamble (system prompt, tools, RAG) once, mid-prefill, as a base that later chats restore. The floor is `max(--slot-save-block, N)`. |
+| `--slot-restore-min-tokens N` | 0 | Skip a disk restore whose verified prefix is shorter than `N` tokens and re-prefill instead. `0` always restores. |
 
 > **Eviction is opt-in.** Plain `--slot-save-path` (manual `/slots` save, upstream behaviour)
 > never deletes anything. The bounded LRU store only runs when `--slot-save-auto` owns the
@@ -325,51 +328,57 @@ whole prompt.
 - [`docs/kv-cache/01-primitives-recurrent-restore.md`](docs/kv-cache/01-primitives-recurrent-restore.md) — the recurrent-model restore/regenerate fixes
 - [`docs/kv-cache/02-auto-disk-cache.md`](docs/kv-cache/02-auto-disk-cache.md) — the automatic disk cache (indexing, fingerprinting, cross-process)
 - [`docs/kv-cache/03-multimodal-cache.md`](docs/kv-cache/03-multimodal-cache.md) — multimodal snapshots (media identity records, the v2 `.meta` format, verification order, manual `/slots` rehydration)
+- [`docs/kv-cache/README.md`](docs/kv-cache/README.md) — **recommended configurations** (pool, speculative decoding, context rungs), the `.dft` draft sidecar, and the `/metrics` counters for cache hits, misses, saves and evictions
 - the "Automatic disk prompt cache" section of [`tools/server/README.md`](tools/server/README.md) — user-facing invariants, restore semantics and operational notes
 
 ---
 
-## Carried upstream-bug workaround: SYCL tensor-parallel VMM hang
+## Retired carries (dropped in the 2026-10 upstream merge)
 
-**REMOVE THIS PATCH once upstream fixes it.** Commit: `sycl: fix hang in --split-mode
-tensor all-reduce with VMM pool`.
+Two SYCL commits used to be carried on top of upstream. Both were dropped when upstream
+`836d57176` was merged, and `ggml/src/ggml-sycl/ggml-sycl.cpp` is now upstream's file. Neither
+replacement has been run on GPU yet, so each has a check to pass before it is trusted.
 
-Unlike the rest of this fork, that commit is **not a feature of ours**. It is a workaround
-for an upstream defect in the `--split-mode tensor` all-reduce (introduced by upstream
-PR #24152). The BF16 large path peer-copies from a `ggml_sycl_pool_alloc` buffer on the
-other device; when that comes from the VMM pool and exceeds 4 MiB (two 2 MiB pages), the
-peer copy is enqueued and its event never signals, hanging the decode thread.
+### SYCL tensor-parallel VMM hang (`cd1dd9d76`)
 
-Since the note was first written, upstream has moved those two scratch buffers: they used
-to be allocated per all-reduce inside `ggml_backend_sycl_comm_allreduce_tensor`, and are
-now `buf0` / `buf1` members of the persistent `ggml_backend_sycl_comm_context` built by
-`ggml_backend_sycl_comm_init` (`ggml/src/ggml-sycl/ggml-sycl.cpp`). Our patch moved with
-them: on this branch `buf0` / `buf1` are raw `uint8_t *` from `ggml_sycl_malloc_device`,
-allocated lazily on the first all-reduce once `nelem` is known and released in
-`ggml_backend_sycl_comm_free`. Upstream still holds them as
-`std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>` constructed from `sctx0->pool()` /
-`sctx1->pool()`.
+The carried fix moved the two `--split-mode tensor` all-reduce scratch buffers off the VMM pool
+(`ggml_sycl_malloc_device` instead of `ggml_sycl_pool_alloc`), because the BF16 large path
+peer-copied from a VMM pool buffer on the other device, and once that buffer spanned more than two
+2 MiB pages the peer copy never signalled and decode hung (2x Arc Pro B70: `-ub 200` ok, `-ub 208`
+hung; upstream issues #26409 and #25711).
 
-Measured on 2x Arc Pro B70: `-ub 200` (3.91 MiB) works, `-ub 208` (4.06 MiB) hangs, and
-everything larger hangs, on the first request. Reproduces on Qwen3.6-27B and Qwen3.8-27B.
-The fix allocates those two scratch buffers with `ggml_sycl_malloc_device` instead of from
-the pool.
+Upstream has **not** changed the allocation: `ggml_backend_sycl_comm_init` still builds `buf0` /
+`buf1` from `sctx0->pool()` / `sctx1->pool()`, so the removal test this section used to state does
+not fire. What changed is the copy. Upstream `2a53ace3b` (#29604) stages every all-reduce exchange
+through pinned host memory (`ggml_sycl_comm_exchange`: device to host `memcpy` on each queue, a host
+`memcpy` between the two, host to device back), so nothing peer-reads VMM pool memory any more. The
+carried commit's own measurements cover that combination:
 
-Tracking:
-- Upstream issue: ggml-org/llama.cpp#26409 (ours), and #25711 (independent report, same
-  hardware).
-- Candidate patch offered upstream from branch `sycl-tp-fix-vmm-peer-deadlock`.
+```
+VMM pool + peer copy        -> hangs
+VMM pool + host-staged copy -> works  (GGML_SYCL_DEV2DEV_MEMCPY=2)
+```
 
-**When upstream lands a fix, drop our commit rather than merging both.** Check on each
-upstream merge (we merge, never rebase): if `ggml_backend_sycl_comm_init` no longer builds
-`ctx->buf0` / `ctx->buf1` from `sctx0->pool()` / `sctx1->pool()` (wherever the two scratch
-buffers have moved to by then, the test is whether they still come from a
-`ggml_sycl_pool_alloc`), upstream has fixed it and this patch is redundant.
+That makes the drop sound in principle, but the device to host copies still read from those
+multi-page VMM pool buffers, and that exact upstream code has not run on our hardware. **Before
+using `-sm tensor` again**, run on a drained pair of cards, with
+`UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1` so a lost context raises an error instead of hanging:
 
-**Still needed as of the 2026-08-29 merge.** Checked against upstream `master` at
-`d7bd3bfca` (2026-08-28): `ggml_backend_sycl_comm_init` still constructs both buffers from
-the device pools, and issues #26409 and #25711 are both still open. Keep the patch.
+```sh
+llama-server -m Qwen3.8-27B.gguf -ngl 999 -fa on -sm tensor --device SYCL1,SYCL2 \
+    -c 16384 -ub 256 --parallel 1
+# send a prompt of a few thousand tokens and generate; -ub 256 makes nelem*4 = 5 MiB on n_embd 5120,
+# past the old 4 MiB cut-off
+```
 
-**Note this is dormant in our deployment** - no registry entry uses `--split-mode tensor`
-(layer split wins on B70 anyway), so it only matters if we start exploring tensor-parallel
-setups.
+If it hangs, re-carry `cd1dd9d76`'s dedicated `ggml_sycl_malloc_device` buffers on top of
+upstream's host exchange. Nothing in the registry uses `-sm tensor` today, so this is dormant.
+
+### SYCL `GGML_OP_TOP_K` for k > 32 (`9dc0e2f12`)
+
+The carried commit let ggml-sycl run `TOP_K` on the GPU for k > 32 (needed by the Qwen3.8-Flash-Next
+sparse-attention indexer). Upstream `21f6b0d22` (#28670, radix select) and `370cb12e8` (#27847, row
+splitting) replace it, and upstream's `supports_op` now accepts any `k <= ne0`, including a single
+long row. That moves deep-context single-row decode of the indexer from the CPU fallback onto the GPU.
+**Before promoting a build**, A/B prefill and decode on `qwen3.8-flash-next` against the current
+release, and gate on `test-backend-ops -o TOP_K`.

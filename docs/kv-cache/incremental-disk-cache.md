@@ -215,29 +215,35 @@ duplicate cells, and the server never gets that far: the one-shot probe (`delta_
 delta write only) writes both the range and the whole sequence and compares byte counts, latching
 `delta_cap::no` when they are equal. **Fails closed: no override means whole roots only.**
 
-Four classes genuinely honour a range: `llama_kv_cache`, `llama_kv_cache_iswa`,
-`llama_memory_hybrid` and `llama_memory_hybrid_iswa`.
+Every memory class llama.cpp builds today honours a range, except pure recurrent memory:
 
-A fifth, upstream's `llama_memory_hybrid_idx` (block-sparse attention, built for `LLM_ARCH_QWEN4EXP`
-when `hparams.indexer_head_size > 0`), overrides it **only in order to fall back to that default**.
-Its `state_write` appends a third, indexer section that its `state_read` unconditionally reads back;
-`llama_memory_hybrid::state_write_range` would emit the attention delta and the whole recurrent state
-and drop that section, and neither of the fork's two guards would notice: the byte-count probe sees a
-legitimately smaller write, and `delta_bin_cell_count` stops at the attention delta's non-zero cell
-count. There is also an independent restore-side blocker: the indexer restore adopts the attention
-cache's slot layout (`[TAG_HYBRID_IDX_SINFO]`), and `llama_kv_cache::state_read_meta` rejects a
-mirrored `sinfo_in` layout combined with `NO_CLEAR` (they are mutually exclusive: `sinfo_in` needs the
-cells the preceding `seq_rm` released, and `NO_CLEAR` is exactly the flag that skips that `seq_rm`).
-So `llama_memory_hybrid_idx::state_write_range` ignores `[p0, p1)` and writes the whole sequence
-whenever `mem_idx` is present (`[TAG_HYBRID_IDX_STATE]`); the probe then latches `delta_cap::no` and
-the instance publishes whole roots only. A `qwen4exp` GGUF with no indexer tensors has a null
-`mem_idx` and gets normal deltas. The other indexer-bearing classes, `llama_kv_cache_msa`
-(`minimax_m3`) and `llama_kv_cache_dsa` / `llama_kv_cache_dsa_iswa` (`glm_dsa`, `deepseek32`), derive
-straight from `llama_memory_i` and never overrode `state_write_range`, so they have always taken the
-whole-write default and are safe for the same reason.
+| Class | Architectures (examples) | What a delta node holds |
+|---|---|---|
+| `llama_kv_cache` | dense attention (llama, qwen3, ...) | cells `[p0, p1)` |
+| `llama_kv_cache_iswa` | gemma2/3, iSWA models | base cells `[p0, p1)` + the whole sliding window |
+| `llama_memory_hybrid`, `llama_memory_hybrid_iswa` | qwen35 (GDN), jamba, falcon-h | attention cells `[p0, p1)` + the whole recurrent state |
+| `llama_memory_hybrid_idx` | qwen4exp (QSA), glm5-next | as hybrid, plus the indexer keys `[p0, p1)` |
+| `llama_kv_cache_dsa` | glm-dsa, deepseek32, hy_v4 | MLA cells and lightning-indexer keys `[p0, p1)` |
+| `llama_kv_cache_dsa_iswa` | dots3note | DSA cells `[p0, p1)` + the whole sliding window |
+| `llama_kv_cache_msa` | minimax-m3 | base cells and indexer keys `[p0, p1)` |
+| `llama_kv_cache_dsv4` | deepseek4 | raw-cache delta (window whole), compressed K rows completed at or after `p0` (section version 3), compressor states whole |
+| `llama_memory_recurrent` | mamba, mamba2, rwkv | nothing narrower exists: the state is a fixed-size fold of the whole prefix, so every save is a whole root |
 
-Lifting the `qwen4exp`-with-indexer restriction means relaxing the `NO_CLEAR` + `sinfo_in` rule in
-`llama_kv_cache::state_read_meta` first; the two are not separable.
+`llama_memory_hybrid_idx` used to ignore the range whenever an indexer was present, because
+`llama_kv_cache::state_read_meta` refused a mirrored `sinfo_in` layout under `NO_CLEAR`. That
+refusal rested on a wrong premise: `sinfo_in` is the layout the attention cache was given for the
+current read, i.e. the cells it just allocated for the appended delta, not the cells the sequence
+already held. Both caches carry the same occupancy cell for cell, so those cells are free in the
+indexer cache too; the per-cell free check that follows still fails the restore if they are not.
+
+The composition of every class above is checked against an uncached run by test 10 (`delta`) of
+`tests/test-save-load-state.cpp` over all generate-models dummies: a class that ignores the range is
+reported as `WHOL` instead of being composed. As of 2026-10-03 only `mamba-dense` and `mamba2-dense`
+report `WHOL`. The server-level path (probe YES, v3 nodes, chain composed by a fresh instance) is
+covered for the indexer and compressed classes by `tools/server/tests/unit/test_slot_save_nodelta.py`.
+
+A save that falls back to a whole root because the probe said NO is counted in
+`llamacpp:auto_cache_save_whole_fallback_total` and logged once per instance.
 
 ## Correctness invariants
 
