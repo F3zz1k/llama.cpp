@@ -328,7 +328,7 @@ whole prompt.
 - [`docs/kv-cache/01-primitives-recurrent-restore.md`](docs/kv-cache/01-primitives-recurrent-restore.md) — the recurrent-model restore/regenerate fixes
 - [`docs/kv-cache/02-auto-disk-cache.md`](docs/kv-cache/02-auto-disk-cache.md) — the automatic disk cache (indexing, fingerprinting, cross-process)
 - [`docs/kv-cache/03-multimodal-cache.md`](docs/kv-cache/03-multimodal-cache.md) — multimodal snapshots (media identity records, the v2 `.meta` format, verification order, manual `/slots` rehydration)
-- [`docs/kv-cache/README.md`](docs/kv-cache/README.md) — **recommended configurations** (pool, speculative decoding, context rungs), the `.dft` draft sidecar, and the `/metrics` counters for cache hits, misses, saves and evictions
+- [`docs/kv-cache/README.md`](docs/kv-cache/README.md): **recommended configurations** (pool, speculative decoding, context rungs), the `.dft` draft sidecar, and the `/metrics` counters for cache hits, misses, saves and evictions
 - the "Automatic disk prompt cache" section of [`tools/server/README.md`](tools/server/README.md) — user-facing invariants, restore semantics and operational notes
 
 ---
