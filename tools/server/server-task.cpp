@@ -1620,6 +1620,11 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_auto_restore_failed
         },
         {
+            "auto_cache_restore_not_prefix_total",
+            "Auto disk KV cache: misses where a snapshot of the prefix existed but the request diverged inside it and the memory class cannot rewind (needs a node at or before the divergence)",
+            (double) metrics.n_auto_restore_not_prefix
+        },
+        {
             "auto_cache_restore_tokens_total",
             "Auto disk KV cache: prompt tokens restored from disk",
             (double) metrics.n_auto_restore_tokens

@@ -1939,6 +1939,12 @@ private:
     // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
     int32_t n_swa_mem = 0;
 
+    // Candidates the current restore attempt passed over because the request diverges inside them
+    // and this memory class cannot rewind into a snapshot (the "must extend" rule). Reset by the
+    // restore site before its lookup, bumped by auto_index_lookup's filter and by the whole-prefix
+    // gate in auto_restore_into_slot, read back to classify a miss.
+    size_t auto_not_prefix_skips = 0;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -2035,6 +2041,25 @@ private:
                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO   ||
                n_swa_mem > 0;
+    }
+
+    // An SWA snapshot whose cells all fit inside one window was persisted WHOLE. state_write drops
+    // only the cells masked against the snapshot's OWN pos_max, and while every position is below
+    // n_swa_mem nothing is masked (STANDARD keeps p1 - p0 < n_swa, CHUNKED keeps the first chunk).
+    // Such a snapshot is a complete attention state, so it rewinds per token exactly like plain
+    // attention and the whole-prefix rule does not apply to it. Cells bound positions from above
+    // (M-RoPE media spends fewer positions than cells), so a cell count is a conservative test.
+    // auto_restore_into_slot re-checks the LOADED window (pos_min == 0) before keeping a rewound
+    // restore, which also covers a mask type where n_cells <= n_swa is not sufficient (SYMMETRIC).
+    bool swa_snapshot_is_whole_window(size_t n_cells) const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+               n_swa_mem > 0 && n_cells <= (size_t) n_swa_mem;
+    }
+
+    // Per-snapshot form of restore_is_whole_prefix_only(): the class rule, minus the SWA snapshots
+    // that were persisted whole (see swa_snapshot_is_whole_window).
+    bool restore_needs_whole_prefix(size_t n_cells) const {
+        return restore_is_whole_prefix_only() && !swa_snapshot_is_whole_window(n_cells);
     }
 
     // Whether a snapshot taken at a SMALLER n_ctx may be restored into this
@@ -2400,6 +2425,7 @@ private:
         // cost is negligible against it, and a peer's snapshot written <1s ago (within the throttle
         // window) is still found on this first request rather than only the next one.
         auto_index_refresh_locked(/*force=*/false);
+        std::unordered_set<std::string> seen_not_prefix;
         for (int attempt = 0; attempt < 2; ++attempt) {
             out.clear();
             std::unordered_set<std::string> seen;
@@ -2412,7 +2438,7 @@ private:
                     if (!c.fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
                         continue; // invariant 3
                     }
-                    if (restore_is_whole_prefix_only() && c.n_tokens > req.size()) {
+                    if (restore_needs_whole_prefix(c.n_tokens) && c.n_tokens > req.size()) {
                         // A snapshot longer than the request is never a whole prefix of it, and every
                         // class in restore_is_whole_prefix_only() (FULL, RS and SWA alike) can restore
                         // only a whole prefix. For SWA specifically, its persisted window is anchored at
@@ -2421,6 +2447,11 @@ private:
                         // snapshots, such siblings are the COMMON case. Left unfiltered they exhaust
                         // AUTO_MAX_RESTORE_ATTEMPTS and starve the shorter, usable mid-prefill base
                         // (which sorts last).
+                        // Counted, not silent: the restore site reports a miss that had such a
+                        // candidate as a must-extend miss (WRN + auto_cache_restore_not_prefix_total).
+                        if (seen_not_prefix.insert(c.state_path).second) {
+                            auto_not_prefix_skips++;
+                        }
                         continue;
                     }
                     if (!seen.insert(c.state_path).second) {
@@ -2922,7 +2953,7 @@ private:
         // Only WHOLE-block prefixes are valid reuse lengths (hash boundaries).
         const int B = params_base.slot_save_block;
         int n_keep_disk;
-        if (restore_is_whole_prefix_only()) {
+        if (restore_needs_whole_prefix(disk_toks.size())) {
             // FULL, RS and SWA can only ever resume a snapshot as a WHOLE prefix (see
             // restore_is_whole_prefix_only): do_slot_restore loads the ENTIRE L-token snapshot, and a
             // later keep_first(n_past < L) would issue a partial common_context_seq_rm that either
@@ -2934,6 +2965,7 @@ private:
             // Refuse BEFORE the multi-GB read so the candidate loop falls through to a SHORTER snapshot
             // that IS a whole prefix of this request (e.g. the mid-prefill context base).
             if (v != disk_toks.size()) {
+                auto_not_prefix_skips++;
                 SLT_DBG(slot, "auto-restore: snapshot is not a whole prefix of the request "
                               "(verified %zu of %zu snapshot tokens; request %zu, seq_rm_type = %d, n_swa = %d) - skipping %s\n",
                         v, disk_toks.size(), req.size(), (int) ctx_tgt_seq_rm_type, n_swa_mem, cand.state_path.c_str());
@@ -3043,10 +3075,10 @@ private:
         // restores whole-snapshot extend-matches). Non-SWA attention models skip the checkpoint
         // machinery entirely and need none of this.
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa_mem > 0) {
-            // (this trim is dead since the whole-prefix gate above forces v == disk_toks.size();
-            // kept as a belt-and-braces guard. It was already dead before the gate was merged, the
-            // old SWA branch forced the same equality.)
-            if (v < disk_toks.size()) {
+            // The trim runs only for a snapshot that swa_snapshot_is_whole_window() admitted past the
+            // whole-prefix gate above; every other SWA snapshot reaches here with v == its length.
+            const bool rewound = v < disk_toks.size();
+            if (rewound) {
                 if (disk_media.empty()) {
                     slot.prompt.tokens.keep_first(v); // media prompts were already rebuilt to exactly v cells
                 }
@@ -3055,6 +3087,17 @@ private:
             }
             const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
             const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (rewound && ckpt_pos_min != 0) {
+                // The cell-count test admitted this snapshot, but the loaded window does not start at
+                // position 0, so the save DID mask cells (a mask type the cell count does not bound)
+                // and the rewound prefix would attend over a hole. Drop it and fall through to a
+                // shorter candidate or a cold prefill (invariant 4).
+                SLT_WRN(slot, "auto-restore: snapshot window starts at pos %d, not 0; a rewind to %zu is unsound, clearing restored state\n",
+                        (int) ckpt_pos_min, v);
+                auto_restore_drop(slot);
+                metrics.n_auto_restore_failed++;
+                return 0;
+            }
             if (ckpt_pos_min < 0) {
                 // the trim emptied the SWA cache: the request diverges more than the SWA window
                 // before the snapshot end, so the loaded window holds no position at or below the
@@ -3069,8 +3112,8 @@ private:
             slot.prompt.checkpoints.clear();
             create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
         }
-        // do_slot_restore loaded the snapshot. For every restore_is_whole_prefix_only() class (FULL, RS
-        // and SWA) n_keep_disk == snapshot length (gated above), so the existing regenerate /
+        // do_slot_restore loaded the snapshot. For every restore_needs_whole_prefix() snapshot (FULL, RS
+        // and SWA past one window) n_keep_disk == snapshot length (gated above), so the existing regenerate /
         // suffix-reuse path takes over with no partial rewind. For plain-attention PART the request may
         // diverge inside the snapshot; keep_first(n_past) + a PARTIAL seq_rm then reprefills the
         // divergent tail (supported for PART). The verified prefix is what we claim as reused.
@@ -6430,6 +6473,7 @@ private:
                                     // usable one at the same boundary. Media requests look up first-class:
                                     // auto_index_lookup folds each chunk's identity into the boundary hashes.
                                     int n_restored = 0;
+                                    auto_not_prefix_skips = 0;
                                     for (const auto & cand : auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
@@ -6460,6 +6504,14 @@ private:
                                         slot.stats.n_prompt_cached_disk = (uint64_t) n_restored;
                                     } else if ((int) input_tokens.size() >= n_past + params_base.slot_save_block) {
                                         metrics.n_auto_restore_miss++;
+                                        if (auto_not_prefix_skips > 0) {
+                                            // a snapshot of this prefix exists, but the request diverges inside it
+                                            // and this class cannot rewind (FULL, RS, NO, or SWA past one window):
+                                            // only a node at or before the divergence could have served it
+                                            metrics.n_auto_restore_not_prefix++;
+                                            SLT_WRN(slot, "auto-restore: miss, %zu snapshot(s) share this prefix but the request diverges inside them and this memory class cannot rewind (seq_rm_type = %d, n_swa = %d); a node at or before the divergence is needed\n",
+                                                    auto_not_prefix_skips, (int) ctx_tgt_seq_rm_type, n_swa_mem);
+                                        }
                                     }
                                 }
                                 // ===== end AUTO-RESTORE =====================================================
