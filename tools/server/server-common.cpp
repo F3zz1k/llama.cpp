@@ -1278,12 +1278,10 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
             out.push_back(h);
         }
     }
-    // Degenerate guard: a prompt that still produced no key (e.g. one media chunk shorter than a
-    // block with nothing after it) must be indexable — emit the full length (a prompt never ends
-    // mid-chunk, so the full length is always chunk-safe).
-    if (out.empty() && !cells.empty() && boundary_is_chunk_safe(cells, media, cells.size())) {
-        out.push_back(h);
-    }
+    // No fallback key: a prompt with at least one media record always gets one at its last chunk end
+    // (the cell after it is text, another record's start, or the end, so that boundary is chunk-safe),
+    // and a text prompt shorter than one block gets none, exactly as in the pre-media chain. Such a
+    // prompt is below the save floor (max(block, min-tokens)), so no snapshot keyed by it can exist.
     return out;
 }
 

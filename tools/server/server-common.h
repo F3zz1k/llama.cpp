@@ -566,13 +566,16 @@ static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
 // prompts, so a media prompt's pure-text prefix boundaries hash identically to a
 // text-only prompt's and text<->media prefix reuse works both ways).
 //
-// Only chunk-safe boundaries are emitted (boundary_is_chunk_safe: block-aligned
-// AND not strictly inside a chunk) — this is the SINGLE site enforcing the
-// boundary rule, so save-time insert, scan rehash and lookup cannot drift. A
-// trailing partial block is never a boundary. For a text-only prompt (media
-// empty) every block boundary is chunk-safe and out[k] commits to tokens
-// [0, (k+1)*B) — bit-identical to the pre-media algorithm, same filenames, same
-// index keys. `media` must be ordered by start_idx and tile the NULL cells
+// A key is emitted at every block-aligned position AND at the end of every media
+// chunk, in both cases only where boundary_is_chunk_safe holds (not strictly
+// inside a chunk); this is the SINGLE site enforcing the boundary rule, so
+// save-time insert, scan rehash and lookup cannot drift. A media prompt therefore
+// always has at least one key (its last chunk end), and its keys are NOT
+// positional: out[k] need not commit to (k+1)*B cells. A trailing partial text
+// block is never a boundary. For a text-only prompt (media empty) out[k] commits
+// to tokens [0, (k+1)*B) and nothing else is emitted, bit-identical to the
+// pre-media algorithm (same filenames, same index keys); a text prompt shorter
+// than one block yields no key. `media` must be ordered by start_idx and tile the NULL cells
 // exactly, as extract_media_records / slot_meta_read produce them.
 std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                                         const std::vector<server_media_record> & media,

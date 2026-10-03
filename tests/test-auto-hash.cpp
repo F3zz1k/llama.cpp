@@ -95,11 +95,14 @@ int main(void) {
         llama_tokens text_cells = make_cells(16, {}); // same first 8 tokens, then text
         const auto text_bhs = auto_block_hashes(text_cells, {}, B, salt, fpmm);
         GGML_ASSERT(text_bhs.size() == 4); // 4, 8, 12, 16
-        // media boundaries: 4 (text), 8 (chunk start), 12 (inside chunk -> skipped), 16 (end)
-        GGML_ASSERT(media_bhs.size() == 3);
+        // media keys: 4 (text), 8 (chunk start), 12 (inside chunk -> skipped),
+        // 14 (chunk end, not block-aligned), 16 (end)
+        GGML_ASSERT(media_bhs.size() == 4);
         GGML_ASSERT(media_bhs[0] == text_bhs[0]); // shared text prefix [0,4)
         GGML_ASSERT(media_bhs[1] == text_bhs[1]); // shared text prefix [0,8)
-        GGML_ASSERT(media_bhs[2] != text_bhs[3]); // full prompts differ
+        GGML_ASSERT(media_bhs[3] != text_bhs[3]); // full prompts differ
+        // the chunk-end key at 14 is the [0,14) prefix of the [0,16) chain
+        GGML_ASSERT(auto_block_hashes(llama_tokens(media_cells.begin(), media_cells.begin() + 14), img, B, salt, fpmm).back() == media_bhs[2]);
         // determinism: same inputs, same chain
         GGML_ASSERT(auto_block_hashes(media_cells, img, B, salt, fpmm) == media_bhs);
     }
@@ -139,18 +142,21 @@ int main(void) {
     {
         const std::vector<server_media_record> split =
             { make_rec(8, 3, "image_1", 3), make_rec(11, 3, "image_1", 3) };
+        // keys: 4, 8, 11 (end of the first slice, start of the second: safe), 14, 16
         const auto bhs = auto_block_hashes(media_cells, split, B, salt, fpmm);
-        GGML_ASSERT(bhs.size() == media_bhs.size());
-        GGML_ASSERT(bhs[2] != media_bhs[2]);
+        GGML_ASSERT(bhs.size() == media_bhs.size() + 1);
+        GGML_ASSERT(bhs[0] == media_bhs[0] && bhs[1] == media_bhs[1]);
+        GGML_ASSERT(bhs[3] != media_bhs[2]); // [0,14)
+        GGML_ASSERT(bhs[4] != media_bhs[3]); // [0,16)
     }
 
     // chunk-safe emission on a chunk-start block boundary: 4 text + 6-cell image + 2 text,
-    // B=4 -> boundaries 4 (chunk start, safe), 8 (inside, skipped), 12 (end, safe)
+    // B=4 -> keys 4 (chunk start, safe), 8 (inside, skipped), 10 (chunk end), 12 (end)
     {
         const std::vector<server_media_record> rec = { make_rec(4, 6, "image_1", 3) };
         const llama_tokens cells = make_cells(4, rec, 2);
         const auto bhs = auto_block_hashes(cells, rec, B, salt, fpmm);
-        GGML_ASSERT(bhs.size() == 2);
+        GGML_ASSERT(bhs.size() == 3);
         const auto text_bhs = auto_block_hashes(llama_tokens(cells.begin(), cells.begin() + 4), {}, B, salt, fpmm);
         GGML_ASSERT(bhs[0] == text_bhs[0]); // the [0,4) text boundary is shared
     }
@@ -171,12 +177,29 @@ int main(void) {
             for (size_t idx = Bi; idx <= n; idx += Bi) {
                 n_safe += toks.boundary_is_chunk_safe(idx) ? 1 : 0;
             }
+            // plus one key per chunk end that is not already block-aligned
+            for (const auto & r : recs) {
+                const size_t end = (size_t) r.start_idx + r.n_tokens;
+                GGML_ASSERT(toks.boundary_is_chunk_safe(end));
+                n_safe += end % Bi != 0 ? 1 : 0;
+            }
             GGML_ASSERT(bhs.size() == n_safe);
             if (Bi == 1) {
                 // B=1 visits every cell: the chunk's interior boundaries must have been skipped
                 GGML_ASSERT(n_safe == n - (recs[0].n_tokens - 1));
             }
         }
+    }
+
+    // a media chunk shorter than one block is still indexable: its chunk end is a key
+    // (the case 0301cfbda added chunk-end keys for), with or without a text prefix,
+    // while the same length of pure text below one block has none
+    {
+        const std::vector<server_media_record> only = { make_rec(0, 3, "image_1") };
+        GGML_ASSERT(auto_block_hashes(make_cells(0, only), only, 8, salt, fpmm).size() == 1);
+        const std::vector<server_media_record> after2 = { make_rec(2, 3, "image_1") };
+        GGML_ASSERT(auto_block_hashes(make_cells(2, after2), after2, 8, salt, fpmm).size() == 1);
+        GGML_ASSERT(auto_block_hashes(make_cells(5, {}), {}, 8, salt, fpmm).empty());
     }
 
     printf("test-auto-hash: all tests passed\n");
