@@ -2541,9 +2541,22 @@ mtmd_input_chunk * mtmd_input_chunk_init_stub(mtmd_context * ctx,
         // is not part of the restore-tested fleet (see mtmd.h stub-init contract)
         mtmd_image_tokens_assign_pos_type(ctx, image_tokens.get(), /* image_idx */ 0);
         image_tokens->id = id;
-        // one placeholder entry (empty buf): nz = 1, so n_tokens() derives from nx/ny alone;
-        // multi-frame (video) geometry is not reproducible this way and fails the check below
-        image_tokens->batch_f32.entries.emplace_back();
+        if (ctx->proj_type_v() == PROJECTOR_TYPE_INKLING) {
+            // Inkling builds every image as nx = ny = 1 with n_temporal_merge = 2 and two entries per
+            // output token (see the Inkling branch of the tokenizer above), so n_tokens() counts
+            // entries / 2. Reproduce exactly that layout with 2 * n_tokens / (nx * ny) placeholder
+            // entries; any other recorded geometry fails the check below, as before.
+            image_tokens->n_temporal_merge = 2;
+            const uint32_t n_cells = nx * ny;
+            if (n_cells == 0 || n_tokens % n_cells != 0) {
+                return nullptr;
+            }
+            image_tokens->batch_f32.entries.resize(2 * (size_t) (n_tokens / n_cells));
+        } else {
+            // one placeholder entry (empty buf): nz = 1, so n_tokens() derives from nx/ny alone;
+            // multi-frame (video) geometry is not reproducible this way and fails the check below
+            image_tokens->batch_f32.entries.emplace_back();
+        }
         chunk = new mtmd_input_chunk{
             MTMD_INPUT_CHUNK_TYPE_IMAGE,
             {}, // text tokens
