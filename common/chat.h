@@ -188,6 +188,32 @@ struct common_chat_msg_spans {
         return -1;
     }
 
+    // end (exclusive) of the last system span when the prompt carries NO user message at all, i.e. a
+    // system-prompt-only request (a pre-cache of a shared system prompt). -1 when a user span exists or
+    // there is no system span.
+    int32_t system_only_context_end() const {
+        int32_t end = -1;
+        for (const auto & sp : spans) {
+            if (sp.role == COMMON_CHAT_ROLE_USER) {
+                return -1;
+            }
+            if (sp.role == COMMON_CHAT_ROLE_SYSTEM) {
+                end = (int32_t) (sp.pos + sp.len);
+            }
+        }
+        return end;
+    }
+
+    // end (exclusive) of the last user message, -1 if there is no user span
+    int32_t last_user_message_end() const {
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) (it->pos + it->len);
+            }
+        }
+        return -1;
+    }
+
     // forward-iterate mirror of last_user_message_pos(): the token offset of the FIRST user
     // message, i.e. the end of the shared leading context (system + developer + tool + RAG).
     // Used as the boundary B for the [0,B) shared-context checkpoint. -1 if there is no user span.

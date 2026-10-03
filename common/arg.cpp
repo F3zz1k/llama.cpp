@@ -3752,6 +3752,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-node-system"},
+        {"--no-slot-save-node-system"},
+        "auto disk cache: publish a node at the end of the leading system context (the first user message) "
+        "while a cold prompt prefills, so other conversations sharing that system prompt restore it; a "
+        "request with only a system prompt caches all of it (default: enabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_node_system = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_NODE_SYSTEM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-node-prompt"}, "{off,cold,on}",
+        "auto disk cache: publish a node at the end of the last user message while the prompt prefills, so "
+        "a resend, regenerate or edit of the response restores it even on models that cannot rewind a "
+        "longer snapshot (recurrent, hybrid, sliding-window past one window); 'cold' only for prompts that "
+        "got essentially no reuse, 'on' whenever a block of new prompt precedes it (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.slot_save_node_prompt = COMMON_SLOT_SAVE_NODE_PROMPT_OFF;
+            } else if (value == "cold") {
+                params.slot_save_node_prompt = COMMON_SLOT_SAVE_NODE_PROMPT_COLD;
+            } else if (value == "on") {
+                params.slot_save_node_prompt = COMMON_SLOT_SAVE_NODE_PROMPT_ON;
+            } else {
+                throw std::invalid_argument("--slot-save-node-prompt must be off, cold or on");
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_NODE_PROMPT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-node-response"},
+        {"--no-slot-save-node-response"},
+        "auto disk cache: save the conversation as soon as each response completes, instead of only on idle, "
+        "on reclaim and at shutdown (default: disabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_node_response = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_NODE_RESPONSE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-node-tool"},
+        {"--no-slot-save-node-tool"},
+        "auto disk cache: save the conversation when a response ends in tool calls (default: disabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_node_tool = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_NODE_TOOL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-on-reclaim"},
+        {"--no-slot-save-on-reclaim"},
+        "auto disk cache: save a slot's conversation before a request from a different conversation takes "
+        "the slot (default: enabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_on_reclaim = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_ON_RECLAIM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

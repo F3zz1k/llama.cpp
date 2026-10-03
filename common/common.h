@@ -450,6 +450,13 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// when the auto disk cache publishes a node at the end of the last user message (--slot-save-node-prompt)
+enum common_slot_save_node_prompt {
+    COMMON_SLOT_SAVE_NODE_PROMPT_OFF  = 0, // never
+    COMMON_SLOT_SAVE_NODE_PROMPT_COLD = 1, // only while prefilling a prompt that got essentially no reuse
+    COMMON_SLOT_SAVE_NODE_PROMPT_ON   = 2, // whenever at least one block of new prompt precedes it
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -727,6 +734,14 @@ struct common_params {
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).
     int32_t slot_save_idle_seconds = 60;
     bool    slot_save_idle_seconds_set = false; // true once --slot-save-idle-seconds is given explicitly
+    // checkpoint triggers of the auto disk cache: which moments publish a node (docs/disk-cache.md).
+    // The conversation itself is saved on idle (slot_save_idle_seconds), on reclaim and at shutdown.
+    bool    slot_save_node_system   = true;  // node at the end of the leading system context (first user
+                                             // message; a system-only request caches the whole system prompt)
+    common_slot_save_node_prompt slot_save_node_prompt = COMMON_SLOT_SAVE_NODE_PROMPT_OFF; // node at the end of the last user message
+    bool    slot_save_node_response = false; // save the conversation as soon as each response completes
+    bool    slot_save_node_tool     = false; // same, but only for responses that end in tool calls
+    bool    slot_save_on_reclaim    = true;  // save a slot's conversation before a different one takes the slot
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

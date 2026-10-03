@@ -1160,6 +1160,11 @@ struct server_slot {
     // One-shot: armed once per task at prompt start, cleared (-> -1) after the save so the slot then
     // prefills [B_ctx, N) normally. -1 = not armed (no boundary / warm restore / small preamble).
     int32_t ctx_save_pos = -1;
+    // --- mid-prefill prompt node (--slot-save-node-prompt) ---
+    // Same mechanism at a second position: the end of the last user message, block-aligned down (or
+    // n_tokens - 1 without a user span). Saved through auto_save_slot_if_useful, so it is a delta on
+    // the deepest saved node under --slot-save-incremental. -1 = not armed.
+    int32_t prompt_save_pos = -1;
 
     // --- KV restore-reuse (logits sidecar) ---
     // Full-vocab logits of this slot's most recently sampled token, captured at sample time
@@ -3604,10 +3609,12 @@ private:
             return; // defensive: the hook must fire with the slot resident at exactly B_ctx
         }
         const int B = params_base.slot_save_block;
-        if (B <= 0 || (B_ctx % B) != 0) {
-            return; // defensive: B_ctx is block-aligned by construction (arm uses boundary - boundary % B)
+        if (B <= 0 || B_ctx < B) {
+            return; // defensive: the arm floor keeps B_ctx >= one block
         }
-        // dense (text) block-hash chain over [0, B_ctx); the boundary hash names the base.
+        // dense (text) block-hash chain over [0, B_ctx); the deepest boundary hash names the base. B_ctx
+        // is block-aligned for a first-user boundary; a system-only pre-cache ends where the system
+        // prompt ends, and like any other unit it is keyed by its last whole block and holds every cell.
         const auto bhs = auto_block_hashes(toks, {}, B, cur_fp.fp_model, cur_fp.fp_mmproj);
         const size_t kb = (size_t) (B_ctx / B) - 1;                  // bhs dense (text) => positional index OK
         if (kb >= bhs.size()) {
@@ -3862,6 +3869,32 @@ private:
                               /*hi=*/ (int32_t) toks.size(),
                               full_hash, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
                               /*media=*/ media, /*parent_id=*/ have_parent ? parent_id : 0);
+    }
+
+    // AFTER-RESPONSE node (--slot-save-node-response, --slot-save-node-tool; both default off). Called
+    // with the task still attached, just before release(); the save itself runs after release(), on the
+    // idle slot, exactly like the idle flush. Off by default because a user who continues on the same
+    // instance gains nothing from it: the idle flush and the reclaim save persist the conversation when
+    // that is useful, and they cover tool loops too. The tool variant parses the response once, and only
+    // when the request offered tools to call.
+    bool auto_save_after_response_wanted(const server_slot & slot) const {
+        if (!auto_cache_enabled() || !slot.task || !slot.task->need_sampling()) {
+            return false;
+        }
+        if (params_base.slot_save_node_response) {
+            return true;
+        }
+        if (!params_base.slot_save_node_tool || !slot.task->params.chat_parser_params.parse_tool_calls ||
+            slot.task->params.chat_parser_params.format == COMMON_CHAT_FORMAT_CONTENT_ONLY) {
+            return false;
+        }
+        try {
+            const common_chat_msg msg = common_chat_parse(slot.generated_text, false, slot.task->params.chat_parser_params);
+            return !msg.tool_calls.empty();
+        } catch (const std::exception & e) {
+            SLT_DBG(slot, "auto-save: could not parse the response for tool calls, %s\n", e.what());
+            return false;
+        }
     }
 
     // AUTO-SAVE (shutdown): persist every slot's warm KV on graceful terminate — the third
@@ -4708,14 +4741,18 @@ private:
         }
 
         if (ret) {
-            // Second auto-save site for when cache_idle_slots is OFF (the idle-flush path that calls
-            // idle-flush loop where the primary auto_save runs). Here get_available_slot just picked `ret`
-            // for a new task and `update_cache` signals its prior KV is about to be discarded, so we
-            // persist it before the prompt_save/prompt_load below overwrites it. Mutually exclusive
-            // with the primary site via !cache_idle_slots, so no double-save. Reads `update_cache`
-            // BEFORE the `&& prompt_cache` narrowing so disk save works without --cache-ram. The
-            // callee carries all correctness gates; `ret` is idle so this never stalls generation.
-            if (auto_cache_enabled() && !params_base.cache_idle_slots && update_cache) {
+            // RECLAIM save (--slot-save-on-reclaim, default on): get_available_slot just picked `ret` for a
+            // task whose prompt shares too little with the slot's (or picked it by LRU), so `update_cache`
+            // says the slot's conversation is about to be overwritten. Persist it to disk first. This must
+            // NOT depend on cache_idle_slots: that path saves only the slots that stay idle AFTER the new
+            // task launched, so with --parallel 1 it never reaches the slot being taken over, and a
+            // conversation preempted within --slot-save-idle-seconds of its last request used to vanish
+            // from disk (it lived on only in --cache-ram). The two sites never save the same slot for the
+            // same task (this one saves `ret`, that one the others), and the callee's exact-length dedup
+            // absorbs any repeat. Reads `update_cache` BEFORE the `&& prompt_cache` narrowing so disk save
+            // works without --cache-ram. `ret` is idle, so this delays only the new task's first token by
+            // one save (a delta under --slot-save-incremental).
+            if (auto_cache_enabled() && params_base.slot_save_on_reclaim && update_cache) {
                 auto_save_slot_if_useful(*ret);
             }
 
@@ -6208,11 +6245,18 @@ private:
         // viable hook — a still-prefilling slot has i_batch == -1 and is skipped by its
         // is_inside_view() early-return. Cost when nothing is armed: one cheap slot scan.
         for (auto & slot : slots) {
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT &&
-                slot.ctx_save_pos > 0 &&
-                slot.prompt.n_tokens() == slot.ctx_save_pos) {
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                continue;
+            }
+            if (slot.ctx_save_pos > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) {
                 auto_save_context_base(slot);
                 slot.ctx_save_pos = -1; // one-shot: neither re-clamp nor re-save this task
+            }
+            if (slot.prompt_save_pos > 0 && slot.prompt.n_tokens() == slot.prompt_save_pos) {
+                // the slot is resident at exactly [0, prompt_save_pos): the regular save persists that
+                // prefix (a delta on the deepest saved node under --slot-save-incremental)
+                auto_save_slot_if_useful(slot);
+                slot.prompt_save_pos = -1;
             }
         }
         // ===== end MID-PREFILL BASE =====================================================
@@ -7051,76 +7095,60 @@ private:
                         // sequence IS the true whole state at B_ctx, the whole-save is sound for dense,
                         // SWA AND recurrent/hybrid — there is NO model-class gate (unlike the old
                         // idle-flush [0,B) sub-range checkpoint this replaces).
-                        slot.ctx_save_pos = -1;
+                        slot.ctx_save_pos    = -1;
+                        slot.prompt_save_pos = -1;
                         if (auto_cache_enabled() &&
                             slot.task->need_sampling() &&               // generative only (not embed/rerank; keeps the can_split path)
                             slot.alora_invocation_start <= 0 &&         // aLoRA caching bound (mirror the auto-restore gate)
                             are_lora_equal(slot.lora, params_base.lora_adapters) && // fp captures the global LoRA set (invariant 3)
                             !input_tokens.has_media()) {                // text-only keeps the block-hash array dense
                             const int     B        = params_base.slot_save_block;
-                            const int     floor    = std::max(B, params_base.slot_save_context_min_tokens);
-                            const int32_t boundary = slot.prompt.ctx_boundary; // first_user_message_pos, stashed at task launch
-                            // block-align DOWN: base stays within the shared preamble
-                            int32_t B_ctx = boundary > 0 ? boundary - (boundary % B) : -1;
-                            // SWA FALLBACK: on an SWA model a release-time snapshot (prompt + generated
-                            // tail) is restorable ONLY by a request that STRICTLY EXTENDS it - its state
-                            // file carries just the window [L - n_swa, L), so it can never be rewound to
-                            // a shorter prefix (see restore_is_whole_prefix_only() and the whole-prefix
-                            // gate it drives in auto_restore_into_slot). A repeat /
-                            // regenerate of the SAME prompt therefore gets ZERO reuse unless the store
-                            // also holds a whole-state root STRICTLY INSIDE the prompt.
-                            // CORRECTION (2026-08-19): this comment used to add "and, on a reasoning
-                            // model, EVERY follow-up turn, since the generated thinking tokens are not
-                            // replayed". That is NOT a property of reasoning models, it is a property of
-                            // the individual chat template, and it is false for current ones. Measured
-                            // via /apply-template with reasoning_content set on a history message:
-                            // Qwen3.6 family DROPS historical reasoning (a follow-up turn is then not an
-                            // extension of the release snapshot), Qwen3.8 RENDERS it as a full <think>
-                            // block (a follow-up turn CAN extend). Normal chat replays thinking; the
-                            // server even logs that a template supports it and suggests
-                            // --reasoning-preserve. Do not reason about reuse from "is it a reasoning
-                            // model", check what the deployed template actually renders.
-                            // When the shared-context boundary does not arm one (absent, or
-                            // below the floor - the common single-user-message case), anchor it at the
-                            // deepest block boundary below the prompt end instead. The mid-prefill
-                            // whole-save is sound for SWA precisely because the resident sequence IS the
-                            // true whole state at B_ctx, so its persisted window is anchored at B_ctx.
-                            // Only when this request got essentially no reuse (n_past < floor), so a warm
-                            // or restored slot arms nothing and pays nothing (the arm below additionally
-                            // requires n_past < B_ctx).
-                            // ==== THE F4 NOTE (referred to from the fp_kv_full and whole-save sites) ====
-                            // `n_swa_mem > 0` here is a COST gate, NOT a soundness gate. Do not read the
-                            // sentence it replaced ("untouched by construction") as an argument that
-                            // FULL/RS are unsound here: they are not, the whole-save is sound for dense,
-                            // SWA and recurrent/hybrid alike, for the same reason the outer arm above
-                            // states, because the resident sequence IS the true whole state at B_ctx.
-                            // What FULL and RS would pay is one extra whole-state write per COLD prefill
-                            // that got no reuse (multi-GB at f16 KV on a deep prompt) against an
-                            // LRU-bounded store, which is a measured perf/capacity decision, not a
-                            // correctness one.
-                            // The excuse that used to be offered for excluding FULL, "the regenerate
-                            // fast-path covers it", does NOT hold: that path (see the restore-continue
-                            // gate) requires n_past == task->n_tokens() AND n_past == prompt.n_tokens(),
-                            // i.e. a snapshot of EXACTLY the request's length, so it serves an exact
-                            // resend of prompt+generation, never a regenerate of the prompt alone. No
-                            // auto-save site routinely produces such a snapshot (release/idle/shutdown
-                            // save prompt+generated; the mid-prefill base is a strict prefix). Under RS
-                            // neither mechanism exists at all: that gate is FULL-only and the logits
-                            // sidecar is not even written under RS. After the whole-prefix restore rule,
-                            // the RS miss degrades to a correct cold reprefill, so this is a reuse-rate
-                            // question to revisit with measurements taken AFTER that rule lands (it
-                            // changes the very reuse distribution the decision depends on), not a defect
-                            // to widen blind.
-                            if (n_swa_mem > 0 && n_past < floor &&
-                                !(B_ctx >= floor && B_ctx < slot.task->n_tokens())) {
-                                const int32_t e = slot.task->n_tokens() - 1; // -1 keeps B_ctx a STRICT prefix
-                                B_ctx = e > 0 ? e - (e % B) : -1;
+                            const int32_t n_prompt = slot.task->n_tokens();
+                            const auto &  spans    = slot.task->params.message_spans;
+
+                            // --- SYSTEM node (--slot-save-node-system, default on) ---
+                            // Position: the first user message, block-aligned DOWN so the base stays inside
+                            // the shared preamble; on a request that carries only a system prompt (a pre-cache
+                            // of it), the end of that system prompt exactly, so all of it is cached (capped
+                            // at n_prompt - 1: the node must be a strict prefix to be cut mid-prefill).
+                            // Floor: --slot-save-context-min-tokens. COLD only: n_past < B_ctx means the
+                            // [0, B_ctx) region was NOT reused or restored, so there is new state to persist.
+                            if (params_base.slot_save_node_system) {
+                                const int     floor    = std::max(B, params_base.slot_save_context_min_tokens);
+                                const int32_t boundary = slot.prompt.ctx_boundary; // first_user_message_pos, stashed at task launch
+                                int32_t B_ctx = boundary > 0 ? boundary - (boundary % B) : -1;
+                                if (boundary <= 0) {
+                                    const int32_t sys_end = spans.system_only_context_end();
+                                    B_ctx = sys_end > 0 ? std::min(sys_end, n_prompt - 1) : -1;
+                                }
+                                if (B_ctx >= floor && B_ctx < n_prompt && n_past < B_ctx) {
+                                    slot.ctx_save_pos = B_ctx;
+                                }
                             }
-                            // COLD only: n_past < B_ctx means the [0, B_ctx) region was NOT reused/
-                            // restored, so there is genuinely-new state to persist. A warm/restored
-                            // slot (n_past >= B_ctx) arms nothing (zero change to normal prefill).
-                            if (B_ctx >= floor && B_ctx < slot.task->n_tokens() && n_past < B_ctx) {
-                                slot.ctx_save_pos = B_ctx;
+
+                            // --- PROMPT node (--slot-save-node-prompt, default off) ---
+                            // Position: the end of the last user message (n_prompt - 1 without a user span),
+                            // block-aligned down. A unit saved after the response (idle, reclaim, shutdown,
+                            // --slot-save-node-response) is prompt + generation, and a memory class that
+                            // cannot rewind (recurrent, hybrid, FULL, sliding-window past one window) can
+                            // restore it only for a request that extends it. A resend, a regenerate, an edit
+                            // of the response or a follow-up whose history is not re-rendered token for token
+                            // diverges inside it; this node sits before that divergence. 'cold' arms it only
+                            // for a prompt that got essentially no reuse (n_past < the save floor), 'on'
+                            // whenever at least one block of new prompt precedes it. The mid-prefill save is
+                            // the true whole state at that position, so it is sound for every memory class.
+                            // Floor: max(--slot-save-block, --slot-save-min-tokens), as for any other save.
+                            if (params_base.slot_save_node_prompt != COMMON_SLOT_SAVE_NODE_PROMPT_OFF) {
+                                const int     floor    = std::max(B, params_base.slot_save_min_tokens);
+                                const int32_t user_end = spans.last_user_message_end();
+                                const int32_t e        = std::min(user_end > 0 ? user_end : n_prompt - 1, n_prompt - 1);
+                                const int32_t B_p      = e > 0 ? e - (e % B) : -1;
+                                const bool    want     = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
+                                                         ? n_past + B <= B_p
+                                                         : n_past < floor;
+                                if (want && B_p >= floor && B_p < n_prompt && n_past < B_p && B_p != slot.ctx_save_pos) {
+                                    slot.prompt_save_pos = B_p;
+                                }
                             }
                         }
                         // ===== end ARM =============================================================
@@ -7298,7 +7326,8 @@ private:
                         // disarms ctx_save_pos, after which the slot prefills [B_ctx, N) unclamped. If
                         // B_ctx exceeds n_batch the loop's own batch.size() < n_batch cap stops it first
                         // and a later update_slots() iteration re-enters here to reach B_ctx.
-                        if (slot.ctx_save_pos > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) {
+                        if ((slot.ctx_save_pos    > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) ||
+                            (slot.prompt_save_pos > 0 && slot.prompt.n_tokens() == slot.prompt_save_pos)) {
                             break;
                         }
 
@@ -7678,7 +7707,11 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                const bool save = auto_save_after_response_wanted(slot);
                 slot.release();
+                if (save) {
+                    auto_save_slot_if_useful(slot);
+                }
 
                 return;
             }
@@ -7816,7 +7849,11 @@ private:
                 if (!process_token(result, slot)) {
                     slot.print_timings();
                     send_final_response(slot);
+                    const bool save = auto_save_after_response_wanted(slot);
                     slot.release();
+                    if (save) {
+                        auto_save_slot_if_useful(slot);
+                    }
 
                     return;
                 }
