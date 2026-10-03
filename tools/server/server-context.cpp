@@ -1959,6 +1959,14 @@ private:
         const size_t    n_cells = snap_toks.size();
         const llama_pos p0      = cell_lo > 0 ? slot.prompt.tokens.pos_next((int64_t) cell_lo) : -1;
         const llama_pos p1      = slot.prompt.tokens.pos_next((int64_t) n_cells);
+        // the draft must cover the unit up to its last cell (a save cut while the draft still lags the
+        // target, e.g. mid-prefill, would otherwise publish a sidecar that ends short of its unit)
+        if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) < p1 - 1) {
+            metrics.n_auto_save_draft_skipped++;
+            SLT_DBG(slot, "auto-save: no draft sidecar for [%u, %zu), the draft has not reached pos %d\n",
+                    cell_lo, n_cells, (int) (p1 - 1));
+            return;
+        }
         const size_t nwrite = llama_state_seq_save_file_range(ctx_dft, path.c_str(), slot.id, p0, p1,
                                                               snap_toks.data(), n_cells);
         uint32_t cells = 0;
@@ -2016,6 +2024,11 @@ private:
             const llama_pos tgt_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             if (llama_memory_seq_pos_max(mem_dft, slot.id) > tgt_max &&
                 !llama_memory_seq_rm(mem_dft, slot.id, tgt_max + 1, -1)) {
+                warm = false;
+            }
+            // nor end short of it: a draft missing its last cells would draft over a hole that the
+            // speculative begin() checks cannot see (they look at pos_max only)
+            if (warm && llama_memory_seq_pos_max(mem_dft, slot.id) != tgt_max) {
                 warm = false;
             }
         }
