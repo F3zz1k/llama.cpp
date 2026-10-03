@@ -856,6 +856,10 @@ struct server_metrics {
     uint64_t n_auto_restore_miss           = 0; // eligible requests with >= 1 block beyond the in-memory match and no restore
     uint64_t n_auto_restore_failed         = 0; // restores that failed after clearing the slot
     uint64_t n_auto_restore_tokens         = 0; // tokens restored from disk
+    uint64_t n_auto_save_draft             = 0; // draft-context (.dft) sidecars written next to a unit
+    uint64_t n_auto_save_draft_skipped     = 0; // units published without one (no cells, or the range was ignored)
+    uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars
+    uint64_t n_auto_restore_draft_cold     = 0; // disk restores with a draft context left cold (a node lacked a sidecar)
 
     void init() {
         t_start = ggml_time_us();

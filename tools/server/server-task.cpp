@@ -1624,6 +1624,26 @@ std::string server_task_result_metrics::to_metrics() {
             "Auto disk KV cache: prompt tokens restored from disk",
             (double) metrics.n_auto_restore_tokens
         },
+        {
+            "auto_cache_save_draft_total",
+            "Auto disk KV cache: draft-context (.dft) sidecars written next to a unit",
+            (double) metrics.n_auto_save_draft
+        },
+        {
+            "auto_cache_save_draft_skipped_total",
+            "Auto disk KV cache: units published without a draft sidecar although a draft context exists",
+            (double) metrics.n_auto_save_draft_skipped
+        },
+        {
+            "auto_cache_restore_draft_warm_total",
+            "Disk KV restores that brought the speculative draft back warm from .dft sidecars",
+            (double) metrics.n_auto_restore_draft_warm
+        },
+        {
+            "auto_cache_restore_draft_cold_total",
+            "Disk KV restores that left the speculative draft cold (some node had no .dft sidecar)",
+            (double) metrics.n_auto_restore_draft_cold
+        },
     };
 
     const std::vector<metric_item> gauges = {

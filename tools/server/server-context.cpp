@@ -263,6 +263,16 @@ static std::string slot_logits_sidecar_path(const std::string & state_filepath) 
     return state_filepath + ".logits";
 }
 
+// The auto disk cache's DRAFT sidecar: the speculative draft context's (MTP / EAGLE3 / draft model)
+// KV for the same cells as "<state>", in the ordinary llama_state_seq file format, written with the
+// same [lo, hi) split as the unit itself so a chain of .dft files composes exactly like the chain of
+// state files. Optional and best-effort: a unit without one restores with a cold draft, and draft KV
+// can only change how many drafted tokens are accepted, never the output (the target verifies every
+// token), so a stale or foreign sidecar costs speed, never correctness.
+static std::string slot_draft_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".dft";
+}
+
 // Best-effort "touch": bump the mtime of an auto-cache snapshot's 3-file unit (state + .logits +
 // .meta) to now, so a snapshot that is REUSED (read/restored) but never rewritten is treated as
 // recently-used by the mtime LRU. Without this, the LRU is least-recently-WRITTEN, which would
@@ -276,6 +286,7 @@ static void auto_touch_unit(const std::string & state_filepath) {
     std::filesystem::last_write_time(state_filepath, now, ec);
     std::filesystem::last_write_time(slot_logits_sidecar_path(state_filepath), now, ec);
     std::filesystem::last_write_time(state_filepath + ".meta", now, ec);
+    std::filesystem::last_write_time(slot_draft_sidecar_path(state_filepath), now, ec);
 }
 
 // Best-effort write of the logits sidecar. Returns the number of bytes written (0 on failure or
@@ -382,6 +393,7 @@ struct slot_save_unit {
     std::string state_path;
     std::string sidecar_path; // "<state>.logits", "" if none
     std::string meta_path;    // "<state>.meta",   "" if none (auto disk cache)
+    std::string dft_path;     // "<state>.dft",    "" if none (auto disk cache draft sidecar)
     uintmax_t   bytes = 0;
     std::filesystem::file_time_type mtime;
     // Tree-aware eviction (U5): a checkpoint node's identity, derived entirely from disk. A node is
@@ -521,7 +533,8 @@ static void slot_save_enforce_limits(const std::string & dir,
             // file, so they must be matched here rather than reaped as orphaned sidecars below.
             if ((p.size() >= 4  && p.compare(p.size() - 4,  4,  ".tmp")        == 0) ||
                 (p.size() >= 11 && p.compare(p.size() - 11, 11, ".tmp.logits") == 0) ||
-                (p.size() >= 9  && p.compare(p.size() - 9,  9,  ".tmp.meta")   == 0)) {
+                (p.size() >= 9  && p.compare(p.size() - 9,  9,  ".tmp.meta")   == 0) ||
+                (p.size() >= 8  && p.compare(p.size() - 8,  8,  ".tmp.dft")    == 0)) {
                 continue;
             }
             // a "<X>.logits" file is a sidecar ONLY when its state file "<X>" is also present;
@@ -542,6 +555,11 @@ static void slot_save_enforce_limits(const std::string & dir,
                 present.count(p.substr(0, p.size() - 4))) {
                 continue;
             }
+            // a "<X>.dft" file is the draft-context sidecar: accounted with its state file, reaped if orphaned
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".dft") == 0 &&
+                present.count(p.substr(0, p.size() - 4))) {
+                continue;
+            }
             // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
             // accumulate (we never count them) and eat real on-disk space forever.
             if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
@@ -555,6 +573,11 @@ static void slot_save_enforce_limits(const std::string & dir,
                 continue;
             }
             if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                !present.count(p.substr(0, p.size() - 4))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".dft") == 0 &&
                 !present.count(p.substr(0, p.size() - 4))) {
                 std::filesystem::remove(p, fec);
                 continue;
@@ -592,6 +615,14 @@ static void slot_save_enforce_limits(const std::string & dir,
                     u.bytes += mb;
                 }
             }
+            const std::string dft = slot_draft_sidecar_path(p);
+            if (present.count(dft)) {
+                const auto db = std::filesystem::file_size(dft, fec);
+                if (!fec) {
+                    u.dft_path = dft;
+                    u.bytes += db;
+                }
+            }
             u.mtime = std::filesystem::last_write_time(p, fec);
             if (fec) {
                 continue;
@@ -625,6 +656,9 @@ static void slot_save_enforce_limits(const std::string & dir,
                 }
                 if (!u.meta_path.empty()) {
                     std::filesystem::remove(u.meta_path, ec);
+                }
+                if (!u.dft_path.empty()) {
+                    std::filesystem::remove(u.dft_path, ec);
                 }
                 break;
             }
@@ -664,6 +698,9 @@ static void slot_save_enforce_limits(const std::string & dir,
         }
         if (!u.meta_path.empty()) {
             std::filesystem::remove(u.meta_path, ec);
+        }
+        if (!u.dft_path.empty()) {
+            std::filesystem::remove(u.dft_path, ec);
         }
     };
 
@@ -1828,6 +1865,75 @@ private:
         }
     }
 
+    // DRAFT SIDECAR (see slot_draft_sidecar_path). Writes the draft context's cells for [cell_lo, N) of
+    // this slot, bounded by POSITION on both ends: the draft may hold drafted-but-rejected cells past
+    // the target's end, and those must never reach a sidecar or a later delta would duplicate them.
+    // Kept only if it holds at least one cell and no more cells than the target range it shadows (a
+    // memory type that ignores the range would write every cell, which a NO_CLEAR compose would
+    // duplicate). Best-effort: a skipped sidecar only means that unit restores with a cold draft.
+    void auto_write_draft_sidecar(const server_slot & slot, const std::string & path,
+                                  const llama_tokens & snap_toks, uint32_t cell_lo) {
+        const size_t    n_cells = snap_toks.size();
+        const llama_pos p0      = cell_lo > 0 ? slot.prompt.tokens.pos_next((int64_t) cell_lo) : -1;
+        const llama_pos p1      = slot.prompt.tokens.pos_next((int64_t) n_cells);
+        const size_t nwrite = llama_state_seq_save_file_range(ctx_dft, path.c_str(), slot.id, p0, p1,
+                                                              snap_toks.data(), n_cells);
+        uint32_t cells = 0;
+        const bool ok = nwrite > 0 &&
+                        delta_bin_cell_count(path, n_cells, cells) &&
+                        cells > 0 && (size_t) cells <= n_cells - cell_lo;
+        if (!ok) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            metrics.n_auto_save_draft_skipped++;
+            SLT_DBG(slot, "auto-save: no draft sidecar for [%u, %zu) (%zu B, %u cells)\n", cell_lo, n_cells, nwrite, cells);
+            return;
+        }
+        metrics.n_auto_save_draft++;
+    }
+
+    // Loads the draft sidecars of a restored chain into ctx_dft, in the same order and with the same
+    // NO_CLEAR composition as the target. All or nothing: a chain with any node missing its sidecar, or
+    // any load failing, leaves the draft empty (cold), which is exactly what every restore did before
+    // sidecars existed. Called after the target chain has loaded.
+    void auto_restore_draft_chain(server_slot & slot, const std::vector<std::string> & node_paths) {
+        llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+        bool warm = !node_paths.empty();
+        for (const std::string & node : node_paths) {
+            std::error_code ec;
+            if (!std::filesystem::exists(slot_draft_sidecar_path(node), ec)) {
+                warm = false;
+                break;
+            }
+        }
+        if (warm) {
+            llama_tokens scratch(slot.n_ctx);
+            for (size_t i = 0; i < node_paths.size(); ++i) {
+                size_t n_out = 0;
+                const llama_state_seq_flags flags = (i == 0) ? 0 : LLAMA_STATE_SEQ_FLAGS_NO_CLEAR;
+                if (llama_state_seq_load_file_ext(ctx_dft, slot_draft_sidecar_path(node_paths[i]).c_str(), slot.id,
+                                                  flags, scratch.data(), scratch.size(), &n_out) == 0) {
+                    warm = false;
+                    break;
+                }
+            }
+        }
+        if (warm) {
+            // the draft must never run ahead of the target it drafts for
+            const llama_pos tgt_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (llama_memory_seq_pos_max(mem_dft, slot.id) > tgt_max &&
+                !llama_memory_seq_rm(mem_dft, slot.id, tgt_max + 1, -1)) {
+                warm = false;
+            }
+        }
+        if (warm) {
+            metrics.n_auto_restore_draft_warm++;
+        } else {
+            llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
+            metrics.n_auto_restore_draft_cold++;
+        }
+    }
+
     // The value the ENGINE masks with (llama_model_n_swa), NEVER zeroed by --swa-full. Every disk
     // save/restore soundness decision must use THIS, not n_swa: --swa-full enlarges the SWA cache but
     // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
@@ -2392,47 +2498,22 @@ private:
             if (out_token_count) { *out_token_count = 0; }
             return false;
         }
-        // A snapshot is a ctx_tgt state file: llama_state_seq_load_file_ext below writes ctx_tgt only,
-        // and nothing draft-side is ever persisted. So whatever ctx_dft holds for this seq belongs to
-        // the PREVIOUS prompt, and after the restore the MTP/EAGLE3 head would draft while attending
-        // over another conversation's cells (the post-restore prefill only decodes the SUFFIX, and the
-        // seq_rm at [p0, -1) that precedes it removes nothing below p0). Reset it: a COLD draft is
-        // correct, only unaccelerated. This does NOT reconstruct draft state for [0, L), no snapshot
-        // carries it, so drafting stays cold until generation refills ctx_dft.
-        // ORDER IS NOT LOAD-BEARING: placed before the load only for locality. ctx_dft and ctx_tgt
-        // always own DISTINCT memory objects (llama_context builds its own via model.create_memory,
-        // passing the other context's memory as mem_other rather than sharing the pointer), so a clear
-        // of ctx_dft can never touch cells the load just wrote, in either order. On a shared-CELLS
-        // draft (common/speculative.cpp is_mem_shared, gemma4-class: llama_get_ctx_other(ctx_dft) ==
-        // ctx_tgt) this call is a no-op by construction: llama_kv_cache::seq_rm returns true
-        // immediately when `other` is set, and none is needed there because the draft reads the
-        // target's own cells, which node [0] repopulates. The reset therefore only ever affects a
-        // genuinely separate draft KV (the qwen35 MTP case), which is exactly the stale-conversation
-        // case this is here for.
-        // ACCEPTED LOSS: the clear is unconditional, so it also fires when the snapshot is a PREFIX of
-        // what this slot already holds (the manual /slots rollback: restore an earlier snapshot of the
-        // conversation the slot is already serving). There ctx_dft held a valid [0, L+G) that the
-        // suffix prefill's seq_rm at [p0, -1) would have trimmed to a warm, correct [0, L); after this
-        // it is empty and no draft impl rebuilds a gap below the live decode point, so that
-        // conversation drafts cold from here on. Note the gap is also SILENT: EVERY begin() override
-        // that tests for this at all checks it the same blind way — MTP `pos_max < N - 1`, EAGLE3
-        // `pos_max < N - 1`, draft-model `pos_max < N - 2` — and llama_memory_seq_pos_max returns the
-        // maximum POSITION rather than a count, so it cannot see a hole BELOW a populated tail. On
-        // this path the post-restore suffix prefill writes ctx_dft cells right up to N-1, so the test
-        // is false while [0, L) is still missing and no warning fires. Measured 0 warnings over 6
-        // runs on qwen3.8-27b + MTP, on this build and the pre-fix one — note those two are silent
-        // for DIFFERENT reasons: here the cells below are absent, pre-fix they were present but
-        // belonged to another conversation, and pos_max cannot distinguish absent from stale.
-        // Scoped deliberately: the warning CAN fire elsewhere, e.g. the restore-continue fast path
-        // calls common_speculative_begin with nothing decoded, so pos_max == -1 there (FULL target
-        // plus a separate draft model). Do not rely on it to detect a draft-side hole. We take the
-        // loss over the alternative, because the pre-load slot prompt is not known to agree with the
-        // snapshot past the auto path's verified margin, so "prefix of the current prompt" cannot be
-        // decided cheaply and safely before the load.
+        // Reset the draft first. Whatever ctx_dft holds for this seq belongs to the PREVIOUS prompt, and
+        // the suffix prefill that follows a restore only removes cells at or above its own start, so a
+        // leftover draft would attend over another conversation's cells. After the target chain loads,
+        // auto_restore_draft_chain repopulates the draft from the chain's .dft sidecars when every node
+        // has one (auto-saves write them whenever a separate draft context exists); otherwise the draft
+        // stays empty and that conversation drafts cold for [0, L), which is SILENT to the speculative
+        // begin() checks (they test pos_max, which cannot see a hole below a populated tail). Count it:
+        // llamacpp:auto_cache_restore_draft_{warm,cold}_total.
+        // ctx_dft and ctx_tgt always own DISTINCT memory objects (llama_context builds its own via
+        // model.create_memory, passing the other context's memory as mem_other), so the clear never
+        // touches target cells. On a shared-CELLS draft (gemma4-class, llama_get_ctx_other(ctx_dft) ==
+        // ctx_tgt) this is a no-op by construction, no sidecar is ever written (it would serialise
+        // nothing), and the draft reads the target's restored cells directly.
         // Deliberately a direct llama_memory_seq_rm on ctx_dft, not slot.mem.seq_rm: the wrapper mirrors
         // onto both contexts and cannot express "load into one, reset the other". (-1, -1) is the rm_all
-        // path, legal on every memory class, so the result is not checked (same style as
-        // auto_restore_drop below).
+        // path, legal on every memory class, so the result is not checked.
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
         }
@@ -2464,6 +2545,12 @@ private:
         slot.prompt.tokens.clear();
         slot.prompt.tokens.insert(tokens);
         slot.just_restored = true;
+
+        // the target is in place: bring the draft back warm from the chain's .dft sidecars when every
+        // node has one, before any checkpoint below snapshots the draft state
+        if (ctx_dft) {
+            auto_restore_draft_chain(slot, node_paths);
+        }
 
         // Drop the previous task's checkpoints UNCONDITIONALLY, for every class, before any synth
         // below. They snapshot a DIFFERENT prompt's ctx_tgt state and the sequence they described no
@@ -2522,6 +2609,10 @@ private:
     // for auto_restore_into_slot — every abort after do_slot_restore succeeded goes through here.
     void auto_restore_drop(server_slot & slot) {
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+        if (ctx_dft) {
+            // the restore may have brought the draft back from sidecars; it must not outlive the target
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+        }
         slot.prompt.tokens.clear();
         slot.prompt.checkpoints.clear();
         slot.just_restored = false;
@@ -3199,6 +3290,11 @@ private:
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) snap_toks.size());
         }
+        // 2b) draft sidecar on the temp path, with the same [lo, N) split the state file ended up with
+        //     (parent_hi is 0 when this save became, or always was, a whole root).
+        if (ctx_dft) {
+            auto_write_draft_sidecar(slot, slot_draft_sidecar_path(tmp), snap_toks, is_node ? parent_hi : 0);
+        }
         // 3) meta sidecar on the temp path. Written but renamed LAST. A whole/partial ROOT writes the
         //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
         //    records). A DELTA (is_node) passes the FULL `media` records so slot_meta_write's
@@ -3214,6 +3310,7 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_draft_sidecar_path(tmp), ec);
             auto_save_note_failure(slot, ".meta sidecar write failed", snap_toks.size());
             return; // invariant 4
         }
@@ -3225,11 +3322,27 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_draft_sidecar_path(tmp), ec);
             auto_save_note_failure(slot, "rename of the state file into place failed", snap_toks.size());
             return; // invariant 4
         }
         std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
         ec.clear();
+        {
+            // the draft sidecar lands before the .meta, so a scanned unit never points at a half-written
+            // one. A unit that has none (no draft context, or the write was skipped) must not inherit a
+            // .dft an earlier writer left at this name for a different draft chain shape.
+            std::error_code dec;
+            if (std::filesystem::exists(slot_draft_sidecar_path(tmp), dec)) {
+                std::filesystem::rename(slot_draft_sidecar_path(tmp), slot_draft_sidecar_path(fname), dec);
+                if (dec) {
+                    std::filesystem::remove(slot_draft_sidecar_path(tmp), dec);
+                    std::filesystem::remove(slot_draft_sidecar_path(fname), dec);
+                }
+            } else {
+                std::filesystem::remove(slot_draft_sidecar_path(fname), dec);
+            }
+        }
         std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
         // the .meta is the scan key — a unit whose .meta never landed must NOT be
         // published. If the meta rename failed, the .bin is already in place but unindexable, so we
@@ -3241,6 +3354,7 @@ private:
             std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+            std::filesystem::remove(slot_draft_sidecar_path(fname), rec);
             auto_save_note_failure(slot, "rename of the .meta sidecar into place failed", snap_toks.size());
             return; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
