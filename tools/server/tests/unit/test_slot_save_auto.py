@@ -49,6 +49,17 @@ EMITTED_SHA256 = {
         FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin.meta"],
 }
 
+# The .bin holds the KV numbers themselves, and those depend on the backend's arithmetic: the
+# frozen fixture is a GPU (SYCL) capture, and a CPU build emits a .bin of the same size and layout
+# whose K/V values differ (about 42k bytes, all inside the tensor data). One frozen capture per
+# backend, each taken with this build's predecessor on that backend (the CPU one from main-patched
+# 593c2d0d7, re-emitted unchanged by every later CPU build). The .meta carries no numbers and must
+# match exactly on every backend.
+EMITTED_BIN_SHA256_PER_BACKEND = {
+    "gpu-sycl": FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin"],
+    "cpu":      "c97f4c568102edae478b21e7ac7937e2a437e0e76e8f9410a313d59f0ebc8cc7",
+}
+
 # exact prompt the fixture was captured with (tokenizes to >= 1 hash block of 256)
 GOLDEN_PROMPT = "Once upon a time there was a little dog named Spot. " * 24
 GOLDEN_REQUEST = {
@@ -135,7 +146,11 @@ def test_text_only_meta_byte_identical():
     for name, expected in EMITTED_SHA256.items():
         with open(os.path.join(CACHE_DIR, name), "rb") as f:
             actual = hashlib.sha256(f.read()).hexdigest()
-        assert actual == expected, f"{name}: emitted bytes differ from the golden fixture"
+        if name.endswith(".bin"):
+            assert actual in EMITTED_BIN_SHA256_PER_BACKEND.values(), \
+                f"{name}: emitted bytes match no backend's frozen capture ({actual})"
+        else:
+            assert actual == expected, f"{name}: emitted bytes differ from the golden fixture"
 
 
 def test_v1_meta_still_indexed():
@@ -1219,11 +1234,22 @@ def test_manual_slots_text_on_vision_server():
     vs.stop()
 
 
+def _file_bytes(name: str) -> bytes:
+    with open(os.path.join(CACHE_DIR, name), "rb") as f:
+        return f.read()
+
+
 def test_manual_media_save_restore_continues():
     """Manual SAVE of a media slot writes a v2 .meta sidecar; a fresh process manually
-    RESTORES it (stub rehydration) and the identical request reuses the restored
-    cells INCLUDING the image's — the image is never re-encoded — with the answer
-    identical to a cold run."""
+    RESTORES it (stub rehydration) to exactly the saved state, and the identical request
+    reuses the restored cells INCLUDING the image's (the image is never re-encoded).
+
+    Fidelity is checked on the state itself: saving the restored slot again must give a
+    byte-identical .bin and .meta. The answer is compared only against a run that decodes
+    the same suffix in the same batch split (an in-process erase + restore): on the tiny CI
+    model the greedy answer depends on the split alone, e.g. the in-memory continuation
+    re-decodes 5 tokens from a prefill checkpoint where a restore re-decodes 1, and those two
+    give different text from one and the same state."""
     vs = make_manual_vision_server()
     vs.start()
     prompt_n_full, cache_n_cold, _ = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
@@ -1234,6 +1260,12 @@ def test_manual_media_save_restore_continues():
     assert res.status_code == 200
     n_saved = res.body["n_saved"]
     assert n_saved == prompt_n_full  # prompt-only snapshot
+    # reference answer: the same restore-then-continue, inside the process that saved it
+    res = vs.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+    res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"})
+    assert res.status_code == 200
+    prompt_n_ref, _, content_ref = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
     vs.stop()
 
     # the sidecar is a v2 meta whose single record tiles the image's NULL cells
@@ -1245,10 +1277,10 @@ def test_manual_media_save_restore_continues():
     assert n_img > 0
     assert sum(1 for t in toks if t == LLAMA_TOKEN_NULL) == n_img
 
-    # fresh process: cold reference first, then erase + restore + identical resend
+    # fresh process: a cold run first (the slot then holds other state), then erase + restore
     vs = make_manual_vision_server()
     vs.start()
-    _, _, content_ref = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
 
     res = vs.make_request("POST", "/slots/0?action=erase")
     assert res.status_code == 200
@@ -1256,28 +1288,39 @@ def test_manual_media_save_restore_continues():
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
 
+    # the restored state is exactly the saved one
+    res = vs.make_request("POST", "/slots/0?action=save", data={"filename": "media-rt.bin"})
+    assert res.status_code == 200
+    assert res.body["n_saved"] == n_saved
+    assert _file_bytes("media-rt.bin") == _file_bytes("media.bin")
+    assert _file_bytes("media-rt.bin.meta") == _file_bytes("media.bin.meta")
+
     prompt_n_warm, cache_n_warm, content_warm = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
-    assert content_warm == content_ref
     assert cache_n_warm >= media[0]["start_idx"] + n_img  # every image cell came from the restore
     assert prompt_n_warm <= 8                             # the image was NOT re-processed
+    assert prompt_n_warm == prompt_n_ref                  # same split as the reference ...
+    assert content_warm == content_ref                    # ... so the same answer
     vs.stop()
 
 
 def test_manual_media_restore_stub_never_encoded():
     """After a manual media restore the slot's image chunks are identity-only stubs: a
     follow-up with a DIFFERENT image id-mismatches them, so they are dropped (never
-    encoded) and the request re-processes its own image — answers stay identical to
-    no-cache runs for both the different and the original image."""
-    ref = make_manual_vision_server()
-    ref.start()
-    _, _, content_ref_b = raw_media_request(ref, MEDIA_PROMPT, [IMG2_B64])
-    ref.stop()
-
+    encoded) and the request re-processes its own image. Both that answer and the one for
+    the original image afterwards must equal a reference process that ran the same
+    sequence from a restore of the same file (same cached prefixes and batch splits; see
+    test_manual_media_save_restore_continues for why a cold run is not a valid reference on
+    the CI model)."""
     vs = make_manual_vision_server()
     vs.start()
-    _, _, content_ref_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
+    raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
     res = vs.make_request("POST", "/slots/0?action=save", data={"filename": "media.bin"})
     assert res.status_code == 200
+    # reference sequence: erase, restore, the different image, then the original one
+    assert vs.make_request("POST", "/slots/0?action=erase").status_code == 200
+    assert vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"}).status_code == 200
+    ref_b = raw_media_request(vs, MEDIA_PROMPT, [IMG2_B64])
+    ref_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
     vs.stop()
 
     vs = make_manual_vision_server()
@@ -1285,17 +1328,15 @@ def test_manual_media_restore_stub_never_encoded():
     res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"})
     assert res.status_code == 200
 
-    # different image bytes => different id => the stub never matches nor encodes
-    _, _, content_b = raw_media_request(vs, MEDIA_PROMPT, [IMG2_B64])
-    assert content_b == content_ref_b
+    # different image bytes => different id => the stub never matches nor encodes: the
+    # request processes its own image, exactly as in the reference
+    out_b = raw_media_request(vs, MEDIA_PROMPT, [IMG2_B64])
+    assert out_b[1] < out_b[0]  # cache_n stops before the image: the stub was not reused
+    assert out_b == ref_b
 
-    # and the original image request still answers exactly like its cold run
-    ref = make_manual_vision_server()
-    ref.start()
-    _, _, content_ref_a8 = raw_media_request(ref, MEDIA_PROMPT, [IMG_B64])
-    ref.stop()
-    _, _, content_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
-    assert content_a == content_ref_a8
+    # and the original image request answers exactly like the reference sequence
+    out_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    assert out_a == ref_a
     vs.stop()
 
 
