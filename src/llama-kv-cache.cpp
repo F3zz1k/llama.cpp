@@ -2503,6 +2503,24 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.seq_id[i]   = &dest_seq_id;
         }
 
+        // an appended delta must lie strictly after what the sequence already holds; an overlap means the
+        //   chain does not continue this base (the server checks chain contiguity, this makes the cache
+        //   refuse it on its own). gaps are legal: M-RoPE media spends fewer positions than cells
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR) && cell_count > 0) {
+            const llama_pos pos_max_base = cells.seq_pos_max(dest_seq_id);
+            if (pos_max_base >= 0) {
+                llama_pos pos_min_in = ubatch.pos[0];
+                for (uint32_t i = 1; i < cell_count; ++i) {
+                    pos_min_in = std::min(pos_min_in, ubatch.pos[i]);
+                }
+                if (pos_min_in <= pos_max_base) {
+                    LLAMA_LOG_ERROR("%s: appended cells start at pos %d, the sequence already reaches %d\n",
+                            __func__, (int) pos_min_in, (int) pos_max_base);
+                    return false;
+                }
+            }
+        }
+
         if (sinfo_in) {
             // this cache mirrors another one, so it takes that cache's layout instead of searching for its own cells
             if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {

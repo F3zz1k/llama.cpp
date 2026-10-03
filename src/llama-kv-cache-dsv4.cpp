@@ -376,12 +376,17 @@ static void dsv4_state_write_k_cache(
     }
 }
 
+// pos_max_base is the position the destination sequence already reached before this read (-1 when
+// empty). A delta section must start exactly at the rows that base completed, or the composed cache
+// would hold a hole or a double-written row; the server's chain-contiguity check normally guarantees
+// that, and this makes the cache itself refuse a chain that does not.
 static void dsv4_state_read_k_cache(
         llama_io_read_i  & io,
         llama_kv_cache   * kv,
         llama_seq_id       seq_id,
-        llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
+        llama_state_seq_flags flags,
+        uint32_t           ratio,
+        llama_pos          pos_max_base) {
 
     uint32_t version;
     uint32_t row0 = 0;
@@ -410,6 +415,14 @@ static void dsv4_state_read_k_cache(
     }
 
     const uint32_t kv_size = kv->get_size();
+    if (version == DSV4_K_CACHE_STATE_DELTA && seq_id >= 0) {
+        const uint32_t row0_base = std::min(n_rows_ref, dsv4_state_n_used_k_rows(pos_max_base, ratio, kv_size));
+        if (row0 != row0_base) {
+            LLAMA_LOG_ERROR("%s: delta starts at row %u, the base holds %u rows (pos_max %d, ratio %u)\n",
+                    __func__, row0, row0_base, (int) pos_max_base, ratio);
+            throw std::runtime_error("DSV4 K-cache delta does not continue its base");
+        }
+    }
     if (version == 1 && n_rows_ref != kv_size) {
         LLAMA_LOG_INFO("kv size ref %d kv %d\n", n_rows_ref, kv_size);
         throw std::runtime_error("DSV4 K-cache state size mismatch");
@@ -1702,6 +1715,10 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
+    // the position the base already reached, read BEFORE kv_raw appends the delta's cells
+    const llama_pos pos_max_base = seq_id >= 0 && (flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR) ?
+        kv_raw->seq_pos_max(seq_id) : -1;
+
     // the raw, compressed and compressor-state parts must restore together: a read that fails halfway
     // (more so while composing a delta with NO_CLEAR, which keeps what the base put there) would leave
     // them disagreeing about the sequence, so a failure drops the sequence from every part
@@ -1715,9 +1732,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
                 clear_compressed(seq_id, true);
             }
 
-            dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
-            dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-            dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+            dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags, DSV4_CSA_RATIO, pos_max_base);
+            dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags, DSV4_HCA_RATIO, pos_max_base);
+            dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags, DSV4_CSA_RATIO, pos_max_base);
         }
 
         csa_state->state_read(io, seq_id, flags);
