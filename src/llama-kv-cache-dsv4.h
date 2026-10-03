@@ -136,6 +136,12 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // incremental (delta) saves for the disk KV cache: the raw cache writes its [p0, -1) delta (its
+    // sliding-window part whole), the compressed K caches write only the rows completed at or after
+    // p0, and the small per-sequence compressor states are written whole. p1 >= 0 is not supported
+    // and writes the whole sequence, as the llama_memory_i default does.
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const override;
+
     //
     // llama_kv_cache_dsv4 specific API
     //
@@ -172,6 +178,9 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
+
+    // p0 > 0 writes the [p0, -1) delta, otherwise the whole sequence
+    void state_write_impl(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_state_seq_flags flags) const;
 };
 
 // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept

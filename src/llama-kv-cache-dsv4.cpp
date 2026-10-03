@@ -23,6 +23,7 @@ static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
+static constexpr uint32_t DSV4_K_CACHE_STATE_DELTA = 3; // rows [row0, n_rows) only, composed onto a base under NO_CLEAR
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
@@ -254,15 +255,18 @@ static void dsv4_state_write_tensor_streams(
         uint32_t           n_rows,
         uint32_t           s0,
         uint32_t           ns,
-        const std::vector<uint32_t> * stream_ids = nullptr) {
+        const std::vector<uint32_t> * stream_ids = nullptr,
+        uint32_t           row0 = 0) {
     const int32_t  type_i   = (int32_t) tensor->type;
     const uint64_t ne0      = tensor->ne[0];
-    const uint64_t rows     = n_rows;
     const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
 
-    if (n_rows > tensor_rows) {
+    if (n_rows > tensor_rows || row0 > n_rows) {
         throw std::runtime_error("DSV4 state tensor row count exceeds storage");
     }
+
+    // rows [row0, n_rows) of each stream; row0 > 0 only for a delta K-cache section
+    const uint64_t rows     = n_rows - row0;
 
     io.write(&type_i,   sizeof(type_i));
     io.write(&ne0,      sizeof(ne0));
@@ -270,7 +274,7 @@ static void dsv4_state_write_tensor_streams(
     io.write(&row_size, sizeof(row_size));
 
     const size_t stream_stride = (size_t) tensor_rows*row_size;
-    const size_t size          = (size_t) n_rows*row_size;
+    const size_t size          = (size_t) rows*row_size;
     if (size == 0) {
         return;
     }
@@ -284,7 +288,7 @@ static void dsv4_state_write_tensor_streams(
         if ((int64_t) stream >= tensor->ne[2]) {
             throw std::runtime_error("DSV4 state tensor stream out of range");
         }
-        const size_t offset = (size_t) stream*stream_stride;
+        const size_t offset = (size_t) stream*stream_stride + (size_t) row0*row_size;
         io.write_tensor(tensor, offset, size);
     }
 }
@@ -295,7 +299,8 @@ static void dsv4_state_read_tensor_streams(
         uint32_t          tensor_rows,
         uint32_t          n_rows,
         uint32_t          s0,
-        uint32_t          ns) {
+        uint32_t          ns,
+        uint32_t          row0 = 0) {
     int32_t  type_i_ref;
     uint64_t ne0_ref;
     uint64_t rows_ref;
@@ -306,59 +311,68 @@ static void dsv4_state_read_tensor_streams(
     io.read(&rows_ref,     sizeof(rows_ref));
     io.read(&row_size_ref, sizeof(row_size_ref));
 
+    if (n_rows > tensor_rows || row0 > n_rows) {
+        throw std::runtime_error("DSV4 state tensor row count exceeds storage");
+    }
+
     const int32_t  type_i   = (int32_t) tensor->type;
     const uint64_t ne0      = tensor->ne[0];
-    const uint64_t rows     = n_rows;
+    const uint64_t rows     = n_rows - row0;
     const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
 
     if (type_i != type_i_ref || ne0 != ne0_ref || rows != rows_ref || row_size != row_size_ref) {
         throw std::runtime_error("DSV4 state tensor metadata mismatch");
     }
-    if (n_rows > tensor_rows) {
-        throw std::runtime_error("DSV4 state tensor row count exceeds storage");
-    }
 
     const size_t stream_stride = (size_t) tensor_rows*row_size;
-    const size_t size          = (size_t) n_rows*row_size;
+    const size_t size          = (size_t) rows*row_size;
     if (size == 0) {
         return;
     }
 
     for (uint32_t s = 0; s < ns; ++s) {
-        const size_t offset = (size_t) (s0 + s)*stream_stride;
+        const size_t offset = (size_t) (s0 + s)*stream_stride + (size_t) row0*row_size;
         io.read_tensor(tensor, offset, size);
     }
 }
 
+// row0 == 0 writes the whole K-cache section in the version-2 layout, byte-identical to before deltas
+// existed. row0 > 0 writes a version-3 DELTA section holding only rows [row0, n_rows): compressed rows
+// are only ever written once their block of `ratio` tokens is complete, so the rows a parent snapshot
+// already holds (pos < p0 => rows < p0/ratio) are final and never need rewriting.
 static void dsv4_state_write_k_cache(
         llama_io_write_i    & io,
         const llama_kv_cache * kv,
         llama_seq_id          seq_id,
         llama_state_seq_flags flags,
-        uint32_t              n_rows) {
+        uint32_t              n_rows,
+        uint32_t              row0 = 0) {
     GGML_UNUSED(flags);
 
     uint32_t s0;
     uint32_t ns;
     dsv4_state_src_stream_range(kv->get_n_stream(), seq_id, s0, ns);
 
-    const uint32_t version = DSV4_K_CACHE_STATE_VER;
+    const uint32_t version = row0 > 0 ? DSV4_K_CACHE_STATE_DELTA : DSV4_K_CACHE_STATE_VER;
     const uint32_t kv_size = kv->get_size();
     const auto layer_ids = kv->get_layer_ids();
     const uint32_t n_layer = layer_ids.size();
 
-    if (n_rows > kv_size) {
+    if (n_rows > kv_size || row0 > n_rows) {
         throw std::runtime_error("DSV4 K-cache state row count exceeds cache size");
     }
 
     io.write(&version, sizeof(version));
+    if (row0 > 0) {
+        io.write(&row0, sizeof(row0));
+    }
     io.write(&n_rows,  sizeof(n_rows));
     io.write(&ns,      sizeof(ns));
     io.write(&n_layer, sizeof(n_layer));
 
     for (uint32_t il : layer_ids) {
         io.write(&il, sizeof(il));
-        dsv4_state_write_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows, s0, ns);
+        dsv4_state_write_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows, s0, ns, nullptr, row0);
     }
 }
 
@@ -370,17 +384,29 @@ static void dsv4_state_read_k_cache(
     GGML_UNUSED(flags);
 
     uint32_t version;
+    uint32_t row0 = 0;
     uint32_t n_rows_ref;
     uint32_t ns;
     uint32_t n_layer_ref;
 
     io.read(&version,     sizeof(version));
+    if (version == DSV4_K_CACHE_STATE_DELTA) {
+        // a delta section appends rows onto a base that already holds [0, row0): it is only valid
+        // when composing (NO_CLEAR), never as the first node of a chain
+        if (!(flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR)) {
+            throw std::runtime_error("DSV4 K-cache delta section loaded without NO_CLEAR");
+        }
+        io.read(&row0, sizeof(row0));
+    }
     io.read(&n_rows_ref,  sizeof(n_rows_ref));
     io.read(&ns,          sizeof(ns));
     io.read(&n_layer_ref, sizeof(n_layer_ref));
 
-    if (version != 1 && version != DSV4_K_CACHE_STATE_VER) {
+    if (version != 1 && version != DSV4_K_CACHE_STATE_VER && version != DSV4_K_CACHE_STATE_DELTA) {
         throw std::runtime_error("DSV4 K-cache state version mismatch");
+    }
+    if (row0 > n_rows_ref) {
+        throw std::runtime_error("DSV4 K-cache delta starts past its end");
     }
 
     const uint32_t kv_size = kv->get_size();
@@ -408,7 +434,7 @@ static void dsv4_state_read_k_cache(
             throw std::runtime_error("DSV4 K-cache layer id mismatch");
         }
 
-        dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
+        dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns, row0);
     }
 }
 
@@ -1593,7 +1619,23 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
 }
 
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    state_write_impl(io, seq_id, -1, flags);
+}
+
+void llama_kv_cache_dsv4::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
+    if (p1 >= 0 || seq_id < 0) {
+        // a bounded [p0, p1) range or a whole-context save cannot be expressed: write whole
+        state_write_impl(io, seq_id, -1, flags);
+        return;
+    }
+
+    state_write_impl(io, seq_id, std::max<llama_pos>(p0, 0), flags);
+}
+
+void llama_kv_cache_dsv4::state_write_impl(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    // p0 > 0: a delta of positions [p0, -1) (see state_write_range); p0 <= 0: the whole sequence
+    const bool is_delta = p0 > 0;
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
@@ -1603,7 +1645,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    kv_raw->state_write(io, seq_id, flags);
+    if (is_delta) {
+        kv_raw->state_write_range(io, seq_id, p0, -1, flags);
+    } else {
+        kv_raw->state_write(io, seq_id, flags);
+    }
 
     if (!partial_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
@@ -1616,9 +1662,14 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         const uint32_t n_rows_lid = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
 
-        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
-        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
-        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
+        // the rows the parent already holds: every block completed before p0
+        const uint32_t row0_csa = is_delta ? std::min(n_rows_csa, dsv4_state_n_used_k_rows(p0 - 1, DSV4_CSA_RATIO, kv_csa->get_size())) : 0;
+        const uint32_t row0_hca = is_delta ? std::min(n_rows_hca, dsv4_state_n_used_k_rows(p0 - 1, DSV4_HCA_RATIO, kv_hca->get_size())) : 0;
+        const uint32_t row0_lid = is_delta ? std::min(n_rows_lid, dsv4_state_n_used_k_rows(p0 - 1, DSV4_CSA_RATIO, kv_lid->get_size())) : 0;
+
+        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa, row0_csa);
+        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca, row0_hca);
+        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid, row0_lid);
     }
 
     csa_state->state_write(io, seq_id, flags, rs_idx);
@@ -1654,7 +1705,11 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_raw->state_read(io, seq_id, flags);
 
     if (!partial_only) {
-        clear_compressed(seq_id, true);
+        // composing a delta (NO_CLEAR) keeps the base's compressed rows; the delta sections write only
+        // the rows completed after it. The small compressor states below are always replaced whole.
+        if (!(flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR)) {
+            clear_compressed(seq_id, true);
+        }
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);

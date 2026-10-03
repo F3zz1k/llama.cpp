@@ -2645,6 +2645,15 @@ private:
         if (!f || !rd_u32(n_stream)) {
             return false;
         }
+        // DeepSeek-V4 (llama_kv_cache_dsv4) prefixes its state with magic, version and mode before the
+        // raw cache's own n_stream; skip that prefix so the count below is the raw cache's delta cells.
+        static constexpr uint32_t DSV4_STATE_MAGIC = 0x34565344; // "DSV4", src/llama-kv-cache-dsv4.cpp
+        if (n_stream == DSV4_STATE_MAGIC) {
+            uint32_t dsv4_version = 0, dsv4_mode = 0;
+            if (!rd_u32(dsv4_version) || !rd_u32(dsv4_mode) || !rd_u32(n_stream)) {
+                return false;
+            }
+        }
         // exactly one stream holds this seq's cells; empty streams write only cell_count == 0 with no
         // meta/data following, so scan cell_counts until the first non-zero one (the delta count).
         for (uint32_t s = 0; s < n_stream; ++s) {
