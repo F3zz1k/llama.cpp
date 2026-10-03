@@ -4776,8 +4776,17 @@ private:
             // absorbs any repeat. Reads `update_cache` BEFORE the `&& prompt_cache` narrowing so disk save
             // works without --cache-ram. `ret` is idle, so this delays only the new task's first token by
             // one save (a delta under --slot-save-incremental).
-            if (auto_cache_enabled() && params_base.slot_save_on_reclaim && update_cache) {
-                auto_save_slot_if_useful(*ret);
+            // Gate on "the new task does not extend the slot", NOT on `update_cache`: that flag is the
+            // RAM cache's own rule (f_keep < 0.5, or an LRU pick), and two conversations that share a
+            // long leading prefix (a common system prompt) keep f_keep >= 0.5 while the slot's own tail
+            // is still overwritten. Save whenever at least one block of the slot's tokens lies past the
+            // common prefix with the new task; a task that extends the slot (or diverges within the
+            // last block) loses nothing worth a write.
+            if (auto_cache_enabled() && params_base.slot_save_on_reclaim && !ret->prompt.tokens.empty()) {
+                const size_t n_lcp_reclaim = ret->prompt.tokens.get_common_prefix(task.tokens);
+                if (n_lcp_reclaim + (size_t) params_base.slot_save_block <= (size_t) ret->prompt.n_tokens()) {
+                    auto_save_slot_if_useful(*ret);
+                }
             }
 
             update_cache = update_cache && prompt_cache;
