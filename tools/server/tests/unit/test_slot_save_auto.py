@@ -199,7 +199,7 @@ def test_snapshot_below_min_tokens_not_saved():
     assert len(os.listdir(CACHE_DIR)) > 0
 
 
-def _text_cache_server(n_ctx: int) -> ServerProcess:
+def _text_cache_server(n_ctx: int, ctk: str | None = None) -> ServerProcess:
     s = ServerPreset.tinyllama2()
     s.n_ctx = n_ctx
     s.n_batch = 512
@@ -208,69 +208,119 @@ def _text_cache_server(n_ctx: int) -> ServerProcess:
     s.slot_save_path = CACHE_DIR
     s.slot_save_auto = True
     s.slot_save_min_tokens = 0  # short-prompt test: keep the floor at the hash block size
+    if ctk is not None:
+        s.ctk = ctk
     return s
 
 
 def _golden_completion(s: ServerProcess):
     res = s.make_request("POST", "/completion", data=GOLDEN_REQUEST)
     assert res.status_code == 200
-    return res.body["timings"]["prompt_n"], res.body["content"]
+    t = res.body["timings"]
+    return t["prompt_n"], res.body["content"], t.get("cache_disk_n", 0)
+
+
+def _bins():
+    return sorted(f for f in os.listdir(CACHE_DIR) if f.endswith(".bin"))
 
 
 def test_mixed_geometry_peers_get_disjoint_filenames():
     """G3/F4: two peers sharing one --slot-save-path that agree on the token prefix but
-    differ in a geometry field absent from the block-chain salt used to mint the SAME
-    filename and atomically rename over each other (destructive clobber -> one peer can
-    never restore). The full-identity filename prefix gives them disjoint names so both
-    units coexist and each restores its OWN; a same-config peer still reuses one
-    deterministic name (no file proliferation).
+    differ in an identity field absent from the block-chain salt used to mint the SAME
+    filename and atomically rename over each other (destructive clobber: a K=f32 blob
+    landing under a K=f16 peer's name). The full-identity filename prefix gives them
+    disjoint names so both units coexist and each restores its OWN; a same-config peer
+    still reuses one deterministic name (no file proliferation).
 
-    Discriminator here is --ctx-size (fp_n_ctx): the tiny CI model cannot init a quantized
-    KV cache, but fp_n_ctx is the same class of identity field as the --cache-type-k /
-    --rope-freq-base / --yarn-* named in the finding — all are in operator== yet none feed
-    the fp_model-salted chain, so all collided identically before this fix."""
-    # --- peer A (n_ctx 512) and peer B (n_ctx 1024) each publish into the shared dir ---
+    Discriminator is --cache-type-k (f16 vs f32). It must be a field that
+    restore_compatible() refuses in BOTH directions: with fp_n_ctx the larger peer may
+    legally reuse the smaller peer's unit (cross-ctx reuse), finds it already covering
+    the prefix and writes nothing, so a ctx-only pair never produces a second file and
+    cannot exercise the naming at all. f32 is not a quantised type, so the tiny CI model
+    initialises it."""
     a = _text_cache_server(512)
     a.start()
-    a_prompt_cold, a_content_cold = _golden_completion(a)
+    a_prompt_cold, a_content_cold, a_disk_cold = _golden_completion(a)
     a.stop()   # shutdown flush publishes A's unit
-    b = _text_cache_server(1024)
-    b.start()  # B's startup scan sees A's unit but its fp (n_ctx) differs -> not indexed
-    b_prompt_cold, b_content_cold = _golden_completion(b)
+    assert a_disk_cold == 0
+    assert len(_bins()) == 1
+
+    b = _text_cache_server(512, ctk="f32")
+    b.start()  # B's startup scan reads A's sidecar, fp_cache_k differs -> not indexed
+    b_prompt_cold, b_content_cold, b_disk_cold = _golden_completion(b)
     b.stop()   # shutdown flush publishes B's unit (old code: renames over A's)
+    assert b_disk_cold == 0                      # B never touched A's K=f16 unit
+    assert b_prompt_cold == a_prompt_cold        # and really prefilled cold
 
-    bins = sorted(f for f in os.listdir(CACHE_DIR) if f.endswith(".bin"))
+    bins = _bins()
     # no clobber: two distinct units with disjoint identity-hash prefixes but an IDENTICAL
-    # chain-hash + token-count tail (the chain keeps its fp_model salt, so geometry never
-    # perturbs it — only the prefix separates the peers).
+    # chain-hash + token-count tail (the chain keeps its fp_model salt).
     assert len(bins) == 2, bins
-    prefixes = {f.split("-")[1] for f in bins}
-    tails = {"-".join(f.split("-")[2:]) for f in bins}
-    assert len(prefixes) == 2, bins   # disjoint names (the fix)
-    assert len(tails) == 1, bins      # same fp_model-salted chain tail
+    assert len({f.split("-")[1] for f in bins}) == 2, bins
+    assert len({"-".join(f.split("-")[2:]) for f in bins}) == 1, bins
 
-    # --- both restore their OWN unit from the shared dir (fresh processes) ---
+    # both restore from the shared dir (fresh processes). Each peer can only ever index
+    # its OWN unit (the other is refused by restore_compatible before any load), so a
+    # disk hit here is necessarily a hit on its own file.
     a2 = _text_cache_server(512)
     a2.start()
-    a_prompt_warm, a_content_warm = _golden_completion(a2)
+    a_prompt_warm, a_content_warm, a_disk_warm = _golden_completion(a2)
     a2.stop()
-    assert a_prompt_warm <= a_prompt_cold - 256  # A restored a full block (not clobbered)
+    assert a_disk_warm >= 256
+    assert a_prompt_warm <= a_prompt_cold - 256
     assert a_content_warm == a_content_cold
 
-    b2 = _text_cache_server(1024)
+    b2 = _text_cache_server(512, ctk="f32")
     b2.start()
-    b_prompt_warm, b_content_warm = _golden_completion(b2)
+    b_prompt_warm, b_content_warm, b_disk_warm = _golden_completion(b2)
     b2.stop()
-    assert b_prompt_warm <= b_prompt_cold - 256  # B restored ITS own unit, not A's
+    assert b_disk_warm >= 256
+    assert b_prompt_warm <= b_prompt_cold - 256
     assert b_content_warm == b_content_cold
 
-    # uniform-config idempotence: re-running A's exact config adds no third unit (same
-    # deterministic name -> atomic-rename-idempotent) — the fix does not proliferate files.
+    # uniform-config idempotence: re-running A's exact config adds no third unit
     a3 = _text_cache_server(512)
     a3.start()
     _golden_completion(a3)
     a3.stop()
-    assert len([f for f in os.listdir(CACHE_DIR) if f.endswith(".bin")]) == 2
+    assert len(_bins()) == 2
+
+
+def test_cross_ctx_peers_share_the_smaller_unit():
+    """fp_n_ctx is an identity field (disjoint filenames) but NOT a symmetric restore gate:
+    a larger-ctx peer may restore a smaller-ctx unit (non-SWA), never the reverse.
+    Smaller first: the larger peer restores it and, finding that unit already covering the
+    prefix, writes no duplicate. Larger first: the smaller peer must cold-prefill and then
+    publish its own unit under a disjoint prefix."""
+    a = _text_cache_server(512)
+    a.start()
+    a_prompt_cold, a_content_cold, _ = _golden_completion(a)
+    a.stop()
+    b = _text_cache_server(1024)
+    b.start()
+    b_prompt, b_content, b_disk = _golden_completion(b)
+    b.stop()
+    assert b_disk >= 256                          # cross-ctx reuse of A's unit
+    assert b_prompt <= a_prompt_cold - 256
+    assert b_content == a_content_cold
+    assert len(_bins()) == 1, _bins()             # no redundant 1024-ctx copy
+
+    shutil.rmtree(CACHE_DIR)
+    os.makedirs(CACHE_DIR)
+    b = _text_cache_server(1024)
+    b.start()
+    _golden_completion(b)
+    b.stop()
+    a = _text_cache_server(512)
+    a.start()
+    a_prompt, a_content, a_disk = _golden_completion(a)
+    a.stop()
+    assert a_disk == 0                            # a 1024-ctx unit never restores into 512
+    assert a_prompt == a_prompt_cold
+    assert a_content == a_content_cold
+    bins = _bins()
+    assert len(bins) == 2, bins
+    assert len({f.split("-")[1] for f in bins}) == 2, bins
 
 
 def test_missing_meta_is_transient_not_rejected():
