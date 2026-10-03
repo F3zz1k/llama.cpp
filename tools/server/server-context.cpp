@@ -1794,6 +1794,21 @@ private:
     enum class delta_cap : uint8_t { unknown, yes, no };
     delta_cap delta_capable = delta_cap::unknown;
 
+    // F1: on a class whose probe said NO, every parented save is published as a whole root instead of
+    // a delta. That is a degradation (more bytes per node), so it is never silent: one WRN per
+    // instance plus a cumulative counter (llamacpp:auto_cache_save_whole_fallback_total).
+    bool auto_save_whole_fallback_warned = false;
+    void auto_save_note_whole_fallback(const server_slot & slot, size_t n_tokens, uint32_t parent_hi) {
+        metrics.n_auto_save_whole_fallback++;
+        if (!auto_save_whole_fallback_warned) {
+            auto_save_whole_fallback_warned = true;
+            SLT_WRN(slot, "auto-save: this memory type cannot write deltas (probe said NO); publishing "
+                          "parented saves as WHOLE roots instead (this one: %zu tokens, parent at %u). "
+                          "Logged once; see llamacpp:auto_cache_save_whole_fallback_total\n",
+                    n_tokens, parent_hi);
+        }
+    }
+
     // The value the ENGINE masks with (llama_model_n_swa), NEVER zeroed by --swa-full. Every disk
     // save/restore soundness decision must use THIS, not n_swa: --swa-full enlarges the SWA cache but
     // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
@@ -3022,8 +3037,15 @@ private:
         size_t nwrite;
         // P0.1: a class that does not honour ranges must never publish a delta. Probe once, here,
         // where real resident state exists and the range save is about to happen anyway.
+        // F1: a NO answer must not drop the save. Returning here used to discard EVERY parented save
+        // on a non-delta class (only the first, unparented save of a chain ever reached disk), so
+        // the deeper prefixes were never cached at all. Publish the same prefix as a WHOLE root
+        // instead, exactly as the U6 cell-count fallback below does.
         if (is_node && delta_capable == delta_cap::no) {
-            return; // fail closed: this instance only writes whole roots
+            auto_save_note_whole_fallback(slot, snap_toks.size(), parent_hi);
+            is_node   = false;
+            parent_id = 0;
+            parent_hi = 0;
         }
         if (is_node) {
             // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
@@ -3052,17 +3074,36 @@ private:
             const std::string probe = tmp + ".probe";
             const size_t nwhole = llama_state_seq_save_file(ctx, probe.c_str(), slot.id,
                                                             snap_toks.data(), snap_toks.size());
-            std::error_code pec; std::filesystem::remove(probe, pec);
             if (nwhole == 0) {
-                std::error_code ec; std::filesystem::remove(tmp, ec);
+                std::error_code ec;
+                std::filesystem::remove(probe, ec);
+                std::filesystem::remove(tmp, ec);
                 return; // could not probe; try again on the next save rather than guess
             }
             delta_capable = (nwrite < nwhole) ? delta_cap::yes : delta_cap::no;
             SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
                     delta_capable == delta_cap::yes ? "YES" : "NO (whole roots only)", nwrite, nwhole);
             if (delta_capable == delta_cap::no) {
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                return;
+                // F1: the probe file IS a whole save of this exact prefix, so it is published as a
+                // whole root in place of the (unusable) delta instead of being thrown away.
+                auto_save_note_whole_fallback(slot, snap_toks.size(), parent_hi);
+                is_node   = false;
+                parent_id = 0;
+                parent_hi = 0;
+                std::error_code ec;
+                std::filesystem::rename(probe, tmp, ec);
+                if (ec) {
+                    std::filesystem::remove(probe, ec);
+                    nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
+                    if (nwrite == 0) {
+                        std::filesystem::remove(tmp, ec);
+                        return; // invariant 4
+                    }
+                } else {
+                    nwrite = nwhole;
+                }
+            } else {
+                std::error_code pec; std::filesystem::remove(probe, pec);
             }
         }
 
