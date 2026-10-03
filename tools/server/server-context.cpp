@@ -484,7 +484,8 @@ static bool slot_save_parse_node_id(const std::string & state_path, uint64_t & n
 static void slot_save_enforce_limits(const std::string & dir,
                                      int32_t max_count, int64_t max_bytes,
                                      const std::string & just_written,
-                                     bool & oversized) {
+                                     bool & oversized,
+                                     uint64_t * n_evicted = nullptr) {
     oversized = false;
     if (max_count <= 0 && max_bytes <= 0) {
         return; // both unlimited
@@ -765,6 +766,9 @@ static void slot_save_enforce_limits(const std::string & dir,
             return false;
         }
         remove_unit_files(units[i]);
+        if (n_evicted) {
+            (*n_evicted)++;
+        }
         alive[i] = 0;
         total -= std::min(total, (uintmax_t) units[i].bytes);
         count = (count > 0) ? count - 1 : 0;
@@ -2892,6 +2896,10 @@ private:
 
         if (!do_slot_restore(slot, chain)) {
             // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
+            metrics.n_auto_restore_failed++;
+            SLT_WRN(slot, "auto-restore: loading %s failed after the slot was cleared; trying a shorter "
+                          "candidate or prefilling cold (failed so far = %" PRIu64 ")\n",
+                    cand.state_path.c_str(), metrics.n_auto_restore_failed);
             return 0;
         }
         if (!disk_media.empty()) {
@@ -2919,6 +2927,7 @@ private:
                 // let a later find_chunk() throw mid-decode (invariant 4).
                 SLT_WRN(slot, "%s", "auto-restore: rebuilt prompt failed validation; clearing restored state\n");
                 auto_restore_drop(slot);
+                metrics.n_auto_restore_failed++;
                 return 0;
             }
         }
@@ -2951,6 +2960,7 @@ private:
                 // downstream pos_min==-1 GGML_ABORT — drop it and cold-prefill instead (invariant 4).
                 SLT_WRN(slot, "%s", "auto-restore: verified prefix is outside the snapshot's SWA window; clearing restored state\n");
                 auto_restore_drop(slot);
+                metrics.n_auto_restore_failed++;
                 return 0;
             }
             slot.prompt.checkpoints.clear();
@@ -3233,6 +3243,7 @@ private:
                     snap_toks.size(), media.size(), fname.c_str());
         }
 
+        bool published = true;
         // index insert (bhs[0..kb] -> this snapshot), then bounded-LRU + reconcile.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -3252,7 +3263,17 @@ private:
             slot_save_enforce_limits(params_base.slot_save_path,
                                      params_base.slot_save_max_count,
                                      params_base.slot_save_max_bytes,
-                                     fname, oversized);
+                                     fname, oversized, &metrics.n_auto_cache_evicted);
+            if (oversized) {
+                // enforce_limits deleted the unit just published; the reconcile below drops it
+                // from the index. Not a stored save, so it counts as dropped, not as a root/delta.
+                published = false;
+                auto_save_note_failure(slot, "snapshot is larger than --slot-save-max-mb", snap_toks.size());
+            }
+        }
+        if (published) {
+            (is_node ? metrics.n_auto_save_delta : metrics.n_auto_save_root)++;
+            metrics.n_auto_save_bytes += nwrite;
         }
         // Reconcile index with what the LRU kept (ours or a peer's) AND adopt the post-write dir
         // mtime as our scan baseline — both under ONE lock. Re-baselining here means OUR OWN
@@ -6282,6 +6303,7 @@ private:
                                     // FULL model, which needs a whole-prefix match) from shadowing a shorter
                                     // usable one at the same boundary. Media requests look up first-class:
                                     // auto_index_lookup folds each chunk's identity into the boundary hashes.
+                                    int n_restored = 0;
                                     for (const auto & cand : auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
@@ -6297,8 +6319,21 @@ private:
                                         const int restored = auto_restore_into_slot(slot, cand, input_tokens, (int) n_past);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                         if (restored > 0) {
+                                            n_restored = restored;
                                             break; // restored; stop trying shorter candidates
                                         }
+                                    }
+                                    // hit / miss accounting (llamacpp:auto_cache_restore_*_total and the
+                                    // per-request timings.cache_disk_n). A MISS is a request that still had
+                                    // at least one whole block beyond its in-memory match and got nothing
+                                    // from disk: that includes genuinely new prompts no cache could hold,
+                                    // so read it next to auto_cache_evicted_total, not as a ratio alone.
+                                    if (n_restored > 0) {
+                                        metrics.n_auto_restore_hit++;
+                                        metrics.n_auto_restore_tokens += (uint64_t) n_restored;
+                                        slot.stats.n_prompt_cached_disk = (uint64_t) n_restored;
+                                    } else if ((int) input_tokens.size() >= n_past + params_base.slot_save_block) {
+                                        metrics.n_auto_restore_miss++;
                                     }
                                 }
                                 // ===== end AUTO-RESTORE =====================================================
@@ -6714,6 +6749,8 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
+                        // the disk-restored share can only shrink after the restore (n_past clamps)
+                        slot.stats.n_prompt_cached_disk = std::min<uint64_t>(slot.stats.n_prompt_cached_disk, (uint64_t) n_past);
 
                         metrics.add_prompt_cached(n_past);
 

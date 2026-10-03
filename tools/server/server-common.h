@@ -716,6 +716,7 @@ json format_response_rerank(
 // shared between server_slot and server_task_result_*
 struct server_slot_stats {
     uint64_t n_prompt_cached    = 0;
+    uint64_t n_prompt_cached_disk = 0; // part of n_prompt_cached restored from the auto disk cache
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
 
@@ -847,6 +848,14 @@ struct server_metrics {
     // auto disk KV cache: opportunities that were skipped or degraded (never silent, each also logs a WRN)
     uint64_t n_auto_save_whole_fallback    = 0; // parented saves published as whole roots because the class cannot write deltas
     uint64_t n_auto_save_failed            = 0; // saves dropped with nothing published (no space, IO error, refused)
+    uint64_t n_auto_save_root              = 0; // whole roots published (includes whole fallbacks)
+    uint64_t n_auto_save_delta             = 0; // delta nodes published
+    uint64_t n_auto_save_bytes             = 0; // state bytes written by published saves
+    uint64_t n_auto_cache_evicted          = 0; // units this instance evicted from the shared store (LRU)
+    uint64_t n_auto_restore_hit            = 0; // requests that restored a prefix from disk
+    uint64_t n_auto_restore_miss           = 0; // eligible requests with >= 1 block beyond the in-memory match and no restore
+    uint64_t n_auto_restore_failed         = 0; // restores that failed after clearing the slot
+    uint64_t n_auto_restore_tokens         = 0; // tokens restored from disk
 
     void init() {
         t_start = ggml_time_us();

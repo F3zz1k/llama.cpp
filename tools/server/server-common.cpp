@@ -98,6 +98,11 @@ json server_slot_stats::to_json() const {
         {"predicted_per_second",   n_gen_tps()},
     };
 
+    if (n_prompt_cached_disk > 0) {
+        // the part of cache_n that came from the auto disk cache rather than the resident slot
+        base["cache_disk_n"] = n_prompt_cached_disk;
+    }
+
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;

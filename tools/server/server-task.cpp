@@ -1584,6 +1584,46 @@ std::string server_task_result_metrics::to_metrics() {
             "Auto disk KV cache: saves dropped with nothing published (no space, IO error, refused); each logs a rate-limited WRN with the reason",
             (double) metrics.n_auto_save_failed
         },
+        {
+            "auto_cache_save_root_total",
+            "Auto disk KV cache: whole roots published (includes whole fallbacks)",
+            (double) metrics.n_auto_save_root
+        },
+        {
+            "auto_cache_save_delta_total",
+            "Auto disk KV cache: delta nodes published",
+            (double) metrics.n_auto_save_delta
+        },
+        {
+            "auto_cache_save_bytes_total",
+            "Auto disk KV cache: state bytes written by published saves",
+            (double) metrics.n_auto_save_bytes
+        },
+        {
+            "auto_cache_evicted_total",
+            "Auto disk KV cache: units this instance evicted from the shared store to stay under the caps",
+            (double) metrics.n_auto_cache_evicted
+        },
+        {
+            "auto_cache_restore_hit_total",
+            "Auto disk KV cache: requests that restored a prefix from disk",
+            (double) metrics.n_auto_restore_hit
+        },
+        {
+            "auto_cache_restore_miss_total",
+            "Auto disk KV cache: requests with at least one whole block beyond the in-memory match that restored nothing (includes new prompts)",
+            (double) metrics.n_auto_restore_miss
+        },
+        {
+            "auto_cache_restore_failed_total",
+            "Auto disk KV cache: restores that failed after clearing the slot (fell back to a shorter snapshot or a cold prefill)",
+            (double) metrics.n_auto_restore_failed
+        },
+        {
+            "auto_cache_restore_tokens_total",
+            "Auto disk KV cache: prompt tokens restored from disk",
+            (double) metrics.n_auto_restore_tokens
+        },
     };
 
     const std::vector<metric_item> gauges = {
