@@ -2826,11 +2826,17 @@ private:
 
 class llama_io_read_file : public llama_io_read_i {
 public:
-    llama_io_read_file(llama_file * f) : file(f) {}
+    llama_io_read_file(llama_file * f) : file(f), size_left(f->size() - f->tell()) {}
 
     void read(void * dst, size_t size) override {
+        // llama_file's buffered read clamps a read at EOF and returns without error, so a truncated
+        // state file would otherwise feed stale bytes into the cache and trip an assert afterwards
+        if (size > size_left) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
         file->read_raw(dst, size);
         size_read += size;
+        size_left -= size;
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
@@ -2846,6 +2852,7 @@ public:
 private:
     llama_file * file;
     size_t size_read = 0;
+    size_t size_left;
     std::vector<uint8_t> temp_buffer;
 };
 
