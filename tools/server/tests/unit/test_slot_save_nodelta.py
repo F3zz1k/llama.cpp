@@ -16,8 +16,11 @@ from utils import *
 # so a run against a build whose ctest has generated the models exercises F1 by default. It skips,
 # naming the path it tried, only when neither holds the model. Prompts are token ids because the
 # dummy vocab has 128 tokens and no meaningful text tokenizer.
-#   mamba-dense:  pure recurrent memory, no state_write_range override (base-class whole write)
-#   qwen4exp-moe: llama_memory_hybrid_idx with an indexer, which writes whole on purpose
+#   mamba-dense, mamba2-dense: pure recurrent memory, where the whole state IS the only correct
+#   form of every save (a fixed-size fold of the prefix), so the probe always answers NO
+#
+# The second test is the converse for the memory types that gained state_write_range: the probe
+# must answer YES, parented saves must be v3 deltas, and a fresh instance must compose the chain.
 
 def _default_models_dir() -> str:
     env = os.environ.get("LLAMA_TEST_MODELS_DIR", "")
@@ -110,7 +113,7 @@ def clean_cache_dir():
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
 
 
-@pytest.mark.parametrize("model_name", ["mamba-dense", "qwen4exp-moe"])
+@pytest.mark.parametrize("model_name", ["mamba-dense", "mamba2-dense"])
 def test_nodelta_parented_save_is_whole_root(model_name, tmp_path):
     model = os.path.join(MODELS_DIR, f"{model_name}.gguf")
     if not os.path.isfile(model):
@@ -166,3 +169,58 @@ def test_nodelta_parented_save_is_whole_root(model_name, tmp_path):
     assert hits == 1 and restored == len(EXT2), f"hit counters: hits={hits} tokens={restored}"
     assert res.body["timings"].get("cache_disk_n") == len(EXT2), \
         f"timings.cache_disk_n must report the disk-restored prefix, got {res.body['timings']}"
+
+
+# llama_kv_cache_dsa (glm-dsa, deepseek32), llama_kv_cache_msa (minimax-m3), llama_kv_cache_dsv4
+# (deepseek4) and llama_memory_hybrid_idx with an indexer (glm5-next, qwen4exp) used to write whole
+# only. deepseek4 also exercises the server's DSV4-prefix skip in the delta cell-count check.
+@pytest.mark.parametrize("model_name", [
+    "glm-dsa-moe", "deepseek32-moe", "minimax-m3-moe", "deepseek4-moe", "glm5-next-moe", "qwen4exp-moe",
+])
+def test_delta_capable_parented_saves_are_deltas(model_name, tmp_path):
+    model = os.path.join(MODELS_DIR, f"{model_name}.gguf")
+    if not os.path.isfile(model):
+        pytest.skip(f"{model} not found (set LLAMA_TEST_MODELS_DIR or run the generate-models ctest)")
+
+    log1 = str(tmp_path / "server1.log")
+    s = _make_server(model, log1)
+    s.start()
+    _complete(s, BASE)
+    assert len(_wait_for_metas(1, IDLE_SECONDS + 12)) == 1, "the base prompt must be flushed"
+    _complete(s, EXT)
+    assert len(_wait_for_metas(2, IDLE_SECONDS + 12)) == 2
+    _complete(s, EXT2)
+    metas = _wait_for_metas(3, IDLE_SECONDS + 12)
+    roots = _metric(s, "auto_cache_save_root_total")
+    deltas = _metric(s, "auto_cache_save_delta_total")
+    fallback = _metric(s, "auto_cache_save_whole_fallback_total")
+    s.stop()
+
+    with open(log1) as f:
+        log = f.read()
+    assert "delta capability probed = YES" in log, "this memory type must honour position ranges"
+    assert "cell-count check failed" not in log, "the delta cell-count check must accept these deltas"
+    assert len(metas) == 3, f"three units expected, got {metas}"
+    versions = sorted(_meta_version(m) for m in metas)
+    assert versions == [1, 3, 3], f"one v1 root and two v3 deltas expected, got {versions}"
+    assert roots == 1 and deltas == 2 and fallback == 0, f"roots={roots} deltas={deltas} fallback={fallback}"
+
+    # a fresh instance composes root + delta + delta (NO_CLEAR) and resumes from the deepest node
+    log2 = str(tmp_path / "server2.log")
+    s2 = _make_server(model, log2)
+    s2.start()
+    res = s2.make_request("POST", "/completion", data={
+        "prompt": EXT3,
+        "n_predict": 0,
+        "cache_prompt": True,
+        "id_slot": 0,
+    })
+    assert res.status_code == 200
+    hits = _metric(s2, "auto_cache_restore_hit_total")
+    failed = _metric(s2, "auto_cache_restore_failed_total")
+    s2.stop()
+    with open(log2) as f:
+        log = f.read()
+    assert f"auto-restore: reused {len(EXT2)} tokens from disk" in log, \
+        "the restore must compose the delta chain up to the deepest node"
+    assert hits == 1 and failed == 0, f"hits={hits} failed={failed}"
