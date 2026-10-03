@@ -1702,23 +1702,37 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    // the raw, compressed and compressor-state parts must restore together: a read that fails halfway
+    // (more so while composing a delta with NO_CLEAR, which keeps what the base put there) would leave
+    // them disagreeing about the sequence, so a failure drops the sequence from every part
+    try {
+        kv_raw->state_read(io, seq_id, flags);
 
-    if (!partial_only) {
-        // composing a delta (NO_CLEAR) keeps the base's compressed rows; the delta sections write only
-        // the rows completed after it. The small compressor states below are always replaced whole.
-        if (!(flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR)) {
-            clear_compressed(seq_id, true);
+        if (!partial_only) {
+            // composing a delta (NO_CLEAR) keeps the base's compressed rows; the delta sections write only
+            // the rows completed after it. The small compressor states below are always replaced whole.
+            if (!(flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR)) {
+                clear_compressed(seq_id, true);
+            }
+
+            dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
+            dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
+            dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
         }
 
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
-    }
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+    } catch (...) {
+        if (seq_id >= 0) {
+            kv_raw->seq_rm(seq_id, -1, -1);
+            clear_compressed(seq_id, true);
+        } else {
+            clear(true);
+        }
 
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
+        throw;
+    }
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);

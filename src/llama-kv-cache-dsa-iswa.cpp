@@ -253,13 +253,21 @@ void llama_kv_cache_dsa_iswa::state_write_range(llama_io_write_i & io, llama_seq
 }
 
 void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        kv_dsa->state_read(io, seq_id, flags);
-    }
+    // a failure in either part drops the sequence from both, so they never disagree about it
+    try {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            kv_dsa->state_read(io, seq_id, flags);
+        }
 
-    // the sliding-window part is written whole at every node, so the tip's window must replace the
-    // base's, never compose with it: mask NO_CLEAR off so kv_swa always clears first
-    kv_swa->state_read(io, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_NO_CLEAR);
+        // the sliding-window part is written whole at every node, so the tip's window must replace the
+        // base's, never compose with it: mask NO_CLEAR off so kv_swa always clears first
+        kv_swa->state_read(io, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_NO_CLEAR);
+    } catch (...) {
+        kv_dsa->seq_rm(seq_id, -1, -1);
+        kv_swa->state_clear(seq_id);
+
+        throw;
+    }
 }
 
 llama_kv_cache_dsa * llama_kv_cache_dsa_iswa::get_dsa() const {
