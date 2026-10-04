@@ -15,7 +15,8 @@ from utils import *
 #   LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS     the writer waits this long after a unit's temps are written
 #   LLAMA_TEST_SLOT_SAVE_FAIL_META_AT        the k-th .meta rename fails (1-based)
 #   LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S      age after which a dead writer's temps are reaped (default 600)
-#   LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS the shutdown flush deadline (default 100000)
+#   LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS the shutdown flush deadline (default 90000)
+#   LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS     a writer silent this long counts as hung (default 60000)
 # Prompts are token ids: the dummy vocab has no meaningful text tokenizer.
 
 
@@ -33,7 +34,8 @@ B = 16
 IDLE = 1
 SLOT_META_MAGIC = 0x544D4B4C  # "LKMT"
 HOOKS = ("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", "LLAMA_TEST_SLOT_SAVE_FAIL_META_AT",
-         "LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S", "LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS")
+         "LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S", "LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS",
+         "LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS")
 
 
 def _toks(n: int, seed: int):
@@ -94,6 +96,20 @@ def _metric(s, name: str) -> float:
         if line.startswith(f"llamacpp:{name} "):
             return float(line.split()[1])
     raise AssertionError(f"metric {name} not found")
+
+
+def _site_metric(s, name: str, site: str) -> float:
+    res = s.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    key = f'llamacpp:{name}{{site="{site}"}} '
+    for line in res.body.splitlines():
+        if line.startswith(key):
+            return float(line.split()[1])
+    raise AssertionError(f"metric {name}{{site={site}}} not found")
+
+
+def _lens(cache=CACHE_DIR):
+    return sorted(_node_parent(m)[1] for m in _metas(cache))
 
 
 def _wait(pred, timeout_s: float, step: float = 0.05):
@@ -259,16 +275,22 @@ def test_failed_parent_drops_its_queued_child(tmp_path, monkeypatch):
     assert _wait(lambda: _metric(s, "auto_cache_save_queued_total") >= 1, IDLE + 10)
     _complete(s, EXT)
     assert _wait(lambda: _metric(s, "auto_cache_save_queued_total") >= 2, IDLE + 10)
+    # the orphan's slot still holds the conversation: its idle flush is re-armed and saves it again, now
+    # as a root (the failed parent is neither published nor queued)
+    assert _wait(lambda: _lens() == [len(EXT)], 20), _lens()
     assert _wait(lambda: _metric(s, "auto_cache_save_queue_depth") == 0, 20)
     orphans = _metric(s, "auto_cache_save_orphan_dropped_total")
     failed = _metric(s, "auto_cache_save_failed_total")
-    assert _metas() == []
-    s.stop()  # its shutdown flush may publish the conversation as a new root
+    s.stop()
     assert orphans == 1
     assert failed >= 1
+    (meta,) = _metas()
+    assert _node_parent(meta)[2] is None, "the re-save must be a root"
     assert _bins_without_meta() == []
     assert _temps() == []
-    assert "its parent failed to publish" in _log(str(tmp_path / "s.log"))
+    log = _log(str(tmp_path / "s.log"))
+    assert "its parent failed to publish" in log
+    assert "re-arming the idle flush" in log
 
 
 def test_crash_during_write_publishes_nothing_and_temps_are_reaped(tmp_path, monkeypatch):
@@ -301,9 +323,10 @@ def test_crash_during_write_publishes_nothing_and_temps_are_reaped(tmp_path, mon
     assert body["tokens"] == gen_ref
 
 
-def test_staging_full_drops_while_busy_and_streams_while_idle(tmp_path, monkeypatch):
-    """--slot-save-staging-mb 1: a save larger than the free staging is dropped (WRN + counter) while the
-    writer is busy, and streamed through the ring when it is idle; generation is unaffected."""
+def test_staging_full_idle_flush_defers_then_streams(tmp_path, monkeypatch):
+    """--slot-save-staging-mb 1: an idle flush larger than the free staging while the writer is busy is
+    DEFERRED (nothing dropped, generation unaffected and not delayed), then streamed and published once the
+    writer is idle. A later large save on an idle writer streams too, and the staging returns to 0."""
     model = _model("llama-dense")
     big_a = _toks(900, 3)   # about 1.8 MB of state: larger than the whole budget
     big_b = _toks(900, 4)
@@ -324,20 +347,168 @@ def test_staging_full_drops_while_busy_and_streams_while_idle(tmp_path, monkeypa
     t0 = time.time()
     out = _complete(s, big_a, slot=1, n_predict=8)["tokens"]
     assert out == ref
-    assert _wait(lambda: _metric(s, "auto_cache_save_dropped_staging_total") >= 1, IDLE + 10)
-    assert time.time() - t0 < 4.0, "the server must not wait on the busy writer"
+    assert time.time() - t0 < 4.0, "the request must not wait on the busy writer"
+    # big_a's unit holds its 8 generated tokens too, less the last one sampled
+    assert _wait(lambda: any(n >= len(big_a) for n in _lens()), 20), _lens()
+    assert _metric(s, "auto_cache_save_streamed_total") >= 1
     assert _wait(lambda: _metric(s, "auto_cache_save_queue_depth") == 0, 20)
-    # idle writer: the large save streams
+    # idle writer: the large save streams at once
     _complete(s, big_b, slot=0)
-    assert _wait(lambda: _metric(s, "auto_cache_save_streamed_total") >= 1, IDLE + 10)
+    assert _wait(lambda: _metric(s, "auto_cache_save_streamed_total") >= 2, IDLE + 10)
     assert _wait(lambda: _metric(s, "auto_cache_save_queue_depth") == 0, 20)
     staging = _metric(s, "auto_cache_save_staging_bytes")
+    dropped = _metric(s, "auto_cache_save_dropped_staging_total")
+    req = _site_metric(s, "auto_cache_save_site_requested_total", "idle")
+    pub = _site_metric(s, "auto_cache_save_site_published_total", "idle")
     s.stop()
     log = _log(str(tmp_path / "s.log"))
-    assert "staging full" in log
+    assert "idle flush deferred" in log
+    assert dropped == 0
     assert staging == 0
-    assert any(_node_parent(m)[1] == len(big_b) for m in _metas()), "the streamed unit must be published"
+    assert req == pub == 3, (req, pub)
+    assert len(big_b) in _lens() and sum(n >= len(big_a) for n in _lens()) == 2, _lens()
     assert _bins_without_meta() == []
+
+
+def test_reclaim_waits_for_a_busy_writer(tmp_path, monkeypatch):
+    """One slot, staging 1 MB: a large conversation reclaimed while the writer is busy with the previous
+    unit waits for the writer instead of being dropped, and a fresh instance can restore it."""
+    model = _model("llama-dense")
+    big = _toks(900, 3)
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", "3000")
+    s = _server(model, str(tmp_path / "s.log"), n_slots=1, staging_mb=1, idle=-1)
+    s.start()
+    _complete(s, P)
+    _complete(s, big)            # reclaim save of P: small, staged; the writer sleeps in its delay
+    _complete(s, _toks(300, 7))  # reclaim save of big while the writer is busy: waits, then streams
+    assert _wait(lambda: _metric(s, "auto_cache_save_queue_depth") == 0, 20)
+    dropped = _metric(s, "auto_cache_save_dropped_staging_total")
+    waits = _metric(s, "auto_cache_save_admission_waits_total")
+    req = _site_metric(s, "auto_cache_save_site_requested_total", "reclaim")
+    pub = _site_metric(s, "auto_cache_save_site_published_total", "reclaim")
+    s.process.send_signal(signal.SIGKILL)
+    s.process.wait()
+    server_instances.discard(s)
+    s.process = None
+    s._log.close()
+    assert dropped == 0
+    assert waits >= 1
+    assert req == pub == 2, (req, pub)
+    assert len(big) in _lens(), _lens()
+    assert "for the writer to take a" in _log(str(tmp_path / "s.log"))
+
+    monkeypatch.delenv("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS")
+    r = _server(model, str(tmp_path / "r.log"), idle=-1)
+    r.start()
+    body = _complete(r, big + [42] * B)
+    r.stop()
+    assert body["timings"].get("cache_disk_n", 0) >= len(big) - B, body["timings"]
+
+
+def test_stalled_writer_drops_instead_of_hanging(tmp_path, monkeypatch):
+    """A writer that shows no sign of life for the stall time (here: its test delay, 1 s stall) makes the
+    waiting capture give up with a WRN and the drop counter, rather than holding the server loop for good."""
+    model = _model("llama-dense")
+    big = _toks(900, 3)
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", "6000")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS", "1000")
+    s = _server(model, str(tmp_path / "s.log"), n_slots=1, staging_mb=1, idle=-1)
+    s.start()
+    _complete(s, P)
+    _complete(s, big)
+    t0 = time.time()
+    _complete(s, _toks(300, 7))
+    dt = time.time() - t0
+    dropped = _metric(s, "auto_cache_save_dropped_staging_total")
+    s.stop()
+    assert dropped == 1
+    assert dt < 5.0, dt
+    assert "made no progress" in _log(str(tmp_path / "s.log"))
+
+
+def test_reclaim_saves_again_when_the_covering_queued_delta_is_orphaned(tmp_path, monkeypatch):
+    """The idle flush queued the conversation as a delta on a queued parent, and a reclaim arrives while
+    both are queued. The parent's publish fails, which orphans the delta. The reclaim waited for the delta's
+    outcome instead of trusting the queue, so it writes the conversation itself (as a root) and nothing is
+    lost."""
+    model = _model("llama-dense")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", "2500")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_FAIL_META_AT", "1")
+    s = _server(model, str(tmp_path / "s.log"))
+    s.start()
+    _complete(s, P)
+    assert _wait(lambda: _metric(s, "auto_cache_save_queued_total") >= 1, IDLE + 10)
+    _complete(s, EXT)  # extends the slot; its idle flush queues a delta on the queued P
+    assert _wait(lambda: _metric(s, "auto_cache_save_queued_total") >= 2, IDLE + 10)
+    assert _metas() == []
+    _complete(s, _toks(300, 7))  # reclaims EXT's slot while the delta is queued
+    assert _wait(lambda: len(EXT) in _lens(), 20), _lens()
+    orphans = _metric(s, "auto_cache_save_orphan_dropped_total")
+    s.stop()
+    log = _log(str(tmp_path / "s.log"))
+    assert orphans == 1
+    assert "not published, saving it again" in log
+    meta = [m for m in _metas() if _node_parent(m)[1] == len(EXT)][0]
+    assert _node_parent(meta)[2] is None, "the re-save must be a root"
+    assert _bins_without_meta() == []
+
+
+def test_pending_wait_does_not_stall_other_slots(tmp_path, monkeypatch):
+    """A task waiting for its queued prefix is held in its own slot only: a request on another slot that
+    arrives during the wait is served at its normal speed, and the waiting task restores the prefix."""
+    import threading
+    model = _model("llama-dense")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", "6000")
+    s = _server(model, str(tmp_path / "s.log"), n_slots=3)
+    s.start()
+    t_ref0 = time.time()
+    _complete(s, _toks(40, 9), slot=1, n_predict=16)
+    t_ref = time.time() - t_ref0
+    _complete(s, P, slot=0)
+    assert _wait(lambda: _metric(s, "auto_cache_save_queued_total") >= 2, IDLE + 10)
+    out = {}
+    def waiter():
+        out["body"] = _complete(s, EXT, slot=2)  # waits for the queued prefix
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(0.5)
+    t0 = time.time()
+    _complete(s, _toks(40, 11), slot=1, n_predict=16)
+    t_other = time.time() - t0
+    th.join()
+    s.stop()
+    log = _log(str(tmp_path / "s.log"))
+    assert "queued unit(s) that prefix this request" in log
+    assert t_other < t_ref + 1.0, (t_ref, t_other)
+    assert out["body"]["timings"].get("cache_disk_n", 0) >= len(P) - B, out["body"]["timings"]
+
+
+def test_restore_of_a_unit_evicted_after_indexing_falls_back_cleanly(tmp_path):
+    """The writer thread now runs the LRU while the server thread restores. Deletes take no store lock (by
+    design, as for a peer's LRU), so the worst interleave is a unit this instance has indexed whose .bin is
+    gone when the restore opens it. That restore must fall back to a cold prefill with the cold output,
+    and count the failure."""
+    model = _model("llama-dense")
+    ctl = _server(model, str(tmp_path / "ctl.log"), idle=-1)
+    ctl.slot_save_auto = False
+    ctl.slot_save_path = None
+    ctl.slot_save_incremental = False
+    ctl.slot_save_idle_seconds = None
+    ctl.start()
+    ref = _complete(ctl, EXT, n_predict=8)["tokens"]
+    ctl.stop()
+
+    s = _server(model, str(tmp_path / "s.log"), n_slots=2)
+    s.start()
+    _complete(s, P, slot=0)
+    assert _wait(lambda: len(_metas()) == 1, IDLE + 10)
+    assert _wait(lambda: _metric(s, "auto_cache_save_queue_depth") == 0, 10)
+    os.remove(_metas()[0][:-len(".meta")])  # the "eviction": the .meta stays, the state file is gone
+    body = _complete(s, EXT, slot=1, n_predict=8)
+    s.stop()
+    assert body["tokens"] == ref
+    assert body["timings"].get("cache_disk_n", 0) == 0, body["timings"]
+    assert "failed after the slot was cleared" in _log(str(tmp_path / "s.log")), "the restore must have been tried"
 
 
 def test_shutdown_flush_publishes_the_queue(tmp_path, monkeypatch):
