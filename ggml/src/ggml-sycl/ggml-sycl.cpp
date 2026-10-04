@@ -2612,14 +2612,18 @@ static void top_k_scan_merge_f32(
     float * lv = shared_vals + tid;
     int * li = shared_idx + tid;
 
+    // -INFINITY, not -FLT_MAX. The insert test below is a strict `>`, so a row value equal
+    // to the sentinel is never selectable; with -FLT_MAX that silently excludes the
+    // smallest finite float. A slot nothing beats keeps index -1; the final pass repairs
+    // those below, so a -1 never reaches dst.
     for (int i = 0; i < k; i++) {
-        lv[i * block_size] = -FLT_MAX;
+        lv[i * block_size] = -INFINITY;
         li[i * block_size] = -1;
     }
 
     // The k-th best, cached in a register. The reject test is taken for the large
     // majority of elements scanned, and in that case touches no memory.
-    float kth = -FLT_MAX;
+    float kth = -INFINITY;
 
     for (int col = begin + tid; col < end; col += block_size) {
         float val = src_vals[col];
@@ -2651,12 +2655,13 @@ static void top_k_scan_merge_f32(
     float * fv = shared_vals + (size_t) k * block_size;
     int * fi = shared_idx + (size_t) k * block_size;
 
+    // see the note on the per-lane sentinel above
     for (int i = 0; i < k; i++) {
-        fv[i] = -FLT_MAX;
+        fv[i] = -INFINITY;
         fi[i] = -1;
     }
 
-    float fkth = -FLT_MAX;
+    float fkth = -INFINITY;
 
     // Candidates are visited in the same (t, i) order as before, so tie-breaking is
     // unchanged.
@@ -2692,8 +2697,52 @@ static void top_k_scan_merge_f32(
     }
 
     if (out_vals) {
+        // An intermediate partition result for the second launch. A slot left at index -1
+        // carries the value -INFINITY, which that pass's strict `>` never accepts, so the
+        // -1 cannot be selected there and is not repaired here.
         for (int i = 0; i < k; i++) {
             out_vals[i] = fv[i];
+        }
+    } else {
+        // Final output. A slot keeps its sentinel index whenever fewer than k of the row's
+        // values compare greater than -INFINITY: an all -INFINITY row, or any row with
+        // fewer than k finite values. Writing -1 out as though it were a selected column is
+        // an out-of-range index that the consumer then uses (ggml_get_rows /
+        // ggml_set_rows), which on a GPU is an out-of-bounds device access, not a wrong
+        // number.
+        //
+        // ggml_top_k asserts k <= ne00, so there are always enough columns to finish the
+        // row. What the op guarantees is k DISTINCT column indices in [0, ne00); which of
+        // a set of tied columns is taken is not part of the contract, and every column
+        // left unselected here is tied at the sentinel, so the multiset of selected values
+        // is the same whichever of them is used. Filling each hole with the lowest column
+        // not already selected satisfies that with no extra state. fi holds original
+        // column indices on both launch shapes (the merge pass maps through src_map), so
+        // the repair works in the row's own column space. k <= 32 here and only one
+        // work-item runs this, so the O(k^2) scan costs nothing.
+        //
+        // The largest column this can reach is k-1 (h holes take the h smallest integers
+        // outside a set of k-h already-selected columns), so it is always in range, and
+        // the result is always k distinct columns.
+        int next_col = 0;
+        for (int i = 0; i < k; i++) {
+            if (fi[i] >= 0) {
+                continue;
+            }
+            for (bool taken = true; taken; ) {
+                taken = false;
+                for (int j = 0; j < k; j++) {
+                    if (fi[j] == next_col) {
+                        taken = true;
+                        break;
+                    }
+                }
+                if (taken) {
+                    next_col++;
+                }
+            }
+            fi[i] = next_col;
+            next_col++;
         }
     }
 
@@ -2734,7 +2783,9 @@ static void top_k_f32_sycl(
     int nsplit = 1;
     if (ncols >= min_cols) {
         // A partition is then always >= split_block = 128 columns, hence always more than
-        // the k <= 32 ceiling, so no pass is ever padded with -FLT_MAX sentinels.
+        // the k <= 32 ceiling. A partition can still end with sentinel slots when fewer
+        // than k of its values are finite; see top_k_scan_merge_f32 for how those are
+        // kept out of dst.
         const int64_t want = ncols / split_block;
         nsplit = (int) (want > max_splits ? max_splits : want);
     }
@@ -3199,6 +3250,8 @@ inline void ggml_sycl_op_argsort(ggml_backend_sycl_context & ctx, ggml_tensor * 
 }
 
 static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+
     const ggml_tensor * src0 = dst->src[0];
 
     GGML_ASSERT(src0);
