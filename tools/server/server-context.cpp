@@ -6685,7 +6685,12 @@ private:
                                     // where n_prompt_cached is final (auto_restore_account), because a later
                                     // n_past clamp can still discard it (e.g. an RS exact resend re-prefills).
                                     if (n_restored > 0) {
-                                        slot.n_auto_restored_pending = n_restored;
+                                        // account what the restore actually loaded, not the block-aligned claim:
+                                        // a plain-attention restore keeps the whole unit and the generic path trims
+                                        // it to the real LCP (n_past, recomputed above), every cell of which came
+                                        // from disk since the restore replaced the slot. auto_restore_account then
+                                        // clamps it to the final n_past.
+                                        slot.n_auto_restored_pending = std::max(n_restored, (int) n_past);
                                     } else if ((int) input_tokens.size() >= n_past + params_base.slot_save_block) {
                                         metrics.n_auto_restore_miss++;
                                         if (auto_not_prefix_skips > 0) {
