@@ -8034,11 +8034,6 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
-                        // the request leaves the conversation this slot (or a saved unit sharing its prefix)
-                        // held before that conversation's end: a response the client did not re-render token
-                        // for token, a regenerate, an edit, or another conversation. Arms the prompt node on
-                        // the classes that cannot rewind (see the PROMPT node below).
-                        bool left_prev_tip = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -8108,7 +8103,6 @@ private:
                             if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
-                                left_prev_tip = n_past < (int) slot.prompt.tokens.size();
 
                                 // ===== AUTO-RESTORE: cold/cross-process KV reuse from disk (opt-in) ==========
                                 // If the in-memory match (n_past) is POOR and the disk index holds a snapshot
@@ -8157,8 +8151,6 @@ private:
                                             break; // restored; stop trying shorter candidates
                                         }
                                     }
-                                    // a saved unit shared this prefix and the request diverges inside it
-                                    left_prev_tip = left_prev_tip || auto_not_prefix_skips > 0;
                                     // hit / miss accounting (llamacpp:auto_cache_restore_*_total and the
                                     // per-request timings.cache_disk_n). A MISS is a request that still had
                                     // at least one whole block beyond its in-memory match and got nothing
@@ -8674,19 +8666,14 @@ private:
                             // sliding-window past one window) can restore it only for a request that extends
                             // it. A resend, a regenerate, an edit of the response or a follow-up whose
                             // history is not re-rendered token for token diverges inside it; this node sits
-                            // before that divergence. 'cold' arms it for a prompt that got essentially no
-                            // reuse (n_past < the save floor), and, on a class that cannot rewind to this
-                            // position, for a prompt whose reuse ended inside the previous conversation
-                            // (left_prev_tip: the slot's tokens or a saved unit go on past n_past) once at
-                            // least one block of new prompt precedes the node: a client that re-renders the
-                            // previous response differently (reasoning dropped or trimmed, tool calls
-                            // re-serialised, the generation prompt rendered differently in history, a
-                            // re-tokenised seam) will do so on every turn, so each turn's after-response unit
-                            // is unusable to the next one and only this node survives a reclaim or a restart.
-                            // A client whose requests extend the conversation never sets it and pays no extra
-                            // write. 'on' arms it whenever at least one block of new prompt precedes it. The
-                            // mid-prefill save is the true whole state at that position, so it is sound for
-                            // every memory class.
+                            // before that divergence. 'cold' arms it only for a prompt that got essentially
+                            // no reuse (n_past < the save floor), so at most once per conversation start. 'on'
+                            // arms it whenever at least one block of new prompt precedes it: that is the
+                            // setting for a client that re-renders the previous response differently on
+                            // every turn (reasoning dropped or trimmed, answers rewritten, tool calls
+                            // re-serialised), whose after-response units can never serve the next turn on
+                            // these classes, and for regenerate or edit after a restart. The mid-prefill save
+                            // is the true whole state at that position, so it is sound for every memory class.
                             // Floor: max(--slot-save-block, --slot-save-min-tokens), as for any other save.
                             // When the system node is armed, the prompt node must lie at least one block past
                             // it: anything closer is a prefix that the system node already covers for every
@@ -8705,8 +8692,7 @@ private:
                                 const auto    ok       = [&](int32_t x) {
                                     const bool want = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
                                                       ? n_past + B <= x
-                                                      : n_past < floor ||
-                                                        (left_prev_tip && restore_needs_whole_prefix((size_t) x) && n_past + B <= x);
+                                                      : n_past < floor;
                                     const bool past_sys = slot.ctx_save_pos <= 0 || x >= slot.ctx_save_pos + B;
                                     return want && past_sys && x >= floor && x < n_prompt && n_past < x;
                                 };
