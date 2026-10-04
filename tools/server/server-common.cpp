@@ -1232,15 +1232,22 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                                         int B,
                                         uint64_t salt,
                                         uint64_t fp_mmproj,
-                                        uint64_t * full) {
+                                        uint64_t * full,
+                                        std::vector<uint64_t> * chain) {
     std::vector<uint64_t> out;
     if (full) {
         *full = 0;
+    }
+    if (chain) {
+        chain->clear();
     }
     if (B <= 0) {
         return out;
     }
     out.reserve(cells.size() / (size_t) B);
+    if (chain) {
+        chain->reserve(cells.size());
+    }
     size_t   ri        = 0; // index of the record covering the current NULL run
     bool     ri_seeded = false;
     uint64_t rec_seed  = 0; // cell-independent part of the record's contribution
@@ -1272,6 +1279,9 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
             h = auto_hash_mix64(h, auto_hash_splitmix64(rec_seed ^ (uint64_t) (i - rec.start_idx)));
         } else {
             h = auto_hash_mix(h, cells[i]);
+        }
+        if (chain) {
+            chain->push_back(h);
         }
         // Emit an index key at a block-aligned position OR at the END of a media chunk. The
         // chunk-boundary emission is essential for media: one image chunk can span every

@@ -2827,8 +2827,13 @@ private:
             SRV_WRN("auto-restore: lookup refused, %s\n", e.what());
             return out;
         }
+        // For the classes that restore only a whole prefix, also keep the request's chain value after
+        // every cell: (*chain)[n - 1] equals the identity of a unit of n cells exactly when that unit is a
+        // whole prefix of the request (see the identity check in the loop below).
+        std::vector<uint64_t> req_chain;
         const auto bhs = auto_block_hashes(req.get_cell_tokens(), media, params_base.slot_save_block,
-                                           cur_fp.fp_model, cur_fp.fp_mmproj);
+                                           cur_fp.fp_model, cur_fp.fp_mmproj, nullptr,
+                                           restore_is_whole_prefix_only() ? &req_chain : nullptr);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         // Cross-process visibility: cheaply pick up snapshots a peer process created since our last
         // scan (throttled dir-mtime check). Then search; on a MISS, force a re-scan and search again
@@ -2877,6 +2882,22 @@ private:
                         // token, every earlier turn's unit sits at these shared boundaries, deeper than the
                         // prompt node that can restore, and after four turns they used to exhaust
                         // AUTO_MAX_RESTORE_ATTEMPTS and turn a hit into a cold prefill.
+                        if (seen_not_prefix.insert(c.state_path).second) {
+                            auto_not_prefix_skips++;
+                        }
+                        continue;
+                    }
+                    if (restore_needs_whole_prefix(c.n_tokens) && c.id != 0 && c.n_tokens > 0 &&
+                        c.n_tokens <= req_chain.size() && req_chain[c.n_tokens - 1] != c.id &&
+                        !seen.count(c.state_path)) {
+                        // Met at its deepest boundary, but the request leaves it inside its trailing
+                        // partial block, which no boundary key covers: a previous turn whose response
+                        // ended before the next block boundary and which the client re-rendered
+                        // differently. The unit's identity commits every cell, so it differs from the
+                        // request's chain at the same length exactly when the unit is not a whole prefix.
+                        // Skip it here for the same reason as above: left in, the .meta byte-compare
+                        // rejects it only after it has taken one of the max_attempts places, and from the
+                        // fifth such turn the earlier node that can restore never gets tried.
                         if (seen_not_prefix.insert(c.state_path).second) {
                             auto_not_prefix_skips++;
                         }

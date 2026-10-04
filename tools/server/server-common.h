@@ -624,12 +624,17 @@ static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
 // cell, including a trailing partial block that no key covers. It equals out.back() exactly when the
 // last cell ends a key boundary. Unit filenames and every exact-length dedup use it, so two prompts
 // of equal length that differ only after their last whole block are two units, not one.
+//
+// `chain`, when given, receives the chain value after EVERY cell: (*chain)[n - 1] is the `full` value
+// of the first n cells, so a lookup can tell whether a unit of n cells is a whole prefix of the
+// request by comparing it with the unit's identity, without reading the unit's sidecar.
 std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                                         const std::vector<server_media_record> & media,
                                         int B,
                                         uint64_t salt,
                                         uint64_t fp_mmproj,
-                                        uint64_t * full = nullptr);
+                                        uint64_t * full = nullptr,
+                                        std::vector<uint64_t> * chain = nullptr);
 
 
 //
