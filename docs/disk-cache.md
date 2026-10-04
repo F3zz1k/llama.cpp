@@ -90,6 +90,7 @@ different content (a whole unit and a delta) under one name.
 | `--slot-save-context-min-tokens N` | 4096 | smallest system prefix worth a node of its own |
 | `--slot-save-max-mb N` / `--slot-save-max-count N` | 0 (unlimited) | least-recently-used eviction caps for the whole directory |
 | `--slot-restore-min-tokens N` | 0 | skip a restore shorter than `N` tokens and prefill instead |
+| `--slot-save-staging-mb N` | 1024 | host memory a save may hold between its copy off the device and its write by the background writer; `0` writes every save on the server thread (see below) |
 
 ### When a node is written (checkpoint triggers)
 
@@ -121,6 +122,58 @@ for a resend, a regenerate or an edit of the last answer.
 
 Without a usable node a miss is reported, never silent: a WRN line and the
 `auto_cache_restore_not_prefix_total` counter (below).
+
+## What runs in the background
+
+A save has two halves. The **capture** runs on the server thread at the moment the save is decided: the
+checks (floor, dedup, parent choice, the delta probe), and the copy of the state off the device into
+host memory. Every request on the instance waits for that copy, as it waited for the whole save before.
+The **publish** runs on one writer thread per instance, in the order the saves were captured: it writes
+the `.bin`, `.logits`, `.dft` and `.meta` temp files, syncs each one to disk (`fdatasync`), renames them
+into place under the store lock with the `.meta` last, syncs the directory, inserts the index entry and
+runs the LRU. So a node written while a prompt prefills, or a conversation saved when another request
+takes its slot, costs that request the copy only, not the write.
+
+- **Staging budget.** A save whose bytes fit in the free part of `--slot-save-staging-mb` is copied whole
+  and the request continues at once. One that does not fit is streamed through two chunks of at most
+  64 MiB when the writer is idle, so the request pays about the larger of the copy and the write; no
+  save is narrowed by the budget. When the writer is busy and the save does not fit, it is **dropped**
+  with a `WRN` (`auto-save: dropped ... staging full`) and counted; a request never waits on the writer.
+  A dropped prompt node is covered by the conversation's later idle, reclaim or shutdown save. Staging
+  is allocated per save and freed as the writer drains it, so an idle instance holds none; budget the
+  worst case (`N` instances times the value) against host RAM.
+- **Visibility.** A unit is visible to restores only once its `.meta` is in place; restores never read
+  the queue. A request whose prefix is still queued in the same instance waits for that publish
+  (at most 30 s, logged as `auto-restore: waited ... for N queued unit(s)`) rather than prefilling it
+  again; a peer instance cannot see the queue and prefills.
+- **Deltas on queued parents.** The save-side dedup and parent choice see the queue, so a delta can be
+  written against a parent that is still queued (a prompt node, then a reclaim save seconds later in a
+  tool loop). The writer is FIFO, so the parent is published first. If the parent fails (disk full, a
+  failed rename, a lock timeout), its queued children are dropped, because their bytes are a suffix
+  only, and counted in `auto_cache_save_orphan_dropped_total`; a child whose parent left the store
+  while it was queued is dropped the same way.
+- **Shutdown.** A graceful stop captures every slot (waiting for staging room instead of dropping),
+  then the writer drains the queue, oldest first. Whatever is still queued 100 s after the stop began is
+  abandoned between chunks, its temps removed and nothing renamed, which leaves room for the rest of the
+  shutdown inside a 120 s `TimeoutStopSec`.
+- **Crashes.** A unit whose writer died before its `.meta` rename is never published. Its temps
+  (`<name>.<pid>.<n>.tmp*`) are removed by the next instance that starts on the store, or by any writer
+  after a publish (at most once a minute), once that pid is gone and the files are 10 minutes old.
+- **Synchronous mode.** `--slot-save-staging-mb 0` runs the publish on the server thread, as builds
+  before the writer did, now with the same `fdatasync` calls.
+
+Every published save logs one line with its timings, for example:
+
+```
+auto-save: persisted 65280 tokens to .../auto-...-65280.bin (root, 268431436 B: capture d2h 163.9 ms
+  [tgt 163.9 / dft 0.0 / logits 0.0], queue-wait 0.0 ms, write 237.6 ms, fdatasync 139.4 ms,
+  publish 8.8 ms, evict 0.6 ms, mode staged)
+```
+
+`capture d2h` is what the request waited for (the target state, the draft state, the logits copy);
+`queue-wait` is how long the unit sat behind earlier saves; `write`, `fdatasync`, `publish` (the
+renames under the store lock, and the directory sync) and `evict` (the LRU and the reconcile) ran on
+the writer. `mode` is `staged`, `streamed` or `sync`.
 
 ## Seeing hits and misses
 
@@ -156,6 +209,13 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_sysnode_seam_mismatch_total` | requests whose system-prompt tokens were not a prefix of the prompt (no system node) |
 | `auto_cache_sysnode_probe_short_total` | chat prompts too short in bytes to reach the system node's floor, so not probed at all |
 | `auto_cache_node_media_skipped_total` | system or prompt nodes not written because media left no cut above the floor (see Known limits) |
+| `auto_cache_save_queued_total` | saves handed to the background writer |
+| `auto_cache_save_streamed_total` | of those, saves larger than the free staging, streamed while the writer was idle |
+| `auto_cache_save_dropped_staging_total` | saves dropped because the staging was full and the writer busy (each logs a WRN) |
+| `auto_cache_save_orphan_dropped_total` | queued deltas dropped because their parent failed to publish or left the store |
+| `auto_cache_save_shutdown_abandoned_total` | queued saves abandoned at the shutdown deadline |
+| `auto_cache_save_staging_bytes` (gauge) | host bytes held by saves copied and not yet written |
+| `auto_cache_save_queue_depth` (gauge) | saves queued or being written |
 
 A miss includes conversations no cache could have held, so read it next to `auto_cache_evicted_total`:
 misses that climb with evictions mean the store is too small.
@@ -175,13 +235,16 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 - Every unit is named and deduplicated by its identity over all of its tokens, so two system prompts of
   the same length that differ only near the end (a date, a user name) get a node each. Index lookups
   still go by whole blocks, and every restore byte-compares the tokens.
-- Both nodes are written synchronously while a cold prompt prefills, on the server-loop thread: each
-  delays that request's first token by its write (a whole snapshot, or a delta under
-  `--slot-save-incremental`) and holds up other slots meanwhile. The cost per model class is measured at
-  the GPU gate; the default `cold` prompt node adds at most one write per conversation start, plus one
+- Both nodes are captured while a cold prompt prefills, on the server-loop thread: each delays that
+  request's first token by the copy of its state off the device (a whole snapshot, or a delta under
+  `--slot-save-incremental`) and holds up other slots meanwhile; the write itself runs on the background
+  writer. The default `cold` prompt node adds at most one capture per conversation start, plus one
   per turn on a model that cannot rewind when the client does not re-render the previous response token
   for token (each such turn's after-response unit cannot serve the next turn, so the node is the only
   restore point that survives a reclaim or a restart).
+- The copy off the device stays on the request's critical path. It lands in ordinary (pageable) host
+  memory; staging in pinned memory may copy faster on a GPU and is not measured yet. Moving the copy
+  itself off the first token needs the cells to be copied lazily after the node, which is not done.
 - The system node is placed from the chat template for every template (the boundary is checked over
   all of `models/templates` by `test-chat-preamble`). The first chat request with a new system prompt
   or tool set pays for the template renders that find it: about four times one render of the request,
