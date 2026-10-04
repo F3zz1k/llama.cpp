@@ -351,3 +351,90 @@ def test_prompt_node_not_inside_system_node(tmpl_name, user):
     assert all(b >= a + B for a, b in zip(inside, inside[1:])), f"prompt node within a block of the system node: {inside}"
     _assert_node_brackets_system(model, tmpl, inside[0])
 
+
+# The token seam on a REAL byte-level BPE vocabulary with real special tokens (the dummies have none of
+# the templates' special tokens, and the ggml-vocab files in this checkout are LFS placeholders). Point
+# LLAMA_TEST_REAL_VOCAB_MODEL at a small chat GGUF (on the rig: the Qwen3-4B behind tasks-tiny, run on
+# CPU with 4 threads); skipped without it. With the model's own template the role markers are special
+# tokens (the is_special branch of the seam); with the others they are plain text in this vocabulary,
+# which byte-level BPE can merge with the message (the re-tokenisation branch).
+REAL_MODEL = os.environ.get("LLAMA_TEST_REAL_VOCAB_MODEL", "")
+REAL_TOL = 1e-4
+
+
+@pytest.mark.parametrize("tmpl_name", [None] + TEMPLATES)
+def test_system_node_real_vocab(tmpl_name):
+    if not REAL_MODEL or not os.path.isfile(REAL_MODEL):
+        pytest.skip("no real-vocabulary model (set LLAMA_TEST_REAL_VOCAB_MODEL)")
+    tmpl = None
+    if tmpl_name is not None:
+        tmpl = os.path.join(TEMPLATES_DIR, f"{tmpl_name}.jinja")
+        if not os.path.exists(tmpl):
+            pytest.skip(f"template not found: {tmpl}")
+
+    def srv(cache=True):
+        s = _server(REAL_MODEL, tmpl, cache=cache)
+        s.n_ctx = 2048
+        s.n_batch = 512
+        s.n_threads = 4
+        return s
+
+    s = srv()
+    s.start()
+    body = _chat(s, _sys("What is the capital of France?"))
+    n_prompt = body["timings"]["prompt_n"]
+    _assert_sysnode_counters(s)
+    s.stop()
+    inside = [u for u in _units() if u < n_prompt]
+    assert len(inside) == 1, f"units {_units()}, prompt {n_prompt}"
+    X = inside[0]
+
+    # the node lies past the whole system prompt and before the user's text
+    s = srv(cache=False)
+    s.start()
+    a = _prompt_tokens(s, _sys("What is the capital of France?"))
+    b = _prompt_tokens(s, [{"role": "system", "content": SYSTEM[:-6] + "places."},
+                           {"role": "user", "content": "What is the capital of France?"}])
+    s.stop()
+    assert _lcp(a, b) < X <= n_prompt
+
+    def first_probs(s, prompt):
+        # /completion on the rendered prompt: the restore goes by tokens, and the first token's
+        # distribution is reported whatever the template's response parser would make of the text
+        res = s.make_request("POST", "/completion", data={"prompt": prompt, "n_predict": 1, "n_probs": 8,
+                                                          "temperature": 0, "id_slot": 0, "cache_prompt": True,
+                                                          "post_sampling_probs": False})
+        assert res.status_code == 200, res.body
+        return res.body, {t["id"]: t["logprob"] for t in res.body["completion_probabilities"][0]["top_logprobs"]}
+
+    for user in ["\nA question that starts with a newline", "Hello there, how are you?", " leading space"]:
+        msgs = _sys(user)
+        s = srv(cache=False)
+        s.start()
+        res = s.make_request("POST", "/apply-template", data={"messages": msgs})
+        assert res.status_code == 200
+        prompt = res.body["prompt"]
+        c = _prompt_tokens(s, msgs)
+        s.stop()
+        s = srv()
+        s.start()
+        body, dr = first_probs(s, prompt)
+        s.stop()
+        assert body["timings"].get("cache_disk_n", 0) >= X, (user, body["timings"])
+        # the oracle: a process with no disk cache that prefills the same split in memory, [0, k) then
+        # [k, N), where k is what the restore reused. A cold one-batch prefill is NOT a valid oracle on
+        # this quantised model: the split alone moves the first token's top-8 logprobs by up to 0.58 and
+        # changes which tokens are in the top 8, measured with no disk cache involved at all
+        k = body["timings"]["cache_n"]
+        s = srv(cache=False)
+        s.start()
+        res = s.make_request("POST", "/completion", data={"prompt": c[:k], "n_predict": 0, "id_slot": 0,
+                                                          "cache_prompt": True})
+        assert res.status_code == 200, res.body
+        ctl, dc = first_probs(s, prompt)
+        s.stop()
+        assert X <= _lcp(a, c), f"node {X} past the point where {user!r} diverges ({_lcp(a, c)})"
+        assert ctl["timings"]["cache_n"] == k, (ctl["timings"], k)
+        worst = max(abs(dr[k_] - dc[k_]) if k_ in dr else float("inf") for k_ in dc)
+        print(f"{tmpl_name} {user!r}: node {X}, reused {k}, restored vs same-split control differ by {worst:.3g}")
+        assert worst < REAL_TOL, f"restored state differs from the same-split control by {worst}"

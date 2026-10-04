@@ -299,7 +299,8 @@ def test_exact_resend_counts(tmp_path, spec):
     s = _server(cache, str(tmp_path / "seed.log"), spec=spec)
     s.start()
     b = _complete(s, BASE, 8)
-    _wait_meta(cache, 1, IDLE + 15)
+    # the prompt node (mid-prefill) and the idle-flushed conversation, which the resends below extend
+    assert len(_wait_meta(cache, 2, IDLE + 15)) == 2
     s.stop()
     saved = BASE + b["tokens"][:-1]
     for name, prompt in (("exact", saved), ("plus1", saved + [42])):
@@ -332,6 +333,70 @@ def test_exact_resend_counts(tmp_path, spec):
         if name == "exact":
             assert r["tokens"][0] == b["tokens"][-1]
         assert r["tokens"] == cold["tokens"], f"{name}: restored {r['tokens']} vs cold {cold['tokens']}"
+
+
+@pytest.mark.parametrize("spec", [True, False])
+def test_mtp_prompt_node_resend(tmp_path, spec):
+    """The default prompt node (--slot-save-node-prompt cold) on the MTP model: the same prompt resent
+    after a restart cannot use the conversation unit (prompt + generation; this hybrid model cannot
+    rewind into it), so it restores the mid-prefill prompt node. With speculation the draft comes back
+    warm from that node's .dft, and drafts exactly like an uninterrupted prefill of the same prompt;
+    with or without it, the tokens equal a cold run."""
+    if not os.path.isfile(MODEL):
+        pytest.skip("no MTP dummy")
+    B_P = len(BASE) - 1 - (len(BASE) - 1) % 16  # no user span: the last prompt token, block-aligned down
+    cache = os.path.join(ROOT, "c")
+    os.makedirs(cache)
+    s = _server(cache, str(tmp_path / "seed.log"), spec=spec)
+    s.start()
+    _complete(s, BASE, 8)
+    assert len(_wait_meta(cache, 2, IDLE + 15)) == 2
+    s.stop()
+    lens = sorted(int(os.path.basename(p)[:-len(".bin.meta")].split("-")[-1]) for p in glob.glob(cache + "/auto-*.bin.meta"))
+    assert lens[0] == B_P, lens
+    if spec:
+        assert os.path.exists(glob.glob(cache + f"/auto-*-{B_P}.bin")[0] + ".dft")
+
+    s = _server(None, str(tmp_path / "ctl.log"), spec=spec, auto=False)
+    s.start()
+    ctl = _complete(s, BASE, 24)
+    s.stop()
+
+    nodft = os.path.join(ROOT, "nodft")
+    shutil.copytree(cache, nodft)
+    for p in glob.glob(nodft + "/*.dft"):
+        os.remove(p)
+
+    out = {}
+    for name, d in (("warm", cache), ("colddraft", nodft)):
+        s = _server(d, str(tmp_path / f"{name}.log"), spec=spec)
+        s.start()
+        r = _complete(s, BASE, 24)
+        out[name] = (r, _metric(s, "auto_cache_restore_hit_total"), _metric(s, "auto_cache_restore_draft_warm_total"))
+        s.stop()
+        if not spec:
+            break
+    r, hit, warm = out["warm"]
+    t = r["timings"]
+    print(f"spec={spec} cache_disk_n={t.get('cache_disk_n')} prompt_n={t.get('prompt_n')} hit={hit} warm={warm}")
+    assert hit == 1
+    assert t.get("cache_disk_n", 0) == B_P
+    assert t["prompt_n"] == len(BASE) - B_P
+    assert r["tokens"] == ctl["tokens"], f"restored {r['tokens']} vs cold {ctl['tokens']}"
+    if spec:
+        assert warm >= 1
+        c0 = _cands(str(tmp_path / "ctl.log"), "")
+        cw = _cands(str(tmp_path / "warm.log"), "")
+        cc = _cands(str(tmp_path / "colddraft.log"), "")
+        n = min(len(c0), len(cw))
+        assert n > 0
+        dif = [(i, c0[i], cw[i]) for i in range(n) if c0[i][2] != cw[i][2] or abs(c0[i][3] - cw[i][3]) > 2e-3]
+        nc = min(len(c0), len(cc))
+        difc = [(i, c0[i], cc[i]) for i in range(nc) if c0[i][2] != cc[i][2] or abs(c0[i][3] - cc[i][3]) > 2e-3]
+        print("warm vs control:", dif[:3], "cold draft vs control:", len(difc))
+        assert difc, "instrument is blind: a cold draft drafts like the control"
+        assert not dif, "a draft restored from the prompt node must draft like an uninterrupted prefill"
+        assert out["colddraft"][0]["tokens"] == ctl["tokens"]
 
 
 def test_ram_disk_warm_classification(tmp_path):

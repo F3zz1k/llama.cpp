@@ -10,8 +10,8 @@ from utils import *
 # Shared-context BASE integration tests (Option A). The feature whole-saves the leading shared context
 # [0, B_ctx) — everything before the first user turn — ONCE as a deduplicated v1 base, so N chats that
 # share that prefix RESTORE it instead of re-prefilling (and, with --slot-save-incremental, each collapse
-# their own save to a small [B_ctx, N) v3 delta parented on that one base). B_ctx is the first-user-
-# message token offset, block-aligned down. Unlike the earlier design — which saved a [0,B) SUB-RANGE at
+# their own save to a small [B_ctx, N) v3 delta parented on that one base). B_ctx is the end of the
+# system preamble, exactly (not block-aligned). Unlike the earlier design — which saved a [0,B) SUB-RANGE at
 # idle-flush with the slot sitting at N and was therefore hard-gated to dense/PART, n_swa == 0 — the base
 # is now written MID-PREFILL as a WHOLE state save, taken at the instant a cold prefill is resident at
 # exactly B_ctx. That is sound for EVERY model class (dense, SWA and recurrent/hybrid), so there is NO
@@ -58,19 +58,9 @@ CACHE_DIR = "./tmp/slot_save_context_ckpt"
 
 IDLE_SECONDS = 2
 
-# The positive base-write path needs a model with a separate-system-role chat template whose role
-# delimiters are atomic special tokens (so the first-user boundary is found and clears the floor). No
-# test-suite preset qualifies: stories260K (tinyllama2) lacks the chatml markers as special tokens, so
-# the delimiters do not align and the boundary is never found; tinygemma3 has aligned special-token
-# delimiters but its template merges the system prompt INTO the first user turn (boundary == 1, below the
-# floor). The positive base-write and the restore-with-a-real-match are therefore validated ON-RIG with
-# qwen3.6-27b (chatml, separate system role, atomic specials) — which, being a qwen35 HYBRID, also
-# exercises the Option-A soundness for the recurrent/hybrid class the old design excluded. CPU CI still
-# covers boundary detection (test-chat), arg validation, and the no-boundary no-op.
-_NO_CPU_POSITIVE_MODEL = (
-    "no CPU preset has separate-system-role + special-token delimiters clearing the floor; "
-    "the shared-context base-write path is validated on-rig (qwen3.6-27b, a qwen35 hybrid)"
-)
+# The positive base-write path runs on CPU with llama-dense and a real template (_mk_tmpl_server): the
+# system node is placed from the template, so it no longer needs a model whose role delimiters are atomic
+# special tokens. The hybrid class is covered by test_slot_save_sysnode.py (qwen35-dense).
 
 BLOCK = 16
 CONTEXT_MIN = 32  # 2 blocks; effective base floor is max(BLOCK, CONTEXT_MIN) == 32
@@ -83,6 +73,11 @@ CONTEXT_MIN = 32  # 2 blocks; effective base floor is max(BLOCK, CONTEXT_MIN) ==
 SHARED_SYSTEM = " ".join(
     ["You are a meticulous assistant grounded in the following reference material."] * 8
     + ["The village by the river kept careful records of every harvest for two hundred years."] * 8
+)
+# the dummy behind _mk_tmpl_server has a 256-token training context: a shorter shared context for it
+SHARED_SYSTEM_TMPL = " ".join(
+    ["You are a meticulous assistant grounded in the following reference material."] * 2
+    + ["The village by the river kept careful records of every harvest for two hundred years."] * 2
 )
 USER_A = "Summarise the reference material in one sentence."
 USER_B = "List three facts drawn from the reference material."
@@ -161,6 +156,44 @@ def _mk_attn_server(context_min: int = CONTEXT_MIN, restore_min: int = 0):
     return s
 
 
+MODELS_DIR = os.environ.get("LLAMA_TEST_MODELS_DIR", "") or os.path.normpath(os.path.join(
+    os.path.dirname(os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server")), "..", "tests", "test-models"))
+TEMPLATES_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models", "templates"))
+
+
+def _mk_tmpl_server(context_min: int = CONTEXT_MIN, restore_min: int = 0):
+    """A plain-attention dummy (llama-dense) with a real template. The system node is placed from the
+    template (common_chat_preamble_end), so it fires whatever the template's parser marks; this replaces
+    the old requirement for a CPU model with separate-system-role special-token delimiters. The prompt
+    node is off so that each chat writes exactly its node (once) and its own conversation unit."""
+    m = os.path.join(MODELS_DIR, "llama-dense.gguf")
+    t = os.path.join(TEMPLATES_DIR, "poolside-Laguna-S-2.1.jinja")
+    if not os.path.exists(m) or not os.path.exists(t):
+        pytest.skip(f"dummy model or template not found: {m} {t}")
+    s = ServerProcess()
+    s.model_hf_repo = None
+    s.model_hf_file = None
+    s.model_file = m
+    s.model_alias = "dummy"
+    s.jinja = True
+    s.chat_template_file = t
+    s.n_ctx = 1024
+    s.n_batch = 1024
+    s.n_slots = 1
+    s.temperature = 0.0
+    s.slot_save_path = CACHE_DIR
+    s.slot_save_auto = True
+    s.slot_save_incremental = True
+    s.slot_save_block = BLOCK
+    # --slot-restore-min-tokens may not exceed either save floor (arg validation)
+    s.slot_save_min_tokens = restore_min
+    s.slot_save_context_min_tokens = max(context_min, restore_min)
+    s.slot_restore_min_tokens = restore_min
+    s.slot_save_idle_seconds = IDLE_SECONDS
+    s.slot_save_node_prompt = "off"
+    return s
+
+
 def _chat(s, system, user, max_tokens=1):
     res = s.make_request("POST", "/chat/completions", data={
         "max_tokens": max_tokens,
@@ -177,21 +210,21 @@ def _chat(s, system, user, max_tokens=1):
 
 # --- (1) two shared-context chats -> exactly ONE base + two v3 deltas ----------
 
-@pytest.mark.skip(reason=_NO_CPU_POSITIVE_MODEL)
 def test_two_chats_share_one_base_plus_two_deltas():
     """RECOMMENDATION §3/§6: two chats that share a >context-min leading context each persist their
     own small [B, N) delta, but the shared prefix [0, B) is written to disk EXACTLY ONCE as a v1 base
-    at the block-aligned first-user boundary. Result on disk: one v1 root (the base, tok_count == B,
-    block-aligned, a STRICT prefix of both full prompts) + two v3 deltas, both chaining to that base."""
+    at the exact end of the system preamble (not block-aligned). Result on disk: one v1 root (the base,
+    a STRICT prefix of both full prompts, ending before they diverge) + two v3 deltas, both chaining to
+    that base."""
     global server
-    server = _mk_attn_server()
+    server = _mk_tmpl_server()
     server.start()
 
-    _chat(server, SHARED_SYSTEM, USER_A)
+    _chat(server, SHARED_SYSTEM_TMPL, USER_A)
     m1 = _wait_for_metas(2, IDLE_SECONDS + 12)   # base (checkpoint) + chat A's own delta
     assert len(m1) == 2, f"first chat should write a base + its delta, got {len(m1)}"
 
-    _chat(server, SHARED_SYSTEM, USER_B)
+    _chat(server, SHARED_SYSTEM_TMPL, USER_B)
     metas = _wait_for_metas(3, IDLE_SECONDS + 12)
     server.stop()
 
@@ -202,8 +235,11 @@ def test_two_chats_share_one_base_plus_two_deltas():
     assert len(deltas) == 2, f"each chat's own save collapses to a v3 delta, got {len(deltas)}"
 
     base = parse_meta(roots[0])
-    assert base["tok_count"] % BLOCK == 0, "the base is block-aligned (B_ctx = B - B % block)"
     assert base["tok_count"] >= max(BLOCK, CONTEXT_MIN), "the base clears the max(block, context-min) floor"
+    full = [parse_meta(d)["toks"] for d in deltas]
+    diverge = next(i for i, (a, b) in enumerate(zip(full[0], full[1])) if a != b)
+    assert base["tok_count"] <= diverge, "the base ends before the two chats' user messages diverge"
+    assert diverge - base["tok_count"] < BLOCK, "and it is the whole shared preamble, not a block-aligned cut"
 
     for d in deltas:
         dm = parse_meta(d)
@@ -242,7 +278,6 @@ def test_no_user_boundary_writes_whole_prefix_no_base():
 
 # --- (3) restore-min above the match skips the disk load ----------------------
 
-@pytest.mark.skip(reason=_NO_CPU_POSITIVE_MODEL + " (needs a base+delta on disk first)")
 def test_restore_min_above_match_skips_disk_load():
     """RECOMMENDATION §4/§6: --slot-restore-min-tokens gates the disk restore on the byte-verified
     matched prefix. Set above any available match, a cold slot must REPROCESS (no disk load) rather
@@ -250,27 +285,27 @@ def test_restore_min_above_match_skips_disk_load():
     global server
 
     # produce a base + delta on disk for chat A (restore-min 0 so saving is unaffected).
-    server = _mk_attn_server(restore_min=0)
+    server = _mk_tmpl_server(restore_min=0)
     server.start()
-    body_a = _chat(server, SHARED_SYSTEM, USER_A)
+    body_a = _chat(server, SHARED_SYSTEM_TMPL, USER_A)
     metas = _wait_for_metas(2, IDLE_SECONDS + 12)
     assert len(metas) >= 2, "need a base + delta on disk before testing the restore guard"
     full_len = body_a["usage"]["prompt_tokens"]
     server.stop()
 
     # control: a fresh process with restore-min 0 DOES restore the full prefix from disk.
-    server = _mk_attn_server(restore_min=0)
+    server = _mk_tmpl_server(restore_min=0)
     server.start()
-    ctrl = _chat(server, SHARED_SYSTEM, USER_A)
+    ctrl = _chat(server, SHARED_SYSTEM_TMPL, USER_A)
     server.stop()
     ctrl_cached = ctrl["usage"]["prompt_tokens_details"]["cached_tokens"]
     assert ctrl_cached >= full_len - BLOCK, \
         f"control: disk restore should reuse ~the whole prefix, cached={ctrl_cached} of {full_len}"
 
     # guard: restore-min above the whole match forces a cold reprocess (no disk load).
-    server = _mk_attn_server(restore_min=full_len + BLOCK)
+    server = _mk_tmpl_server(restore_min=full_len + BLOCK)
     server.start()
-    guarded = _chat(server, SHARED_SYSTEM, USER_A)
+    guarded = _chat(server, SHARED_SYSTEM_TMPL, USER_A)
     server.stop()
     guarded_cached = guarded["usage"]["prompt_tokens_details"]["cached_tokens"]
     assert guarded_cached == 0, \
@@ -294,6 +329,6 @@ def test_restore_min_above_match_skips_disk_load():
 # the behaviour the old test forbade. Asserting "no base on SWA" would now be asserting a bug.
 #
 # The positive base-write on a class the old design excluded (the qwen35 HYBRID qwen3.6-27b) is
-# validated ON-RIG — see _NO_CPU_POSITIVE_MODEL and test_two_chats_share_one_base_plus_two_deltas. CPU
+# covered on CPU by test_slot_save_sysnode.py (qwen35-dense) and test_two_chats_share_one_base_plus_two_deltas. CPU
 # CI retains the model-class-independent coverage: boundary detection (test-chat), arg validation, and
 # the no-boundary no-op (test_no_user_boundary_writes_whole_prefix_no_base above).
