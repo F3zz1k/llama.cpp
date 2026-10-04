@@ -20,6 +20,9 @@ from utils import *
 #     prefilled cold. The lookup now skips a unit met below its deepest boundary before it takes a place;
 #   - 'on': the previous turn's prompt node, so the re-prefill is one response plus one user message, flat
 #     over the turns.
+# A unit whose response stays inside its trailing partial block (a short answer) is met by the next turn at
+# its DEEPEST boundary, so the boundary rule alone cannot tell that the request leaves it; the lookup also
+# compares the unit's identity, which commits every cell, with the request's chain at the same length.
 # Plain attention (llama-dense) is the control: it restores the longer unit and trims it, and gets no
 # prompt node on any turn after the first. A client that EXTENDS the conversation (token ids, the previous
 # response included) gets none either.
@@ -222,3 +225,39 @@ def test_divergent_units_do_not_starve_the_lookup(name):
     sys_node = min(stores[0])
     for turn in range(1, TURNS):
         assert rows[turn][2] == sys_node, f"turn {turn + 1}: {rows[turn]} (system node {sys_node}), {rows}"
+
+
+@pytest.mark.parametrize("name", ["qwen35-dense", "qwen4exp-moe"])
+def test_short_divergent_responses_do_not_starve_the_lookup(name):
+    """Default (cold), raw token prompts, 4-token responses the client re-renders differently, every prompt
+    4 tokens past a block boundary. Each earlier turn's unit ends inside the block after the divergence, so
+    the next request meets it at its deepest boundary and only its identity shows it is not a whole prefix.
+    Without that check the fifth turn's four predecessors took every AUTO_MAX_RESTORE_ATTEMPTS place and it
+    prefilled cold."""
+    _paths(name)
+    prompt = [((i * 7) % 100) + 10 for i in range(9 * B + 4)]
+    rows, stores = [], []
+    for turn in range(TURNS):
+        s = _server(name)
+        s.jinja = False
+        s.chat_template_file = None
+        s.start()
+        res = s.make_request("POST", "/completion", data={
+            "prompt": prompt, "n_predict": 4, "temperature": 0, "top_k": 1, "cache_prompt": True,
+            "id_slot": 0, "return_tokens": True})
+        assert res.status_code == 200, res.body
+        t = res.body["timings"]
+        rows.append((len(prompt), t["cache_n"], t.get("cache_disk_n", 0), t["prompt_n"]))
+        s.stop()
+        stores.append(_units())
+        gen = res.body["tokens"]
+        alt = [x for x in range(10, 40) if x not in gen][:3]  # the client re-renders the response differently
+        prompt = prompt + alt + [((i * 11 + turn) % 100) + 10 for i in range(2 * B - 3)]  # stays 4 past a block
+    node = min(stores[0])  # the turn-1 cold prompt node
+    assert len(stores[0]) == 2, stores
+    for turn in range(1, TURNS):
+        n_prompt, cache_n, disk_n, prompt_n = rows[turn]
+        assert disk_n == cache_n == node, f"turn {turn + 1}: {rows[turn]} (turn-1 node {node}), {rows}"
+        assert prompt_n == n_prompt - node, f"turn {turn + 1}: {rows}"
+    growth = [len(stores[i + 1]) - len(stores[i]) for i in range(len(stores) - 1)]
+    assert all(g == 1 for g in growth), (growth, stores)
