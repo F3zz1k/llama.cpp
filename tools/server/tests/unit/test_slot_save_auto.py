@@ -108,6 +108,9 @@ def create_server():
     # the test prompts sit well under the 1024-token default minimum-snapshot floor; drop it so
     # the auto cache behaves as it did before --slot-save-min-tokens (floor = the hash block size).
     server.slot_save_min_tokens = 0
+    # this file tests the unit format, identity, media and flush paths: no mid-prefill prompt node
+    # (cold by default), so each test sees exactly the units it writes (the node: test_slot_save_resend.py)
+    server.slot_save_node_prompt = "off"
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     os.makedirs(CACHE_DIR)
 
@@ -246,6 +249,7 @@ def _text_cache_server(n_ctx: int, ctk: str | None = None) -> ServerProcess:
     s.slot_save_path = CACHE_DIR
     s.slot_save_auto = True
     s.slot_save_min_tokens = 0  # short-prompt test: keep the floor at the hash block size
+    s.slot_save_node_prompt = "off"  # see create_server
     if ctk is not None:
         s.ctk = ctk
     return s
@@ -565,6 +569,7 @@ def test_vision_save_writes_v2_unit():
     # small hash block so the pre-image text prefix spans chunk-safe boundaries
     vserver.slot_save_block = 16
     vserver.slot_save_min_tokens = 0  # short-prompt test: keep the floor at the hash block size
+    vserver.slot_save_node_prompt = "off"  # see create_server
     vserver.start()
 
     # pin each turn to its own slot: the prefix-similarity slot picker would otherwise route
@@ -702,6 +707,7 @@ def make_vision_server(auto: bool) -> ServerProcess:
         vs.slot_save_auto = True
         vs.slot_save_block = 16
         vs.slot_save_min_tokens = 0  # short-prompt test: keep the floor at the hash block size
+        vs.slot_save_node_prompt = "off"  # see create_server
     return vs
 
 
@@ -1124,6 +1130,7 @@ def make_parallel_vision_server() -> ServerProcess:
     vs.slot_save_auto = True
     vs.slot_save_block = 16
     vs.slot_save_min_tokens = 0  # short-prompt test: keep the floor at the hash block size
+    vs.slot_save_node_prompt = "off"  # see create_server
     return vs
 
 

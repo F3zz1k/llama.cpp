@@ -7177,7 +7177,7 @@ private:
                                 }
                             }
 
-                            // --- PROMPT node (--slot-save-node-prompt, default off) ---
+                            // --- PROMPT node (--slot-save-node-prompt, default cold) ---
                             // Position: the end of the last user message (n_prompt - 1 without a user span),
                             // block-aligned down. A unit saved after the response (idle, reclaim, shutdown,
                             // --slot-save-node-response) is prompt + generation, and a memory class that

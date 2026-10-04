@@ -9,8 +9,9 @@ from utils import *
 #  - truncatable classes (plain attention, and SWA whose snapshot fits one window) must serve a
 #    request that is a PREFIX of a saved unit by restoring it and trimming to the request;
 #  - non-rewindable classes (RS / hybrid, SWA past one window, FULL) serve it only from a node at
-#    or before the divergence; with the default triggers that miss is expected, and it must be
-#    reported (WRN + auto_cache_restore_not_prefix_total), never silent;
+#    or before the divergence; the default prompt node (--slot-save-node-prompt cold) provides one,
+#    and with the node off the miss must be reported (WRN + auto_cache_restore_not_prefix_total),
+#    never silent;
 #  - every class must serve a request that EXTENDS the saved unit (previous response included);
 #  - a conversation preempted by a different one on a --parallel 1 server reaches disk;
 #  - --slot-save-node-prompt (cold / on) gives the non-rewindable classes a node at the end of the
@@ -51,7 +52,10 @@ def _model(name: str) -> str:
     return path
 
 
-def _server(model: str, incr: bool = False, node_prompt: str | None = None, cache: bool = True) -> ServerProcess:
+DEFAULT = None   # node_prompt value meaning "leave the server default"
+
+
+def _server(model: str, incr: bool = False, node_prompt: str | None = "off", cache: bool = True) -> ServerProcess:
     s = ServerProcess()
     s.model_hf_repo = None
     s.model_hf_file = None
@@ -70,8 +74,9 @@ def _server(model: str, incr: bool = False, node_prompt: str | None = None, cach
     s.slot_save_block = B
     s.slot_save_min_tokens = 0
     s.slot_restore_min_tokens = 0
-    # no mid-prefill system node: these tests isolate the release / reclaim units and the prompt
-    # node (--slot-save-node-prompt), which has its own floor (max(block, min-tokens) = B here)
+    # no mid-prefill system node, and no prompt node unless a test asks for one (node_prompt; DEFAULT
+    # leaves the server default, cold): these tests isolate the release / reclaim units and the
+    # prompt node, which has its own floor (max(block, min-tokens) = B here)
     s.slot_save_context_min_tokens = 100000
     s.slot_save_idle_seconds = 3600
     s.slot_save_node_prompt = node_prompt
@@ -164,7 +169,7 @@ def test_resend_truncatable_restores_and_trims(incr):
 
 @pytest.mark.parametrize("name", ["gemma3-dense", "qwen35-dense"])
 def test_resend_non_rewindable_miss_is_reported(name):
-    """Non-rewindable classes, default triggers: the same-prompt resend after a restart is a miss
+    """Non-rewindable classes with the prompt node off: the same-prompt resend after a restart is a miss
     (no node at or before the divergence exists), and the miss is classified, not silent."""
     model = _model(name)
     s = _server(model)
@@ -313,7 +318,7 @@ def test_resend_hits_with_prompt_node(name, mode):
 @pytest.mark.parametrize("name", ["gemma3-dense", "qwen35-dense"])
 def test_divergent_followup_needs_the_prompt_node(name, incr):
     """A follow-up whose history does not re-render the previous response (here: the response is
-    dropped) diverges inside the release unit. Default triggers: a reported must-extend miss. With
+    dropped) diverges inside the release unit. With the prompt node off: a reported must-extend miss. With
     --slot-save-node-prompt on, the node at the end of the previous prompt serves it, and the new
     node it writes for the follow-up is a delta under --slot-save-incremental."""
     model = _model(name)
@@ -353,15 +358,33 @@ def test_divergent_followup_needs_the_prompt_node(name, incr):
         assert delta >= 1
 
 
-@pytest.mark.parametrize("name", ["qwen35-dense", "gemma3-dense"])
-def test_prompt_node_off_by_default(name):
-    """Default triggers write no mid-prefill prompt node: only the release unit reaches disk. Recorded for
-    the SWA class too (gemma3-dense): main-patched always armed a node near the prompt end for an SWA
-    model, the user design (2026-10-03) makes it opt-in (--slot-save-node-prompt cold|on) for every class,
-    so a same-prompt resend after a restart misses there by default (see
-    test_resend_non_rewindable_miss_is_reported) and hits with the option (test_resend_hits_with_prompt_node)."""
+@pytest.mark.parametrize("name", ["llama-dense", "gemma3-dense", "qwen35-dense"])
+def test_prompt_node_cold_by_default(name):
+    """User decision (2026-10-03, round 4): with --slot-save-auto on, the prompt node defaults to 'cold'
+    for every model. A cold prompt writes the node at the end of the prompt (block-aligned down) next to
+    the release unit, and a same-prompt resend after a restart hits on every class, equal to a cold run.
+    --slot-save-node-prompt off writes only the release unit."""
     model = _model(name)
-    s = _server(model)
+    s = _server(model, node_prompt=DEFAULT)
+    s.start()
+    _, _, gen = _complete(s, PROMPT)
+    s.stop()
+    node = (len(PROMPT) - 1) // B * B
+    assert _units() == [node, len(PROMPT) + len(gen) - 1]
+
+    s = _server(model, node_prompt=DEFAULT)
+    s.start()
+    prompt_n, cache_n, _ = _complete(s, PROMPT)
+    body = _complete.last
+    not_prefix = _metric(s, "auto_cache_restore_not_prefix_total")
+    s.stop()
+    assert cache_n >= node and prompt_n <= B + 1
+    assert not_prefix == 0
+    _assert_equals_cold(model, PROMPT, body)
+
+    shutil.rmtree(CACHE_DIR)
+    os.makedirs(CACHE_DIR)
+    s = _server(model, node_prompt="off")
     s.start()
     _, _, gen = _complete(s, PROMPT)
     s.stop()

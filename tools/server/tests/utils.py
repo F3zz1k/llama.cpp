@@ -85,7 +85,7 @@ class ServerProcess:
     slot_save_max_count: int | None = None
     slot_save_max_mb: int | None = None
     slot_save_node_system: bool | None = None    # None = server default (on)
-    slot_save_node_prompt: str | None = None     # off / cold / on; None = server default (off)
+    slot_save_node_prompt: str | None = None     # off / cold / on; None = server default (cold)
     slot_save_node_response: bool | None = None  # None = server default (off)
     slot_save_node_tool: bool | None = None      # None = server default (off)
     slot_save_on_reclaim: bool | None = None     # None = server default (on)

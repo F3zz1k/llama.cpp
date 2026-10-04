@@ -41,7 +41,9 @@ and without speculation:
 with an indexer or compressed KV (DeepSeek-V4, GLM-5 next, Qwen3.8-Flash-Next). These cannot rewind a
 saved conversation to an earlier position, so a regenerate, an edit of the last answer, or a follow-up
 whose history is not re-rendered token for token can only restore a node that sits before the change.
-Add the prompt node:
+The prompt node at the end of the last user message covers that, and it is on by default (`cold`: it is
+written while a prompt that got no reuse prefills). To also write it for prompts that restored part of
+their prefix, for example on every turn of a long agent loop:
 
 ```sh
     --slot-save-node-prompt on
@@ -82,7 +84,7 @@ never restores into a smaller context, and sliding-window models only restore at
 | Flag | Default | Node |
 |---|---|---|
 | `--slot-save-node-system` | on | at the end of the system prompt (the first user message), while a cold prompt prefills; a request with only a system prompt caches all of it |
-| `--slot-save-node-prompt off\|cold\|on` | off | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`) |
+| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never |
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
@@ -92,7 +94,9 @@ never restores into a smaller context, and sliding-window models only restore at
 The defaults save the conversation when that is useful (idle, reclaim, shutdown) and never on every
 turn: a user who keeps talking to the same instance gains nothing from a save after each response, and
 the idle and reclaim saves also cover tool loops. Turn on `--slot-save-node-response` when instances
-die without a graceful stop, and `--slot-save-node-prompt` for the model classes above.
+die without a graceful stop. The default prompt node is written only while a prompt that got no reuse
+prefills, so at most once per conversation start, because every model class that cannot rewind needs it
+for a resend, a regenerate or an edit of the last answer.
 
 ### What a resend of the same request gets
 
@@ -100,7 +104,7 @@ die without a graceful stop, and `--slot-save-node-prompt` for the model classes
 |---|---|---|
 | Plain attention | restores the longer unit and trims it to the request (re-prefills about one token) | nothing |
 | Sliding window, conversation within one window | same as plain attention | nothing |
-| Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it (at most one block plus the generation prompt) | `--slot-save-node-prompt cold` or `on` |
+| Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it (at most one block plus the generation prompt) | the prompt node (`--slot-save-node-prompt`, `cold` by default; `off` turns this into a reported miss) |
 | any | a request that **extends** the saved conversation (the previous answer included) restores all of it | nothing |
 
 Without a usable node a miss is reported, never silent: a WRN line and the
@@ -153,11 +157,10 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   family (Qwen3.5 to 3.8), gpt-oss, Cohere2-MoE, Inkling, Kimi-K3, Ling3 and LLM-jp-harmony do. Gemma 4,
   DeepSeek and templates handled by the generic autoparser mark only user and assistant turns, so on
   those the system node is written only once a user message follows the system prompt.
-- Sliding-window models (Gemma, Laguna) no longer write a node near the end of a cold prompt by
-  default, as main-patched did before the checkpoint triggers: a resend of the same request after a
-  restart misses when the prompt is longer than one window. `--slot-save-node-prompt cold` restores
-  that behaviour (its floor is `max(--slot-save-block, --slot-save-min-tokens)`, where main-patched
-  used `max(--slot-save-block, --slot-save-context-min-tokens)`).
+- The prompt node's floor is `max(--slot-save-block, --slot-save-min-tokens)`. main-patched armed a
+  node near the end of a cold prompt for sliding-window models only, with the floor
+  `max(--slot-save-block, --slot-save-context-min-tokens)`; the default `cold` prompt node now does
+  this for every class that cannot rewind, at the lower floor.
 - On a rollback to a release older than the `.dft` draft sidecars, purge `*.dft` from the store first;
   an older binary counts them as units, evicts them and can delete a newer binary's `.tmp.dft` temps.
   Never run the two on one store at the same time.

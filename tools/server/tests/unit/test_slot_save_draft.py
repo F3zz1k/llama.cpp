@@ -115,10 +115,12 @@ def test_draft_sidecar_restores_warm_draft(model_name, tmp_path):
     s = _make_server(model, CACHE_DIR, str(tmp_path / "server1.log"))
     s.start()
     _complete(s, BASE, 8)
-    metas = _wait_for(os.path.join(CACHE_DIR, "auto-*.bin.meta"), 1, IDLE_SECONDS + 12)
+    # two units: the prompt node written mid-prefill (--slot-save-node-prompt, cold by default) and
+    # the conversation flushed on idle; both must carry a draft sidecar
+    metas = _wait_for(os.path.join(CACHE_DIR, "auto-*.bin.meta"), 2, IDLE_SECONDS + 12)
     drafts_saved = _metric(s, "auto_cache_save_draft_total")
     s.stop()
-    assert len(metas) >= 1, "the conversation must be flushed"
+    assert len(metas) == 2, f"the prompt node and the conversation must be on disk: {metas}"
     dfts = sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.dft")))
     assert len(dfts) == len(metas) and drafts_saved == len(metas), \
         f"every unit carries a draft sidecar: metas={metas} dfts={dfts} counter={drafts_saved}"

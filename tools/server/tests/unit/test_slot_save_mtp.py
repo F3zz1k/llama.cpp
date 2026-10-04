@@ -29,7 +29,7 @@ EXTRA = [((i * 11) % 100) + 10 for i in range(16)]
 CAND_RE = re.compile(r"draft candidate\s+(\d+), pos\s+(\d+):\s+(\d+) \(\s*([0-9.]+)\)")
 
 
-def _server(cache_dir, log_path, spec=True, n_max=3, auto=True):
+def _server(cache_dir, log_path, spec=True, n_max=3, auto=True, node_prompt=None):
     s = ServerProcess()
     s.model_hf_repo = None
     s.model_hf_file = None
@@ -53,6 +53,7 @@ def _server(cache_dir, log_path, spec=True, n_max=3, auto=True):
         s.slot_save_context_min_tokens = 0
         s.slot_restore_min_tokens = 0
         s.slot_save_idle_seconds = IDLE
+        s.slot_save_node_prompt = node_prompt  # None: the server default (cold)
     s.log_path = log_path
     return s
 
@@ -98,11 +99,12 @@ def clean():
     yield
 
 
-def _seed(cache, logp):
-    s = _server(cache, logp)
+def _seed(cache, logp, node_prompt=None):
+    s = _server(cache, logp, node_prompt=node_prompt)
     s.start()
     b = _complete(s, BASE, 8)
-    _wait_meta(cache, 1, IDLE + 15)
+    # the idle-flushed conversation, plus the prompt node written mid-prefill unless it is off
+    _wait_meta(cache, 1 if node_prompt == "off" else 2, IDLE + 15)
     saved = _metric(s, "auto_cache_save_draft_total")
     s.stop()
     return b["tokens"], saved
@@ -163,7 +165,8 @@ def test_mtp_config_changes(tmp_path):
         pytest.skip("no MTP dummy")
     cache = os.path.join(ROOT, "c")
     os.makedirs(cache)
-    gen, _ = _seed(cache, str(tmp_path / "seed.log"))
+    # one root and one delta, compared cell for cell: no prompt node, which would add a second root
+    gen, _ = _seed(cache, str(tmp_path / "seed.log"), node_prompt="off")
     nxt = BASE + gen + EXTRA
     s0 = _server(None, str(tmp_path / "ctl.log"), spec=False, auto=False)
     s0.start()
@@ -246,14 +249,15 @@ def test_mtp_boundary_cell_matches_control(tmp_path):
         pytest.skip("no MTP dummy")
     cache = os.path.join(ROOT, "c")
     os.makedirs(cache)
-    gen, _ = _seed(cache, str(tmp_path / "seed.log"))
+    # one root and one delta, compared cell for cell: no prompt node, which would add a second root
+    gen, _ = _seed(cache, str(tmp_path / "seed.log"), node_prompt="off")
     nxt = BASE + gen + EXTRA
     L = len(BASE) + len(gen) - 1  # cells in the seed snapshot (last generated token not decoded)
     roots = sorted(glob.glob(cache + "/*.dft"))
     assert len(roots) == 1
 
     # warm resume: restore [0, L) + prefill the suffix, idle-save a delta with its own .dft
-    s = _server(cache, str(tmp_path / "warm.log"))
+    s = _server(cache, str(tmp_path / "warm.log"), node_prompt="off")
     s.start()
     _complete(s, nxt, 1)
     _wait_meta(cache, 2, IDLE + 15)
@@ -264,7 +268,7 @@ def test_mtp_boundary_cell_matches_control(tmp_path):
     # control: the same prompt prefilled in one process, root .dft
     cdir = os.path.join(ROOT, "ctl")
     os.makedirs(cdir)
-    s = _server(cdir, str(tmp_path / "ctl.log"))
+    s = _server(cdir, str(tmp_path / "ctl.log"), node_prompt="off")
     s.start()
     _complete(s, nxt, 1)
     _wait_meta(cdir, 1, IDLE + 15)
