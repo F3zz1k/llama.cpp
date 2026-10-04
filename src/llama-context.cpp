@@ -394,6 +394,7 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
+        mem_v_trans = !cparams.flash_attn;
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
@@ -830,6 +831,15 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+bool llama_context::kv_v_trans() const {
+    return mem_v_trans;
+}
+
+uint32_t llama_context::kv_n_stream() const {
+    // as every llama_kv_cache derives it (llama-kv-cache.cpp constructor)
+    return cparams.kv_unified ? 1 : cparams.n_seq_max;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -3972,6 +3982,14 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+bool llama_kv_v_trans(const llama_context * ctx) {
+    return ctx->kv_v_trans();
+}
+
+uint32_t llama_kv_n_stream(const llama_context * ctx) {
+    return ctx->kv_n_stream();
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

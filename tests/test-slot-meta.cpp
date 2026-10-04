@@ -63,7 +63,7 @@ static model_fp make_fp() {
     fp.fp_cache_k        = 1;
     fp.fp_cache_v        = 1;
     fp.fp_n_ctx          = 512;
-    fp.fp_kv_full        = 0;
+    fp.fp_kv_layout      = 0;
     fp.fp_block          = 256;
     fp.fp_rope_scale     = 0x3F800000ULL;
     fp.fp_rope_base      = 0x461C4000ULL;

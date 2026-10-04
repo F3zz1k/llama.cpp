@@ -68,6 +68,8 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
+    bool     kv_v_trans() const; // V transposition the memory was created with (fork)
+    uint32_t kv_n_stream() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
@@ -305,6 +307,10 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // !cparams.flash_attn at memory creation, which is what every attention KV cache was built with;
+    // the -fa auto probe in sched_reserve may change cparams.flash_attn later without rebuilding the memory
+    bool mem_v_trans = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -933,7 +933,7 @@ bool slot_meta_write(const std::string & state_filepath,
     put_u32(fp.fp_cache_k);
     put_u32(fp.fp_cache_v);
     put_u32(fp.fp_n_ctx);
-    put_u32(fp.fp_kv_full);
+    put_u32(fp.fp_kv_layout);
     put_u32(fp.fp_block);
     put_u64(fp.fp_rope_scale);
     // rope_freq_base + YaRN fingerprint fields
@@ -1043,7 +1043,7 @@ bool slot_meta_read(const std::string & state_filepath,
     if (!get_u64(fp.fp_model)         || !get_u32(fp.fp_n_vocab)       || !get_u32(fp.fp_n_ctx_train) ||
         !get_u32(fp.fp_n_embd)        || !get_u32(fp.fp_n_layer)       || !get_u32(fp.fp_rope_type)   ||
         !get_u32(fp.fp_cache_k)       || !get_u32(fp.fp_cache_v)       || !get_u32(fp.fp_n_ctx)       ||
-        !get_u32(fp.fp_kv_full)       || !get_u32(fp.fp_block)         || !get_u64(fp.fp_rope_scale)  ||
+        !get_u32(fp.fp_kv_layout)     || !get_u32(fp.fp_block)         || !get_u64(fp.fp_rope_scale)  ||
         // rope_freq_base + YaRN — must be read in the same order slot_meta_write emits.
         !get_u64(fp.fp_rope_base)     || !get_u32(fp.fp_yarn_ext)      || !get_u32(fp.fp_yarn_attn)   ||
         !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
@@ -1212,7 +1212,7 @@ uint64_t model_fp::identity_hash() const {
     h = auto_hash_mix64(h, fp_cache_k);
     h = auto_hash_mix64(h, fp_cache_v);
     h = auto_hash_mix64(h, ctx_long_regime(*this) ? 1u : 0u); // live only: reads fp_n_ctx_orig
-    h = auto_hash_mix64(h, fp_kv_full);
+    h = auto_hash_mix64(h, fp_kv_layout);
     h = auto_hash_mix64(h, fp_block);
     h = auto_hash_mix64(h, fp_rope_scale);
     h = auto_hash_mix64(h, fp_rope_base);

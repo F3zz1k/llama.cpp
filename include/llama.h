@@ -579,6 +579,12 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    // fork: the attention-KV layout the context's memory was created with. A sequence state saved
+    // under one layout is refused by a context with another (llama_kv_cache::state_read_data), so a
+    // store of state files keyed on identity needs both. Neither depends on n_ctx.
+    LLAMA_API bool     llama_kv_v_trans (const struct llama_context * ctx); // V rows stored transposed (Flash Attention off at memory creation)
+    LLAMA_API uint32_t llama_kv_n_stream(const struct llama_context * ctx); // KV streams: 1 when unified, else n_seq_max
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

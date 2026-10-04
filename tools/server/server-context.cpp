@@ -2377,8 +2377,15 @@ private:
         // any draft) asked for n_rs_seq > 0 rollback rows, which are never serialised (state_write
         // writes the current row, state_read resets rs_idx to 0), so the blob is the same and turning
         // speculation on or off must not split the store. Restore semantics follow the LIVE class.
-        fp.fp_kv_full     = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) ? 1u : 0u;
+        // The other two parts are the attention-KV layout the reader refuses on mismatch, read from
+        // the context (after -fa auto and kv_unified resolve), never from params_base. On a class with
+        // no attention KV (pure recurrent) they still split peers, conservatively: such pools do not
+        // mix -fa or --parallel in practice, and a needless miss is safe where a wrong restore is not.
+        const uint32_t kv_n_stream = std::max<uint32_t>(1u, llama_kv_n_stream(ctx_tgt));
+        fp.fp_kv_layout   = ((ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                              ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) ? 1u : 0u)
+                          | (llama_kv_v_trans(ctx_tgt) ? 2u : 0u)
+                          | (std::min<uint32_t>(kv_n_stream - 1u, 0xFFFFu) << 8);
         fp.fp_block       = (uint32_t) params_base.slot_save_block;
         // effective rope scale (positions are baked into the saved state). rope_freq_scale==0 means
         // "use the model's trained value", so fall back to that for a stable comparison.

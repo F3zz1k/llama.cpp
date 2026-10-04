@@ -388,11 +388,19 @@ struct model_fp {
     // rope_long over rope_short when n_ctx_seq > n_ctx_orig_yarn (llama_model::get_rope_factors),
     // which bakes different K positions. That threshold is the identity field, see ctx_long_regime.
     uint32_t fp_n_ctx      = 0;
-    // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0. Separates FULL from everything else; it does
-    // NOT encode the 4-valued class, so RS and PART share the 0 side. That is sound rather than a
-    // latent collision: an arch in llm_arch_supports_rs_rollback has recurrent memory, so without
-    // MTP it probes as FULL, not PART, and FULL and RS are exactly what this bit does separate.
-    uint32_t fp_kv_full    = 0;
+    // Packed KV layout, every part of it refused on mismatch by the state reader or the restore rules:
+    //   bit 0      1 if the seq_rm class is FULL or RS, else 0 (auto_compute_fingerprint says why the
+    //              two share a value). It does NOT encode the 4-valued class, so PART and NO share 0.
+    //   bit 1      1 if the attention KV stores V transposed (llama_kv_v_trans: Flash Attention was off
+    //              when the memory was created). llama_kv_cache::state_read_data refuses a v_trans
+    //              mismatch, so without this bit -fa on and -fa off peers of one model would name units
+    //              alike and spend a whole state read on every restore of the other's unit, and the
+    //              save-side parent-find could chain a delta onto a parent of the other layout.
+    //   bits 8-23  KV stream count - 1 (llama_kv_n_stream: 1 when unified, else n_seq_max), which the
+    //              same reader refuses on mismatch ("n_stream mismatch").
+    // The common case (Flash Attention on, one stream) leaves bits 1-23 zero, so its .meta bytes are
+    // what they were when this field held only bit 0.
+    uint32_t fp_kv_layout  = 0;
     uint32_t fp_block      = 0; // slot_save_block this snapshot was hashed with
     uint64_t fp_rope_scale = 0; // bit-pattern of effective rope_freq_scale (position-critical)
     // rope_freq_base and ALL YaRN params also bake positions into the saved KV state exactly as
@@ -430,7 +438,7 @@ struct model_fp {
                fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
                fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
                fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
-               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
+               fp_n_ctx == o.fp_n_ctx && fp_kv_layout == o.fp_kv_layout &&
                fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
                fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
                fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
@@ -477,7 +485,7 @@ struct model_fp {
                fp_n_ctx_train == live.fp_n_ctx_train && fp_n_embd == live.fp_n_embd &&
                fp_n_layer == live.fp_n_layer && fp_rope_type == live.fp_rope_type &&
                fp_cache_k == live.fp_cache_k && fp_cache_v == live.fp_cache_v &&
-               ctx_long_regime(live) == live.ctx_long_regime(live) && fp_kv_full == live.fp_kv_full &&
+               ctx_long_regime(live) == live.ctx_long_regime(live) && fp_kv_layout == live.fp_kv_layout &&
                fp_block == live.fp_block && fp_rope_scale == live.fp_rope_scale &&
                fp_rope_base == live.fp_rope_base && fp_yarn_ext == live.fp_yarn_ext &&
                fp_yarn_attn == live.fp_yarn_attn && fp_yarn_beta_fast == live.fp_yarn_beta_fast &&
