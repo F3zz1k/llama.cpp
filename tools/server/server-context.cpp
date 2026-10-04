@@ -8259,7 +8259,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 const int32_t n_chars = json_value(data, "preamble_end_chars", -1);
                 if (n_chars > 0) {
                     task.params.preamble_end = meta->chat_params.preamble_cache->tokens(
-                        ctx_server.vocab, prompt.get<std::string>(), n_chars, task.tokens.get_tokens());
+                        ctx_server.vocab, prompt.get<std::string>(), n_chars, task.tokens.get_cell_tokens());
                 }
             }
 
