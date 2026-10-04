@@ -15,7 +15,12 @@ from utils import *
 #  - a conversation preempted by a different one on a --parallel 1 server reaches disk;
 #  - --slot-save-node-prompt (cold / on) gives the non-rewindable classes a node at the end of the
 #    prompt, so the resend and a follow-up whose history diverges at the response hit too;
-#  - --slot-save-node-response saves as soon as a response completes, and the defaults do not.
+#  - --slot-save-node-response saves as soon as a response completes, and the defaults do not;
+#  - a system-prompt-only request caches the whole system prompt (the system node, default on), and a
+#    later system + user request restores exactly that much.
+# Every hit is also checked for CORRECTNESS against a cold oracle (a server with no cache directory
+# prefilling the same prompt): the greedy tokens must be equal and the top-8 logprobs within TOL. A
+# restore that loads a wrong state "successfully" would otherwise pass on prompt_n / cache_n alone.
 #
 # Dummy models from test-llama-archs (build/tests/test-models), token-id prompts:
 #   llama-dense   PART, plain attention
@@ -36,6 +41,7 @@ CACHE_DIR = "./tmp/slot_save_resend"
 B = 16
 PROMPT = [((i * 7) % 100) + 10 for i in range(150)]
 TAIL = [((i * 11) % 100) + 10 for i in range(40)]
+TOL = 2e-3
 
 
 def _model(name: str) -> str:
@@ -45,7 +51,7 @@ def _model(name: str) -> str:
     return path
 
 
-def _server(model: str, incr: bool = False, node_prompt: str | None = None) -> ServerProcess:
+def _server(model: str, incr: bool = False, node_prompt: str | None = None, cache: bool = True) -> ServerProcess:
     s = ServerProcess()
     s.model_hf_repo = None
     s.model_hf_file = None
@@ -56,6 +62,8 @@ def _server(model: str, incr: bool = False, node_prompt: str | None = None) -> S
     s.n_slots = 1
     s.temperature = 0.0
     s.server_metrics = True
+    if not cache:
+        return s
     s.slot_save_path = CACHE_DIR
     s.slot_save_auto = True
     s.slot_save_incremental = incr
@@ -70,14 +78,43 @@ def _server(model: str, incr: bool = False, node_prompt: str | None = None) -> S
     return s
 
 
+def _req(s: ServerProcess, prompt, extra: dict | None = None):
+    data = {
+        "prompt": prompt, "n_predict": 8, "temperature": 0, "top_k": 1, "cache_prompt": True,
+        "id_slot": 0, "return_tokens": True, "n_probs": 8, "post_sampling_probs": False,
+    }
+    if extra:
+        data.update(extra)
+    res = s.make_request("POST", "/completion", data=data)
+    assert res.status_code == 200, res.body
+    return res.body
+
+
 def _complete(s: ServerProcess, prompt):
-    res = s.make_request("POST", "/completion", data={
-        "prompt": prompt, "n_predict": 8, "temperature": 0, "cache_prompt": True,
-        "id_slot": 0, "return_tokens": True,
-    })
-    assert res.status_code == 200
-    t = res.body["timings"]
-    return t["prompt_n"], t["cache_n"], res.body["tokens"]
+    body = _req(s, prompt)
+    t = body["timings"]
+    _complete.last = body
+    return t["prompt_n"], t["cache_n"], body["tokens"]
+
+
+def _dist(body):
+    return [{t["id"]: t["logprob"] for t in p["top_logprobs"]} for p in body["completion_probabilities"]]
+
+
+def _assert_equals_cold(model: str, prompt, body, extra: dict | None = None):
+    """The oracle: the same prompt prefilled by a server with no cache at all. Greedy tokens equal and
+    every top-8 logprob of the restored run within TOL of the cold one."""
+    s = _server(model, cache=False)
+    s.start()
+    cold = _req(s, prompt, extra)
+    s.stop()
+    assert body["tokens"] == cold["tokens"], f"restored {body['tokens']} vs cold {cold['tokens']}"
+    worst = 0.0
+    for dr, dc in zip(_dist(body), _dist(cold)):
+        for k, v in dr.items():
+            assert k in dc, f"token {k} in the restored top-8 but not in the cold one"
+            worst = max(worst, abs(v - dc[k]))
+    assert worst < TOL, f"restored logprobs differ from cold by {worst}"
 
 
 def _metric(s, name: str) -> float:
@@ -116,9 +153,13 @@ def test_resend_truncatable_restores_and_trims(incr):
     s = _server(model, incr)
     s.start()
     prompt_n, cache_n, _ = _complete(s, PROMPT)
+    body = _complete.last
     s.stop()
     assert prompt_n <= B + 1
     assert cache_n >= len(PROMPT) - B
+    # every reused cell came from disk (the slot was empty after the restart), none from a "warm slot"
+    assert body["timings"].get("cache_disk_n", 0) == cache_n
+    _assert_equals_cold(model, PROMPT, body)
 
 
 @pytest.mark.parametrize("name", ["gemma3-dense", "qwen35-dense"])
@@ -155,9 +196,35 @@ def test_extend_after_restart_hits_every_class(name, incr):
     s = _server(model, incr)
     s.start()
     prompt_n, cache_n, _ = _complete(s, follow)
+    body = _complete.last
     s.stop()
     assert cache_n >= len(PROMPT) + len(gen) - 1 - B
     assert prompt_n <= len(TAIL) + B + 1
+    _assert_equals_cold(model, follow, body)
+
+
+@pytest.mark.parametrize("name", ["llama-dense", "gemma3-dense", "qwen35-dense"])
+def test_two_turn_delta_chain_equals_cold(name):
+    """Three units chained with incremental deltas (P, P+g+T, P+g+T+g2+T2): the deepest restore composes
+    the whole chain and must equal a cold prefill."""
+    model = _model(name)
+    s = _server(model, True)
+    s.start()
+    _, _, g1 = _complete(s, PROMPT)
+    s.stop()
+    p2 = PROMPT + g1 + TAIL
+    s = _server(model, True)
+    s.start()
+    _, _, g2 = _complete(s, p2)
+    s.stop()
+    p3 = p2 + g2 + TAIL[:20]
+    s = _server(model, True)
+    s.start()
+    prompt_n, cache_n, _ = _complete(s, p3)
+    body = _complete.last
+    s.stop()
+    assert cache_n >= len(p2) + len(g2) - 1 - B
+    _assert_equals_cold(model, p3, body)
 
 
 def test_reclaim_saves_preempted_conversation():
@@ -177,8 +244,42 @@ def test_reclaim_saves_preempted_conversation():
     s = _server(model)
     s.start()
     prompt_n, _, _ = _complete(s, PROMPT)
+    body = _complete.last
     s.stop()
     assert prompt_n <= B + 1
+    _assert_equals_cold(model, PROMPT, body)
+
+
+@pytest.mark.parametrize("name", ["llama-dense", "qwen35-dense"])
+@pytest.mark.parametrize("shared", [0, 120])
+def test_reclaim_with_shared_leading_prefix(name, shared):
+    """Conversation B takes the only slot from A while sharing a long leading prefix with it (a common
+    system prompt, the normal agent / RAG case). The RAM cache's f_keep rule stays >= 0.5 there, but A's
+    own tail is still overwritten, so A must reach disk before B prefills. A request that EXTENDS the slot
+    must not trigger a reclaim write."""
+    model = _model(name)
+    sys_p = [((i * 3) % 100) + 10 for i in range(shared)]
+    a = sys_p + [((i * 7) % 100) + 10 for i in range(160 - shared)]
+    b = sys_p + [((i * 13) % 100) + 10 for i in range(170 - shared)]
+    s = _server(model)
+    s.start()
+    _, _, ga = _complete(s, a)
+    a2 = a + ga + TAIL[:8]
+    _, _, ga2 = _complete(s, a2)   # extends the slot: nothing is lost, nothing is written
+    assert _units() == []
+    _complete(s, b)
+    units = _units()
+    s.stop()
+    assert len(a2) + len(ga2) - 1 in units, f"units after B: {units}"
+
+    follow = a2 + ga2 + TAIL[8:24]
+    s = _server(model)
+    s.start()
+    prompt_n, cache_n, _ = _complete(s, follow)
+    body = _complete.last
+    s.stop()
+    assert cache_n >= len(a2) + len(ga2) - 1 - B
+    _assert_equals_cold(model, follow, body)
 
 
 @pytest.mark.parametrize("mode", ["cold", "on"])
@@ -199,11 +300,13 @@ def test_resend_hits_with_prompt_node(name, mode):
     s = _server(model, node_prompt=mode)
     s.start()
     prompt_n, cache_n, _ = _complete(s, PROMPT)
+    body = _complete.last
     not_prefix = _metric(s, "auto_cache_restore_not_prefix_total")
     s.stop()
     assert cache_n >= node
     assert prompt_n <= B + 1
     assert not_prefix == 0
+    _assert_equals_cold(model, PROMPT, body)
 
 
 @pytest.mark.parametrize("incr", [False, True])
@@ -237,10 +340,12 @@ def test_divergent_followup_needs_the_prompt_node(name, incr):
     s = _server(model, incr, node_prompt="on")
     s.start()
     prompt_n, cache_n, _ = _complete(s, follow)
+    body = _complete.last
     delta = _metric(s, "auto_cache_save_delta_total")
     s.stop()
     node = (len(PROMPT) - 1) // B * B
     assert cache_n >= node
+    _assert_equals_cold(model, follow, body)
     assert prompt_n <= len(follow) - node + 1
     # the follow-up's own prompt node, past the restored one by at least a block
     assert (len(follow) - 1) // B * B in _units()
@@ -248,9 +353,14 @@ def test_divergent_followup_needs_the_prompt_node(name, incr):
         assert delta >= 1
 
 
-def test_prompt_node_off_by_default():
-    """Default triggers write no mid-prefill prompt node: only the release unit reaches disk."""
-    model = _model("qwen35-dense")
+@pytest.mark.parametrize("name", ["qwen35-dense", "gemma3-dense"])
+def test_prompt_node_off_by_default(name):
+    """Default triggers write no mid-prefill prompt node: only the release unit reaches disk. Recorded for
+    the SWA class too (gemma3-dense): main-patched always armed a node near the prompt end for an SWA
+    model, the user design (2026-10-03) makes it opt-in (--slot-save-node-prompt cold|on) for every class,
+    so a same-prompt resend after a restart misses there by default (see
+    test_resend_non_rewindable_miss_is_reported) and hits with the option (test_resend_hits_with_prompt_node)."""
+    model = _model(name)
     s = _server(model)
     s.start()
     _, _, gen = _complete(s, PROMPT)
@@ -292,3 +402,68 @@ def test_reclaim_save_can_be_disabled():
     assert _units() == []
     s.stop()
     assert len(_units()) == 1
+
+
+# --- system-prompt-only pre-cache (the system node, on by default) ---------------------------------
+# The test-models dummies have no chat template with a system role, so the request carries the role
+# delimiters itself (/completion's "message_delimiters", exactly what the chat path forwards) and the
+# prompt is built from their token ids. Body ids are drawn from ids the delimiters do not use.
+
+DELIMS = [
+    {"role": "system",    "delimiter": "<|im_start|>system"},
+    {"role": "user",      "delimiter": "<|im_start|>user"},
+    {"role": "assistant", "delimiter": "<|im_start|>assistant"},
+]
+
+
+def _tok(s: ServerProcess, text: str):
+    res = s.make_request("POST", "/tokenize", data={"content": text, "add_special": False, "parse_special": True})
+    assert res.status_code == 200
+    toks = res.body["tokens"]
+    assert len(toks) > 0
+    return toks
+
+
+@pytest.mark.parametrize("incr", [False, True])
+@pytest.mark.parametrize("name", ["llama-dense", "gemma3-dense", "qwen35-dense"])
+def test_system_only_request_precaches_the_whole_system_prompt(name, incr):
+    """User scenario 1: a request carrying only a system prompt (plus the generation prompt) caches the
+    whole system prompt, at its exact (unaligned) end. After a restart, a system + user request restores
+    exactly that much from disk, on every class, and its output equals a cold prefill."""
+    model = _model(name)
+    s = _server(model, incr)
+    s.slot_save_context_min_tokens = 0   # the system node's floor becomes the block size
+    s.start()
+    S, U, A = (_tok(s, d["delimiter"]) for d in DELIMS)
+    used = set(S) | set(U) | set(A)
+    pool = [t for t in range(10, 110) if t not in used]   # the id range PROMPT already uses
+    assert len(pool) >= 32
+    body_sys = [pool[(i * 7) % len(pool)] for i in range(70)]
+    body_usr = [pool[(i * 11) % len(pool)] for i in range(40)]
+    nl = [pool[0]]
+    sys_only = S + body_sys + A + nl
+    sys_end = len(S) + len(body_sys)
+    assert sys_end % B != 0, "the test wants an unaligned system end"
+    extra = {"message_delimiters": DELIMS}
+    _req(s, sys_only, extra)
+    s.stop()
+    assert sys_end in _units(), f"units: {_units()}"
+
+    follow = S + body_sys + U + body_usr + A + nl
+    s = _server(model, incr)
+    s.slot_save_context_min_tokens = 0
+    s.start()
+    body = _req(s, follow, extra)
+    s.stop()
+    t = body["timings"]
+    # non-rewindable classes restore the system node, exactly sys_end; plain attention restores the
+    # longer release unit and trims it to the real common prefix, which runs a few tokens past sys_end
+    # when the user and assistant delimiters share leading tokens. Either way every reused cell is disk.
+    expect = sys_end
+    if name == "llama-dense":
+        expect = next(i for i, (x, y) in enumerate(zip(sys_only, follow)) if x != y)
+        assert expect >= sys_end
+    assert t["cache_n"] == expect, t
+    assert t.get("cache_disk_n", 0) == expect, t
+    assert t["prompt_n"] == len(follow) - expect
+    _assert_equals_cold(model, follow, body, extra)
