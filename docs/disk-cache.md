@@ -129,7 +129,7 @@ rewrite answers, and regenerate or edit after a restart, want `--slot-save-node-
 |---|---|---|
 | Plain attention | restores the longer unit and trims it to the request (re-prefills about one token) | nothing |
 | Sliding window, conversation within one window | same as plain attention | nothing |
-| Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it (at most one block plus the generation prompt) | the prompt node (`--slot-save-node-prompt`: `cold`, the default, writes it only for the first prompt of a conversation, so a later turn falls back to the deepest earlier node; `on` writes it every turn; `off` turns this into a reported miss) |
+| Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it: the generation prompt, since the node sits exactly at the end of the last user message (a request without a user message, raw tokens for example, places it a block boundary below its end, and an image that ends at that position moves it to before the image) | the prompt node (`--slot-save-node-prompt`: `cold`, the default, writes it only for the first prompt of a conversation, so a later turn falls back to the deepest earlier node; `on` writes it every turn; `off` turns this into a reported miss) |
 | any | a request that **extends** the saved conversation (the previous answer included) restores all of it | nothing |
 
 Without a usable node a miss is reported, never silent: a WRN line and the
