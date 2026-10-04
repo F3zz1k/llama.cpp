@@ -44,7 +44,7 @@ The hash is purely a candidate-*narrowing* accelerator so we don't scan every sn
 
 ## 4. The fingerprint (`model_fp`)
 
-Computed once at load (`auto_compute_fingerprint`), compared by exact equality (`restore_compatible`). Fields: model-desc hash (+ size/n_params/n_embd/n_layer), n_vocab, n_ctx_train, rope_type, **cache_type_k/v**, FULL-vs-attention, block size, **rope_freq_scale**, **rope_freq_base + all five YaRN params**, LoRA-set hash, and an **mmproj-loaded** bit, plus the LongRoPE regime (`n_ctx > n_ctx_orig_yarn`). n_ctx itself is persisted as a capacity record, not compared: a unit restores into any context that holds its cells (`fits_ctx`), checked before its state file is opened.
+Computed once at load (`auto_compute_fingerprint`), compared by exact equality (`restore_compatible`). Fields: model-desc hash (+ size/n_params/n_embd/n_layer), n_vocab, n_ctx_train, rope_type, **cache_type_k/v**, the KV layout (FULL-vs-attention, V transposed or not, stream count), block size, **rope_freq_scale**, **rope_freq_base + all five YaRN params**, LoRA-set hash, and an **mmproj-loaded** bit, plus the LongRoPE regime (`n_ctx > n_ctx_orig_yarn`, the model's own threshold, on LongRoPE models only). n_ctx itself is persisted as a capacity record, not compared: a unit restores into any context that holds its cells (`fits_ctx`), checked before its state file is opened.
 
 ### Why so many fields?
 `llama_state_seq_save_file` serializes the raw KV blob. Loading it into a context with *different KV geometry* silently corrupts:

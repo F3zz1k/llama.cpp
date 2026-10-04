@@ -154,9 +154,12 @@ directions whenever the unit fits the reader's context (a longer one is skipped 
 opened). They must use identical fingerprint fields otherwise: same model file, same
 `--cache-type-k/v`, same `--slot-save-block`, and the **same RoPE/YaRN settings**
 (`--rope-scaling`, `--rope-scale`, `--yarn-orig-ctx`, ...). The GPU count and tensor split are not
-part of the fingerprint. The one way `-c` reaches the KV is LongRoPE (`rope_factors_long` /
-`rope_factors_short`, chosen by `n_ctx_seq > n_ctx_orig_yarn`), so which side of that threshold a rung
-sits on is part of the fingerprint.
+part of the fingerprint; `-fa` and the KV stream count are (`-fa` decides whether V is stored
+transposed, and the state reader refuses either mismatch). The one way `-c` reaches the KV is LongRoPE
+(`rope_factors_long` / `rope_factors_short`, chosen by `n_ctx_seq > hparams.n_ctx_orig_yarn`), so which
+side of that threshold a rung sits on is part of the fingerprint. The threshold comes from the model
+(`llama_model_n_ctx_orig_longrope`), which is 0 on every model without those factors, so a GGUF that
+merely carries `rope.scaling.original_context_length` splits nothing.
 
 ## Speculative decoding and the cache
 

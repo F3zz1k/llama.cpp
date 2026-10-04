@@ -66,9 +66,16 @@ lower-context vision variant beside the text one): point them at the same store.
 unit's identity, so the rungs name units alike, deduplicate them and continue each other's delta chains,
 and a unit restores into any rung whose context holds it, in either direction, for every model class
 (sliding-window and recurrent included). They must still agree on the model file, KV cache types,
-`--slot-save-block`, the mmproj and the RoPE/YaRN settings. The one exception is a LongRoPE model (Phi-3
-style `rope_factors_long`/`rope_factors_short`): rungs on opposite sides of its original context use
-different factors, so they do not share.
+Flash Attention (`-fa` on or off changes the V layout), the KV stream count (`--parallel` without
+`--kv-unified`), `--slot-save-block`, the mmproj and the RoPE/YaRN settings. The one exception is a
+LongRoPE model (Phi-3 style `rope_factors_long`/`rope_factors_short`): rungs on opposite sides of its
+original context use different factors, so they do not share. That threshold is the model's own
+(`rope.scaling.original_context_length`, else `context_length`); `--yarn-orig-ctx` does not move it, and
+a model without LongRoPE factors never splits on it.
+
+Peers sharing a store take a lock on the directory (`flock`) while they publish a unit and while they
+restore one, so a restore always loads the `.bin` its `.meta` describes even when two peers publish
+different content (a whole unit and a delta) under one name.
 
 ## Flags
 
