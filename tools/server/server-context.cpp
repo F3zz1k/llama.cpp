@@ -273,6 +273,75 @@ static std::string slot_draft_sidecar_path(const std::string & state_filepath) {
     return state_filepath + ".dft";
 }
 
+// A manual /slots save's FINGERPRINT sidecar. The .bin is upstream's format, which records no model
+// identity: its restore only checks that every token id is below n_vocab, so a save restored under a
+// different model of the same vocabulary size, or a media save under a different --mmproj, would
+// otherwise be accepted and its cells reused as if valid. This small file beside the .bin carries the
+// identity the fork checked before; a restore refuses when it is present and does not match. Absent
+// (a file saved by upstream or elsewhere) means unchecked, as upstream behaves.
+static constexpr uint32_t SLOT_FP_MAGIC   = 0x50464C53u; // "SLFP"
+static constexpr uint32_t SLOT_FP_VERSION = 1u;
+
+static std::string slot_fp_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".fp";
+}
+
+struct slot_fp_record {
+    uint64_t fp_model         = 0;
+    uint32_t fp_mmproj_loaded = 0;
+    uint64_t fp_mmproj        = 0;
+};
+
+// written to a temp name and renamed, so a torn write never leaves a partial sidecar in place
+static bool slot_fp_write(const std::string & state_filepath, const slot_fp_record & r) {
+    const std::string side = slot_fp_sidecar_path(state_filepath);
+    const std::string tmp  = side + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return false;
+        }
+        f.write((const char *) &SLOT_FP_MAGIC,      sizeof(SLOT_FP_MAGIC));
+        f.write((const char *) &SLOT_FP_VERSION,    sizeof(SLOT_FP_VERSION));
+        f.write((const char *) &r.fp_model,         sizeof(r.fp_model));
+        f.write((const char *) &r.fp_mmproj_loaded, sizeof(r.fp_mmproj_loaded));
+        f.write((const char *) &r.fp_mmproj,        sizeof(r.fp_mmproj));
+        f.flush();
+        if (!f.good()) {
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, side, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
+// 0: no sidecar; 1: read into `r`; -1: present but unreadable (a restore must refuse)
+static int slot_fp_read(const std::string & state_filepath, slot_fp_record & r) {
+    const std::string side = slot_fp_sidecar_path(state_filepath);
+    std::error_code ec;
+    if (!std::filesystem::exists(side, ec) || ec) {
+        return 0;
+    }
+    std::ifstream f(side, std::ios::binary);
+    uint32_t magic = 0, version = 0;
+    f.read((char *) &magic,              sizeof(magic));
+    f.read((char *) &version,            sizeof(version));
+    f.read((char *) &r.fp_model,         sizeof(r.fp_model));
+    f.read((char *) &r.fp_mmproj_loaded, sizeof(r.fp_mmproj_loaded));
+    f.read((char *) &r.fp_mmproj,        sizeof(r.fp_mmproj));
+    if (!f || magic != SLOT_FP_MAGIC || version != SLOT_FP_VERSION) {
+        return -1;
+    }
+    return 1;
+}
+
 // The draft's per-sequence carry-over (common_speculative_get_state: MTP's pending h of the unit's
 // last cell) rides at the END of the .dft, after the llama_state_seq payload, which the state loader
 // never reads past: [blob][i32 tail_pos][u32 blob_size][u32 SLOT_DRAFT_TRAILER_MAGIC]. tail_pos is
@@ -438,6 +507,7 @@ struct slot_save_unit {
     std::string sidecar_path; // "<state>.logits", "" if none
     std::string meta_path;    // "<state>.meta",   "" if none (auto disk cache)
     std::string dft_path;     // "<state>.dft",    "" if none (auto disk cache draft sidecar)
+    std::string fp_path;      // "<state>.fp",     "" if none (manual /slots fingerprint sidecar)
     uintmax_t   bytes = 0;
     std::filesystem::file_time_type mtime;
     // Tree-aware eviction (U5): a checkpoint node's identity, derived entirely from disk. A node is
@@ -604,6 +674,11 @@ static void slot_save_enforce_limits(const std::string & dir,
                 present.count(p.substr(0, p.size() - 4))) {
                 continue;
             }
+            // a "<X>.fp" file is a manual save's fingerprint sidecar: the same
+            if (p.size() >= 3 && p.compare(p.size() - 3, 3, ".fp") == 0 &&
+                present.count(p.substr(0, p.size() - 3))) {
+                continue;
+            }
             // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
             // accumulate (we never count them) and eat real on-disk space forever.
             if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
@@ -623,6 +698,11 @@ static void slot_save_enforce_limits(const std::string & dir,
             }
             if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".dft") == 0 &&
                 !present.count(p.substr(0, p.size() - 4))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
+            if (p.size() >= 3 && p.compare(p.size() - 3, 3, ".fp") == 0 &&
+                !present.count(p.substr(0, p.size() - 3))) {
                 std::filesystem::remove(p, fec);
                 continue;
             }
@@ -667,6 +747,14 @@ static void slot_save_enforce_limits(const std::string & dir,
                     u.bytes += db;
                 }
             }
+            const std::string fps = slot_fp_sidecar_path(p);
+            if (present.count(fps)) {
+                const auto fb = std::filesystem::file_size(fps, fec);
+                if (!fec) {
+                    u.fp_path = fps;
+                    u.bytes += fb;
+                }
+            }
             u.mtime = std::filesystem::last_write_time(p, fec);
             if (fec) {
                 continue;
@@ -703,6 +791,9 @@ static void slot_save_enforce_limits(const std::string & dir,
                 }
                 if (!u.dft_path.empty()) {
                     std::filesystem::remove(u.dft_path, ec);
+                }
+                if (!u.fp_path.empty()) {
+                    std::filesystem::remove(u.fp_path, ec);
                 }
                 break;
             }
@@ -745,6 +836,9 @@ static void slot_save_enforce_limits(const std::string & dir,
         }
         if (!u.dft_path.empty()) {
             std::filesystem::remove(u.dft_path, ec);
+        }
+        if (!u.fp_path.empty()) {
+            std::filesystem::remove(u.fp_path, ec);
         }
     };
 
@@ -5904,23 +5998,39 @@ private:
                         break;
                     }
 
-                    // fork: a fork-format save under the same name may have left sidecars behind; the
-                    // restore dispatches on .meta, so they must not outlive the file they described.
-                    // Removed only once the new snapshot can be written, so a refused save keeps the old one.
+                    // fork: written to a per-writer temp name and renamed over the target, so a save that
+                    // fails at any point (refused, or the write itself) leaves the previous file and its
+                    // sidecars as they were. Only once the new file is complete are the old sidecars
+                    // removed: a fork-format save under the same name may have left a .meta, and the
+                    // restore dispatches on .meta, so none may outlive the file it described.
+                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    const std::string tmp = filepath + "." + std::to_string((long) getpid()) + ".manual.tmp";
+                    const size_t nwrite = llama_state_seq_save_file(
+                        ctx_tgt, tmp.c_str(), slot->id,
+                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    if (nwrite == 0) {
+                        std::error_code ec;
+                        std::filesystem::remove(tmp, ec);
+                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        break;
+                    }
                     {
                         std::error_code ec;
                         std::filesystem::remove(slot_meta_sidecar_path(filepath), ec);
                         std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
                         std::filesystem::remove(slot_draft_sidecar_path(filepath), ec);
+                        std::filesystem::remove(slot_fp_sidecar_path(filepath), ec);
+                        std::filesystem::rename(tmp, filepath, ec);
+                        if (ec) {
+                            std::filesystem::remove(tmp, ec);
+                            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                            break;
+                        }
                     }
-
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
+                    // fork: the model / projector identity upstream's format does not carry (see
+                    // slot_fp_sidecar_path). Best effort: without it the restore is unchecked, as upstream's.
+                    if (!slot_fp_write(filepath, { cur_fp.fp_model, cur_fp.fp_mmproj_loaded, cur_fp.fp_mmproj })) {
+                        SLT_WRN(*slot, "%s", "failed to write the fingerprint sidecar; a restore of this file is unchecked\n");
                     }
 
                     // fork: the regenerate logits sidecar (FULL and RS classes), next to upstream's file and
@@ -6092,6 +6202,23 @@ private:
                         packed.resize(n_packed);
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+                        // fork: the fingerprint sidecar, when the save wrote one (see slot_fp_sidecar_path).
+                        // Text KV is projector-independent, so the projector is compared only for a media save.
+                        {
+                            slot_fp_record rec;
+                            const int st = slot_fp_read(filepath, rec);
+                            if (st < 0) {
+                                throw std::runtime_error("unreadable fingerprint sidecar (.fp)");
+                            }
+                            if (st > 0 && rec.fp_model != cur_fp.fp_model) {
+                                throw std::runtime_error("the file was saved by a different model");
+                            }
+                            if (st > 0 && restored.has_media() &&
+                                (rec.fp_mmproj_loaded != cur_fp.fp_mmproj_loaded || rec.fp_mmproj != cur_fp.fp_mmproj)) {
+                                throw std::runtime_error("the file holds media encoded by a different projector (--mmproj)");
+                            }
+                        }
 
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");

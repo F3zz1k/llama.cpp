@@ -181,3 +181,67 @@ def test_failed_restore_leaves_the_slot_usable():
     s.stop()
     assert body["tokens"] == cold["tokens"]
     assert body["timings"]["prompt_n"] == len(PROMPT)
+
+
+def _save(s: ServerProcess, name: str):
+    return s.make_request("POST", "/slots/0?action=save", data={"filename": name})
+
+
+def _restore(s: ServerProcess, name: str):
+    return s.make_request("POST", "/slots/0?action=restore", data={"filename": name})
+
+
+def test_fingerprint_sidecar_refuses_another_model():
+    """Upstream's .bin records no model identity (its restore only checks token ids against n_vocab), so a
+    manual save writes a small .fp sidecar beside it, and a restore refuses a file whose sidecar names
+    another model. Without the sidecar (a file saved by upstream) the restore is unchecked, as upstream's."""
+    s = _server(_model("llama-dense"))
+    s.start()
+    _complete(s, PROMPT, 1)
+    assert _save(s, "a.bin").status_code == 200
+    s.stop()
+    path = os.path.join(SAVE_DIR, "a.bin")
+    assert os.path.exists(path + ".fp")
+    raw = open(path + ".fp", "rb").read()
+
+    # positive control: the intact sidecar restores
+    s = _server(_model("llama-dense"))
+    s.start()
+    assert _restore(s, "a.bin").status_code == 200
+    # another model identity in the sidecar: refused, and the slot stays usable
+    bad = bytearray(raw)
+    bad[8] ^= 0xFF  # first byte of fp_model
+    open(path + ".fp", "wb").write(bytes(bad))
+    res = _restore(s, "a.bin")
+    assert res.status_code != 200 and "different model" in str(res.body), res.body
+    _complete(s, PROMPT, 1)
+    # unreadable sidecar: refused too
+    open(path + ".fp", "wb").write(b"junk")
+    assert _restore(s, "a.bin").status_code != 200
+    # no sidecar: unchecked, as upstream
+    os.remove(path + ".fp")
+    assert _restore(s, "a.bin").status_code == 200
+    s.stop()
+
+
+def test_failed_save_keeps_previous_file():
+    """A save that fails at write time leaves the previous file and its sidecars untouched: the new file
+    is written to a temp name and renamed over the old one, and the old sidecars are removed only after."""
+    s = _server(_model("qwen35-dense"))
+    s.start()
+    _complete(s, PROMPT, 1)
+    assert _save(s, "keep.bin").status_code == 200
+    path = os.path.join(SAVE_DIR, "keep.bin")
+    before = {suf: open(path + suf, "rb").read() for suf in ("", ".fp", ".logits") if os.path.exists(path + suf)}
+    assert "" in before and ".fp" in before
+    _complete(s, PROMPT + TAIL, 1)
+    os.chmod(SAVE_DIR, 0o555)   # no new file can be created in the directory: the temp write fails
+    try:
+        res = _save(s, "keep.bin")
+    finally:
+        os.chmod(SAVE_DIR, 0o755)
+    assert res.status_code != 200, res.body
+    after = {suf: open(path + suf, "rb").read() for suf in ("", ".fp", ".logits") if os.path.exists(path + suf)}
+    assert after == before
+    assert not [f for f in os.listdir(SAVE_DIR) if f.endswith(".tmp")]
+    s.stop()
