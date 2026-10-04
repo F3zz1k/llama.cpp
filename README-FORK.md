@@ -19,6 +19,11 @@ llama-server -m model.gguf -c 32768 -ngl 999 -fa on \
 Then check it is working with `curl -s localhost:8080/metrics | grep auto_cache_` (restore hits,
 misses, saves and evictions) and the `cache_disk_n` field of each response's `timings`.
 
+On a recurrent, hybrid or sliding-window model, add `--slot-save-node-prompt on` when your client drops
+the previous reasoning from the history or rewrites earlier answers (each follow-up then diverges inside
+the previous response, and these models cannot rewind into it), or when you regenerate or edit answers
+after a restart. The default (`cold`) writes that node only for a prompt that got essentially no reuse.
+
 [`docs/disk-cache.md`](docs/disk-cache.md) is the quick start: the recommended command lines (a
 pool sharing one store, MTP or a draft model, recurrent and hybrid models, a shared system prompt,
 context rungs), every flag with its default, when a node is written, how to read hits and misses,
@@ -132,7 +137,7 @@ the `cold` prompt node, the reclaim save and the 60 s idle save. Add `--metrics`
 | `--slot-save-context-min-tokens N` | 4096 | Whole-save a shared preamble (system prompt, tools, RAG) once, mid-prefill, as a base that later chats restore. The floor is `max(--slot-save-block, N)`. |
 | `--slot-restore-min-tokens N` | 0 | Skip a disk restore whose verified prefix is shorter than `N` tokens and re-prefill instead. `0` always restores. |
 | `--slot-save-node-system` | on | Node at the end of the system prompt (with tools and the template's own preamble, found by rendering the chat template, for every template) while a cold prompt prefills; a request carrying only a system prompt caches all of it. `--no-slot-save-node-system` turns it off. |
-| `--slot-save-node-prompt off\|cold\|on` | cold | Node at the end of the last user message while the prompt prefills, so a resend, regenerate or edit restores it on models that cannot rewind (recurrent, hybrid, sliding window past one window). `cold`: only for prompts with no reuse; `on`: whenever a block of new prompt precedes it; `off`: never. |
+| `--slot-save-node-prompt off\|cold\|on` | cold | Node at the end of the last user message while the prompt prefills, so a resend, regenerate or edit restores it on models that cannot rewind (recurrent, hybrid, sliding window past one window). `cold`: only for prompts with no reuse; `on`: whenever a block of new prompt precedes it (use it for clients that drop the previous reasoning or rewrite answers, and for regenerate or edit after a restart); `off`: never. |
 | `--slot-save-node-response` | off | Save the conversation as soon as each response completes, not only on idle, reclaim and shutdown. |
 | `--slot-save-node-tool` | off | Same, only for responses that end in tool calls. |
 | `--slot-save-on-reclaim` | on | Save a slot's conversation before a request from a different conversation takes the slot. `--no-slot-save-on-reclaim` turns it off. |

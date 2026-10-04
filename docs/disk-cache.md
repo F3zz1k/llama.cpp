@@ -43,12 +43,22 @@ with an indexer or compressed KV (DeepSeek-V4, GLM-5 next, Qwen3.8-Flash-Next). 
 saved conversation to an earlier position, so a regenerate, an edit of the last answer, or a follow-up
 whose history is not re-rendered token for token can only restore a node that sits before the change.
 The prompt node at the end of the last user message covers that, and it is on by default (`cold`: it is
-written while a prompt that got no reuse prefills). To also write it for prompts that restored part of
-their prefix, for example on every turn of a long agent loop:
+written only while a prompt that got essentially no reuse prefills, so once per conversation start). To
+write it on every turn that adds at least a block of new prompt:
 
 ```sh
     --slot-save-node-prompt on
 ```
+
+Use `on` when the client drops the previous reasoning from the history or rewrites earlier answers
+(trimmed, re-serialised tool calls): every follow-up then diverges inside the previous response, so the
+unit saved after it can never serve the next turn, and with `cold` a turn after a reclaim or a restart
+restores only the deepest earlier node (the first turn's prompt node or the system node) and prefills
+everything after it, a re-prefill that grows with the conversation. With `on` each turn restores the
+previous turn's node and re-prefills about one response plus one user message. `on` also helps a
+regenerate or an edit of an answer after a restart. Its cost is one extra capture per such turn (a delta
+under `--slot-save-incremental` when the model supports deltas). Clients that send the conversation back
+token for token (the reasoning included) extend each saved unit and do not need it.
 
 Sliding-window models (Gemma 3/4, Laguna) behave the same way once a conversation is longer than the
 window.
@@ -97,7 +107,7 @@ different content (a whole unit and a delta) under one name.
 | Flag | Default | Node |
 |---|---|---|
 | `--slot-save-node-system` | on | at the end of the system prompt, while a cold prompt prefills; a request with only a system prompt caches all of it. The end is found by rendering the request's system messages and tools through the chat template again, followed by placeholder conversations, so it works for every template, including a default system prompt the template inserts itself |
-| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: for prompts that got essentially no reuse, and, on a model that cannot rewind, for prompts whose reuse ended inside the previous conversation (the client did not re-render the previous response token for token, for example it dropped the reasoning) once at least one block of new prompt precedes the node. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never. When the system node is written in the same prefill, the prompt node must lie at least one block past it, or it is skipped |
+| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never. When the system node is written in the same prefill, the prompt node must lie at least one block past it, or it is skipped |
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
@@ -109,7 +119,9 @@ turn: a user who keeps talking to the same instance gains nothing from a save af
 the idle and reclaim saves also cover tool loops. Turn on `--slot-save-node-response` when instances
 die without a graceful stop. The default prompt node is written only while a prompt that got no reuse
 prefills, so at most once per conversation start, because every model class that cannot rewind needs it
-for a resend, a regenerate or an edit of the last answer.
+for a resend, a regenerate or an edit of the last answer. Clients that drop the previous reasoning or
+rewrite answers, and regenerate or edit after a restart, want `--slot-save-node-prompt on` (see
+[Recommended command lines](#recommended-command-lines)).
 
 ### What a resend of the same request gets
 
@@ -117,7 +129,7 @@ for a resend, a regenerate or an edit of the last answer.
 |---|---|---|
 | Plain attention | restores the longer unit and trims it to the request (re-prefills about one token) | nothing |
 | Sliding window, conversation within one window | same as plain attention | nothing |
-| Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it (at most one block plus the generation prompt) | the prompt node (`--slot-save-node-prompt`, `cold` by default; `off` turns this into a reported miss) |
+| Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it (at most one block plus the generation prompt) | the prompt node (`--slot-save-node-prompt`: `cold`, the default, writes it only for the first prompt of a conversation, so a later turn falls back to the deepest earlier node; `on` writes it every turn; `off` turns this into a reported miss) |
 | any | a request that **extends** the saved conversation (the previous answer included) restores all of it | nothing |
 
 Without a usable node a miss is reported, never silent: a WRN line and the
@@ -260,10 +272,8 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   request's first token by the copy of its state off the device (a whole snapshot, or a delta under
   `--slot-save-incremental`) and holds up other slots meanwhile; the write itself runs on the background
   writer, unless the staging is full and the writer busy, when the capture also waits for the writer
-  (see "Staging budget"). The default `cold` prompt node adds at most one capture per conversation start, plus one
-  per turn on a model that cannot rewind when the client does not re-render the previous response token
-  for token (each such turn's after-response unit cannot serve the next turn, so the node is the only
-  restore point that survives a reclaim or a restart).
+  (see "Staging budget"). The default `cold` prompt node adds at most one capture per conversation start;
+  `on` adds one per turn that brings at least a block of new prompt.
 - The copy off the device stays on the request's critical path. It lands in ordinary (pageable) host
   memory; staging in pinned memory may copy faster on a GPU and is not measured yet. Moving the copy
   itself off the first token needs the cells to be copied lazily after the node, which is not done.
