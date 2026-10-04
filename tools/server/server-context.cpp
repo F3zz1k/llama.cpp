@@ -3871,8 +3871,10 @@ private:
         bool                    started   = false;
         bool                    running   = false;
         bool                    closing   = false;
-        bool                    shutdown  = false; // the shutdown flush: admission waits instead of dropping
-        int64_t                 deadline_ms = -1;  // shutdown: abandon what is left after this
+        bool                    shutdown  = false; // the shutdown flush: admission waits up to the deadline
+        std::atomic<int64_t>    deadline_ms{-1};   // shutdown: abandon what is left after this (read lock-free)
+        int64_t                 last_progress_ms = -1; // the writer's last sign of life (a chunk, a stage, a job)
+        std::vector<int>        resave_slots;      // slots to re-arm for the idle flush (a unit covering them failed)
         size_t                  budget    = 0;
         size_t                  chunk     = 0;
         size_t                  staged    = 0;     // bytes held in chunks not yet written
@@ -3883,13 +3885,18 @@ private:
         int64_t                 test_fail_meta = 0;
         int64_t                 n_publishes    = 0;
         int64_t                 reap_age_s     = 600;
-        int64_t                 shutdown_ms    = 100 * 1000;
+        int64_t                 shutdown_ms    = 90 * 1000;
+        int64_t                 stall_ms       = 60 * 1000;
         int64_t                 last_reap_ms   = -1;
     } aw;
 
     static constexpr size_t  AW_MAX_CHUNK            = 64u << 20;
-    static constexpr int64_t AW_SHUTDOWN_DEADLINE_MS = 100 * 1000; // inside TimeoutStopSec 120 / router 150
-    static constexpr int64_t AW_PENDING_WAIT_MS      = 30 * 1000;  // a restore waits this long for a queued prefix
+    // inside TimeoutStopSec 120 / router 150, leaving 30 s for llama_backend_free: past the deadline the writer
+    // stops between chunks, and the per-chunk writeback (aw_write_stream) keeps the last fdatasync short
+    static constexpr int64_t AW_SHUTDOWN_DEADLINE_MS = 90 * 1000;
+    static constexpr int64_t AW_PENDING_WAIT_MS      = 30 * 1000;  // a new task waits this long for a queued prefix
+    static constexpr int64_t AW_STALL_MS             = 60 * 1000;  // a writer silent this long is treated as hung
+    static constexpr int64_t AW_IDLE_RETRY_MS        = 200;        // a deferred idle flush re-checks this often
 
     static int64_t aw_env_i64(const char * name, int64_t def) {
         const char * v = getenv(name);
@@ -3908,6 +3915,7 @@ private:
         aw.test_fail_meta = aw_env_i64("LLAMA_TEST_SLOT_SAVE_FAIL_META_AT", 0);
         aw.reap_age_s     = aw_env_i64("LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S", 600);
         aw.shutdown_ms    = aw_env_i64("LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS", AW_SHUTDOWN_DEADLINE_MS);
+        aw.stall_ms       = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS", AW_STALL_MS);
         auto_reap_dead_temps();
         if (aw.budget == 0) {
             SRV_INF("%s", "auto disk cache: saves are published on the server thread (--slot-save-staging-mb 0)\n");
@@ -3936,7 +3944,19 @@ private:
     }
 
     bool aw_past_deadline() const {
-        return aw.deadline_ms >= 0 && ggml_time_ms() >= aw.deadline_ms;
+        const int64_t d = aw.deadline_ms.load(std::memory_order_relaxed);
+        return d >= 0 && ggml_time_ms() >= d;
+    }
+
+    // the writer is alive (called by the writer at every chunk and stage)
+    void aw_progress() {
+        std::lock_guard<std::mutex> lk(aw.mtx);
+        aw.last_progress_ms = ggml_time_ms();
+    }
+
+    // under aw.mtx: the writer has work and has shown no sign of life for stall_ms (a hung disk)
+    bool aw_stalled_locked() const {
+        return !aw_idle_locked() && aw.last_progress_ms >= 0 && ggml_time_ms() - aw.last_progress_ms >= aw.stall_ms;
     }
 
     // ---- capture side (server thread) -----------------------------------------------------------------
@@ -4028,8 +4048,19 @@ private:
                 // the ring of two chunks: wait for the writer to drain it, never past the shutdown deadline
                 std::unique_lock<std::mutex> lk(aw.mtx);
                 const size_t ring = 2 * aw.chunk;
-                aw.cv.wait(lk, [&]() { return aw.staged + cap <= ring || sc.st->aborted || aw_past_deadline(); });
-                if (sc.st->aborted || aw_past_deadline()) {
+                bool stalled = false;
+                while (!aw.cv.wait_for(lk, std::chrono::milliseconds(500),
+                                       [&]() { return aw.staged + cap <= ring || sc.st->aborted || aw_past_deadline(); })) {
+                    if (aw_stalled_locked()) {
+                        stalled = true;
+                        break;
+                    }
+                }
+                if (stalled || sc.st->aborted || aw_past_deadline()) {
+                    if (stalled) {
+                        SRV_WRN("slot %d: auto-save: the background writer made no progress for %" PRId64 " ms, "
+                                "abandoning a streamed save\n", sc.job->slot_id, aw.stall_ms);
+                    }
                     sc.failed = true;
                     return nullptr;
                 }
@@ -4037,6 +4068,13 @@ private:
             }
             sc.cur.buf.reset(new (std::nothrow) uint8_t[cap]);
             if (!sc.cur.buf) {
+                if (sc.job->mode == aw_mode::streamed) {
+                    {
+                        std::lock_guard<std::mutex> lk(aw.mtx);
+                        aw.staged -= std::min(aw.staged, cap); // the ring slot this chunk reserved
+                    }
+                    aw.cv.notify_all();
+                }
                 sc.failed = true;
                 return nullptr;
             }
@@ -4216,6 +4254,7 @@ private:
                     return; // closing, and nothing left
                 }
                 job = aw.jobs.front();
+                aw.last_progress_ms = ggml_time_ms();
             }
             aw_publish(*job);
             {
@@ -4252,6 +4291,7 @@ private:
                 job.reserved -= dec;
             }
             aw.staged -= std::min(aw.staged, dec);
+            aw.last_progress_ms = ggml_time_ms();
         }
         aw.cv.notify_all();
     }
@@ -4272,37 +4312,68 @@ private:
     enum class aw_wr { ok, aborted, failed, abandoned };
 
     // writes `st` into `path`, then fdatasyncs it. Timings accumulate into t_write / t_sync (us).
+    // Writeback is bounded as it goes: each chunk is pushed to the kernel and its writeback started, and the
+    // writer waits for the PREVIOUS chunk's writeback before taking the next, so at most two chunks of this
+    // file are dirty at any time. The final fdatasync then has little left to do (it would otherwise flush up
+    // to vm.dirty_ratio of RAM in one go, tens of seconds on a multi-GB unit, with no deadline check), and the
+    // writer's progress is visible chunk by chunk. Past the shutdown deadline the file is abandoned, also just
+    // before that final sync.
     aw_wr aw_write_stream(aw_job & job, aw_stream & st, const std::string & path, int64_t & t_write, int64_t & t_sync) {
         FILE * f = fopen(path.c_str(), "wb");
         bool ok = f != nullptr;
         aw_chunk c;
         bool aborted = false;
         const int64_t t0 = ggml_time_us();
-        while (aw_next_chunk(job, st, c, aborted)) {
-            if (ok && fwrite(c.buf.get(), 1, c.n, f) != c.n) {
-                ok = false;
-            }
-            aw_release_chunk(job, c);
-            c = {};
-            if (job.mode != aw_mode::sync && aw_past_deadline()) {
-                // shutdown deadline: stop between chunks, never publish a partial unit
-                if (f) {
-                    fclose(f);
-                }
-                aw_drain_stream(job, st);
-                std::error_code ec;
-                std::filesystem::remove(path, ec);
-                return aw_wr::abandoned;
-            }
-        }
-        t_write += ggml_time_us() - t0;
-        if (aborted) {
+        int64_t t_wb = 0;              // time spent waiting on writeback, counted as sync
+        off_t   off = 0, prev_off = 0; // start of the current and of the previous chunk
+        off_t   prev_len = 0;
+        auto drop = [&]() {
             if (f) {
                 fclose(f);
             }
             std::error_code ec;
             std::filesystem::remove(path, ec);
+        };
+        while (aw_next_chunk(job, st, c, aborted)) {
+            if (ok && fwrite(c.buf.get(), 1, c.n, f) != c.n) {
+                ok = false;
+            }
+#if defined(__linux__)
+            if (ok && fflush(f) != 0) {
+                ok = false;
+            }
+            if (ok) {
+                const int64_t tw = ggml_time_us();
+                const int fd = fileno(f);
+                sync_file_range(fd, off, (off_t) c.n, SYNC_FILE_RANGE_WRITE);
+                if (prev_len > 0) {
+                    sync_file_range(fd, prev_off, prev_len,
+                                    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+                }
+                t_wb += ggml_time_us() - tw;
+            }
+#endif
+            prev_off = off;
+            prev_len = (off_t) c.n;
+            off     += (off_t) c.n;
+            aw_release_chunk(job, c);
+            c = {};
+            if (job.mode != aw_mode::sync && aw_past_deadline()) {
+                // shutdown deadline: stop between chunks, never publish a partial unit
+                drop();
+                aw_drain_stream(job, st);
+                return aw_wr::abandoned;
+            }
+        }
+        t_write += ggml_time_us() - t0 - t_wb;
+        t_sync  += t_wb;
+        if (aborted) {
+            drop();
             return st.aborted ? aw_wr::aborted : aw_wr::abandoned;
+        }
+        if (job.mode != aw_mode::sync && aw_past_deadline()) {
+            drop();
+            return aw_wr::abandoned;
         }
         if (f) {
             const int64_t t1 = ggml_time_us();
@@ -4318,6 +4389,7 @@ private:
             std::filesystem::remove(path, ec);
             return aw_wr::failed;
         }
+        aw_progress();
         return aw_wr::ok;
     }
 
@@ -4469,7 +4541,23 @@ private:
                 return;
             }
         }
-        // a parent evicted (by a peer, or by our own LRU) while this delta was queued: drop it
+        // 2) atomic publish under the store lock: .bin, .logits, .dft (or remove a stale one), .meta last
+        aw_progress();
+        const int64_t t_p0 = ggml_time_us();
+        int timeout_ms = auto_store_lock::PUBLISH_TIMEOUT_MS;
+        const int64_t deadline_ms = aw.deadline_ms.load(std::memory_order_relaxed);
+        if (deadline_ms >= 0) {
+            timeout_ms = (int) std::clamp<int64_t>(deadline_ms - ggml_time_ms(), 0, timeout_ms);
+        }
+        auto_store_lock pub_lock(params_base.slot_save_path, /*exclusive=*/true, timeout_ms);
+        if (!pub_lock.held()) {
+            aw_fail(job, "timed out waiting for restores in progress to release the store lock");
+            finish();
+            return;
+        }
+        aw_progress();
+        // a parent evicted (by a peer, or by our own LRU) while this delta was queued: drop it. Checked under
+        // the lock, right before the renames, so the window left is a peer's LRU (deletes take no lock).
         if (job.is_node) {
             std::error_code pec;
             if (!std::filesystem::exists(slot_meta_sidecar_path(job.parent_fname), pec)) {
@@ -4477,18 +4565,6 @@ private:
                 finish();
                 return;
             }
-        }
-        // 2) atomic publish under the store lock: .bin, .logits, .dft (or remove a stale one), .meta last
-        const int64_t t_p0 = ggml_time_us();
-        int timeout_ms = auto_store_lock::PUBLISH_TIMEOUT_MS;
-        if (aw.deadline_ms >= 0) {
-            timeout_ms = (int) std::clamp<int64_t>(aw.deadline_ms - ggml_time_ms(), 0, timeout_ms);
-        }
-        auto_store_lock pub_lock(params_base.slot_save_path, /*exclusive=*/true, timeout_ms);
-        if (!pub_lock.held()) {
-            aw_fail(job, "timed out waiting for restores in progress to release the store lock");
-            finish();
-            return;
         }
         const std::string & fname = job.fname;
         std::error_code ec;
@@ -4568,6 +4644,7 @@ private:
                 auto_save_note_failure(job.slot_id, "snapshot is larger than --slot-save-max-mb", job.toks->size());
             }
         }
+        aw_progress();
         auto_reap_dead_temps();
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
