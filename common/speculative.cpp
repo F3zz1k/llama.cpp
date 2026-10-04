@@ -213,6 +213,8 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    // the target position the get_state() blob belongs to, -1 when unknown
+    virtual llama_pos get_state_pos(llama_seq_id /*seq_id*/) const { return -1; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -949,13 +951,20 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             return false;
         }
 
-        const llama_pos          pos = pending_pos_last[seq_id];
+        const llama_pos          pos = get_state_pos(seq_id);
         const std::vector<float> & g = pending_g_last[seq_id];
 
         data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
         std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
         std::memcpy(data.data() + sizeof(llama_pos), g.data(), g.size() * sizeof(float));
         return true;
+    }
+
+    llama_pos get_state_pos(llama_seq_id seq_id) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return -1;
+        }
+        return pending_pos_last[seq_id];
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
@@ -1846,13 +1855,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
             return false;
         }
-        const llama_pos pos = pending_pos[seq_id];
+        const llama_pos pos = get_state_pos(seq_id);
         const size_t    hb  = (size_t) n_embd * sizeof(float);
         data.resize(sizeof(uint32_t) + sizeof(llama_pos) + hb);
         std::memcpy(data.data(),                                        &STATE_TAG, sizeof(uint32_t));
         std::memcpy(data.data() + sizeof(uint32_t),                     &pos,       sizeof(llama_pos));
         std::memcpy(data.data() + sizeof(uint32_t) + sizeof(llama_pos), pending_h[seq_id].data(), hb);
         return true;
+    }
+
+    llama_pos get_state_pos(llama_seq_id seq_id) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return -1;
+        }
+        return pending_pos[seq_id];
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
@@ -3048,6 +3064,22 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         if (impl->get_state(seq_id, data)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_get_state_at(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data, llama_pos & pos) {
+    pos = -1;
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->get_state(seq_id, data)) {
+            pos = impl->get_state_pos(seq_id);
             return true;
         }
     }

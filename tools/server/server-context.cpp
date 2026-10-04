@@ -1982,13 +1982,23 @@ private:
         }
         // the draft's carry-over for the unit's last cell (MTP: h of that cell, which the first cell
         // decoded after a restore pairs with); without it that cell is built from a stale h
+        // The trailer is stamped with the position the blob ITSELF records, and written only when that
+        // is the unit's last cell: a carry-over that lags the target tail would otherwise be labelled as
+        // matching it and applied on restore (the restore compares the stamp with the target tail, and
+        // set_state adopts the blob's pos unchecked). Without a trailer the draft KV still restores; only
+        // the first suffix cell is built without the carry-over.
         std::vector<uint8_t> st;
-        if (common_speculative_get_state(spec.get(), slot.id, st) &&
-            !slot_draft_trailer_append(path, p1 - 1, st)) {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            metrics.n_auto_save_draft_skipped++;
-            return;
+        llama_pos st_pos = -1;
+        if (common_speculative_get_state_at(spec.get(), slot.id, st, st_pos)) {
+            if (st_pos != p1 - 1) {
+                SLT_DBG(slot, "auto-save: draft carry-over is at pos %d, not the unit tail %d; sidecar written without it\n",
+                        (int) st_pos, (int) (p1 - 1));
+            } else if (!slot_draft_trailer_append(path, st_pos, st)) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                metrics.n_auto_save_draft_skipped++;
+                return;
+            }
         }
         metrics.n_auto_save_draft++;
     }
