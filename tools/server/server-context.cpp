@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -43,6 +45,8 @@
 
 #ifndef _WIN32
 #include <unistd.h> // getpid() for per-writer-unique temp filenames (cross-process atomicity)
+#include <fcntl.h>
+#include <sys/file.h> // flock() for the store lock (auto_store_lock)
 #else
 #include <process.h> // _getpid()
 #define getpid _getpid
@@ -58,6 +62,89 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Cross-process lock on a slot-save directory that pairs every unit's .bin with its .meta (fork).
+//
+// A unit is published as separate renames (.bin, .logits, .dft, then .meta) under a deterministic
+// name, and peers sharing the directory can publish DIFFERENT content under one name: a whole root
+// and a delta for the same tokens, chosen because their indexes saw different parents. Without a
+// lock a reader can read one writer's .meta and then open the other writer's .bin. The dangerous
+// interleave is a root .meta with a delta .bin: the bin header carries the full [0, N) token list in
+// both formats, so the single clearing load of cells [L, N) is accepted and the slot holds a silent
+// wrong state. (The opposite pair is caught by the NO_CLEAR overlap check in the kv reader, and a
+// post-load pos_min check cannot close it generically: iSWA, recurrent, hybrid and DSV4 legitimately
+// report pos_min > 0 after a correct whole restore.)
+//
+// Publishers hold the lock EXCLUSIVE for the rename sequence only (milliseconds). Restores hold it
+// SHARED from re-reading the chain's .meta files until the state files are loaded, so what they load
+// is exactly what those .meta files describe. Deletes (LRU, orphan reaping) take no lock: a reader
+// that loses a file fails its load cleanly, and a re-publish under the name waits for the reader.
+// The lock is flock(2) on the directory itself, so it creates no file and needs no cleanup. Waiting
+// is bounded: on timeout a publish is skipped and a restore falls back to a cold prefill, both
+// ordinary cache misses (invariant 4). A filesystem that does not support flock fails OPEN with one
+// warning, i.e. the behaviour before this lock existed. On Windows it is a no-op for the same reason.
+class auto_store_lock {
+public:
+    auto_store_lock(const std::string & dir, bool exclusive, int timeout_ms) {
+#ifndef _WIN32
+        fd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) {
+            return; // no directory: nothing to pair, and nothing can be published or restored there
+        }
+        const int op = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (true) {
+            if (::flock(fd, op) == 0) {
+                ok = true;
+                return;
+            }
+            if (errno != EWOULDBLOCK && errno != EINTR) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    SRV_WRN("slot-save store lock unsupported on %s (errno %d); peers sharing it are unpaired\n",
+                            dir.c_str(), errno);
+                }
+                ::close(fd);
+                fd = -1;
+                ok = true; // fail open: the pre-lock behaviour
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+#else
+        (void) dir; (void) exclusive; (void) timeout_ms;
+        ok = true;
+#endif
+    }
+    ~auto_store_lock() { release(); }
+    auto_store_lock(const auto_store_lock &) = delete;
+    auto_store_lock & operator=(const auto_store_lock &) = delete;
+
+    bool held() const { return ok; }
+
+    void release() {
+#ifndef _WIN32
+        if (fd >= 0) {
+            ::flock(fd, LOCK_UN);
+            ::close(fd);
+            fd = -1;
+        }
+#endif
+        ok = false;
+    }
+
+    // a publish waits out restores in progress (seconds for a multi-GB chain); a restore waits out a
+    // rename sequence (milliseconds)
+    static constexpr int PUBLISH_TIMEOUT_MS = 30000;
+    static constexpr int RESTORE_TIMEOUT_MS = 10000;
+
+private:
+    int  fd = -1;
+    bool ok = false;
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -3176,6 +3263,14 @@ private:
                                const server_tokens & req, int n_keep_mem) {
         // read the small .meta sidecar (tokens + fp + media records) — never opens the multi-GB
         // state file (invariant 5).
+        // Shared store lock from this .meta read until the chain is loaded: every .meta read below
+        // (the tip here, each parent in auto_build_restore_chain) then describes the .bin loaded for it.
+        auto_store_lock rd_lock(std::filesystem::path(cand.state_path).parent_path().string(),
+                                /*exclusive=*/false, auto_store_lock::RESTORE_TIMEOUT_MS);
+        if (!rd_lock.held()) {
+            SLT_WRN(slot, "auto-restore: store lock busy, skipping %s\n", cand.state_path.c_str());
+            return 0; // invariant 4
+        }
         model_fp disk_fp;
         llama_tokens disk_toks;
         std::vector<server_media_record> disk_media;
@@ -3324,7 +3419,9 @@ private:
         slot.prompt.tokens.clear();
         slot.prompt.checkpoints.clear();
 
-        if (!do_slot_restore(slot, chain)) {
+        const bool restored_ok = do_slot_restore(slot, chain);
+        rd_lock.release(); // the state files are loaded (or the load failed); nothing below reads the store
+        if (!restored_ok) {
             // restore failed -> do_slot_restore dropped the slot's seq on both contexts; caller reprefills (invariant 4).
             metrics.n_auto_restore_failed++;
             SLT_WRN(slot, "auto-restore: loading %s failed after the slot was cleared; trying a shorter "
@@ -3661,6 +3758,19 @@ private:
         }
         // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
         //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
+        //    The whole sequence runs under the store lock, so no restore can pair this .bin with the
+        //    .meta of another writer that published under the same name (auto_store_lock).
+        auto_store_lock pub_lock(params_base.slot_save_path, /*exclusive=*/true, auto_store_lock::PUBLISH_TIMEOUT_MS);
+        if (!pub_lock.held()) {
+            std::error_code lec;
+            std::filesystem::remove(tmp, lec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), lec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), lec);
+            std::filesystem::remove(slot_draft_sidecar_path(tmp), lec);
+            auto_save_note_failure(slot, "timed out waiting for restores in progress to release the store lock",
+                                   snap_toks.size());
+            return; // invariant 4
+        }
         std::error_code ec;
         std::filesystem::rename(tmp, fname, ec);
         if (ec) {
@@ -3703,6 +3813,7 @@ private:
             auto_save_note_failure(slot, "rename of the .meta sidecar into place failed", snap_toks.size());
             return; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
+        pub_lock.release(); // the unit is whole on disk; LRU enforcement below takes no lock
 
         if (media.empty()) {
             SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", snap_toks.size(), fname.c_str());
@@ -6142,6 +6253,14 @@ private:
                     // from the sidecar. Every other file takes upstream's body below, unchanged.
                     std::error_code meta_ec;
                     if (std::filesystem::exists(slot_meta_sidecar_path(filepath), meta_ec) && !meta_ec) {
+                        // shared store lock until the chain and its media sidecar are read (auto_store_lock)
+                        auto_store_lock rd_lock(std::filesystem::path(filepath).parent_path().string(),
+                                                /*exclusive=*/false, auto_store_lock::RESTORE_TIMEOUT_MS);
+                        if (!rd_lock.held()) {
+                            send_error(task, "Unable to restore slot: the slot-save store is busy, retry",
+                                       ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
                         // Compose the restore chain (U9 / decision 2). A whole unit (v1/v2 snapshot, parent 0)
                         // restores as a single clearing load. But the same directory may hold an auto-cache
                         // v3/v4 DELTA tip whose .bin
