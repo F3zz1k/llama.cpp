@@ -100,8 +100,8 @@ default `0` changes nothing until you measure your own restore-vs-reprocess cros
 ## Two rules for a shared directory
 
 1. **Identical fingerprints.** Every instance writing to one `--slot-save-path` must agree on the
-   fingerprint-affecting flags — `-c` / `--ctx-size`, `--cache-type-k` / `--cache-type-v`,
-   `--slot-save-block`, the model, the mmproj, and RoPE settings. A snapshot from a mismatched
+   fingerprint-affecting flags: `--cache-type-k` / `--cache-type-v`, `--slot-save-block`, the model,
+   the mmproj, and RoPE settings. `-c` / `--ctx-size` is not one of them (see context rungs below). A snapshot from a mismatched
    instance is rejected (it is never restored into an incompatible context), so a mismatch silently
    disables cross-instance reuse rather than corrupting anything.
 2. **Keep the prefix bit-stable.** Restore and delta-chaining need turn *N*'s tokens to be an exact
@@ -146,12 +146,17 @@ without speculation: the target `.bin` is the same either way, and an instance w
 simply ignores the sidecars.
 
 **Context rungs (the same model at several context sizes, e.g. 1 GPU at 131072 and 2 GPUs at
-262144).** A conversation that outgrows the small rung restores its snapshots into the larger one,
-provided every rung uses identical fingerprint fields apart from `-c`: same model file, same
+262144, or a lower-context vision variant beside the text one).** `-c` is not part of the
+fingerprint: no memory class writes anything that depends on the cache size (the audit is on
+`model_fp::fp_n_ctx` in `tools/server/server-common.h`). Rungs therefore name units alike, never keep
+two copies of one prefix, continue each other's delta chains, and restore each other's units in both
+directions whenever the unit fits the reader's context (a longer one is skipped before its file is
+opened). They must use identical fingerprint fields otherwise: same model file, same
 `--cache-type-k/v`, same `--slot-save-block`, and the **same RoPE/YaRN settings**
 (`--rope-scaling`, `--rope-scale`, `--yarn-orig-ctx`, ...). The GPU count and tensor split are not
-part of the fingerprint. The reverse direction (a large snapshot into a smaller context) is refused,
-and models with a sliding window (iSWA) only restore at an identical `-c`.
+part of the fingerprint. The one way `-c` reaches the KV is LongRoPE (`rope_factors_long` /
+`rope_factors_short`, chosen by `n_ctx_seq > n_ctx_orig_yarn`), so which side of that threshold a rung
+sits on is part of the fingerprint.
 
 ## Speculative decoding and the cache
 

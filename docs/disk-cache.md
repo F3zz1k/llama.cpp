@@ -61,10 +61,14 @@ pre-cache): the whole system prompt is saved.
     --slot-save-context-min-tokens 4096    # the smallest system prefix worth its own node (default)
 ```
 
-**Context rungs** (the same model at several `-c`, e.g. 1 GPU at 131072 and 2 GPUs at 262144): point
-them at the same store. A conversation restores from a smaller rung into a larger one when every rung
-has the same model file, KV cache types, `--slot-save-block` and RoPE/YaRN settings. A larger snapshot
-never restores into a smaller context, and sliding-window models only restore at an identical `-c`.
+**Context rungs** (the same model at several `-c`, e.g. 1 GPU at 131072 and 2 GPUs at 262144, or a
+lower-context vision variant beside the text one): point them at the same store. `-c` is not part of a
+unit's identity, so the rungs name units alike, deduplicate them and continue each other's delta chains,
+and a unit restores into any rung whose context holds it, in either direction, for every model class
+(sliding-window and recurrent included). They must still agree on the model file, KV cache types,
+`--slot-save-block`, the mmproj and the RoPE/YaRN settings. The one exception is a LongRoPE model (Phi-3
+style `rope_factors_long`/`rope_factors_short`): rungs on opposite sides of its original context use
+different factors, so they do not share.
 
 ## Flags
 
@@ -193,9 +197,13 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   the change (the index is rebuilt from the `.meta` files), but an older binary that saves a delta onto
   a newer unit names a parent that does not exist, so that delta is dead weight. Purge the store when
   moving between the two in either direction.
-- Every instance writing to one directory must agree on the model, `-c` (except for the rung rule above),
-  `--cache-type-k/v`, `--slot-save-block`, the mmproj and the RoPE settings; a unit from a mismatched
-  instance is refused, never restored into the wrong context.
+- Every instance writing to one directory must agree on the model, `--cache-type-k/v`,
+  `--slot-save-block`, the mmproj and the RoPE settings (`-c` may differ, see the rung rule above); a
+  unit from a mismatched instance is refused, never restored into the wrong context.
+- Since `-c` left the unit identity, every unit name has a new prefix. Units written before the change
+  still index and restore, chains included (a delta's parent is resolved under the tip's own prefix),
+  but no new delta is linked onto them, so they age out. Purging the store at deploy is the clean
+  option, as for any naming change.
 - Restore needs the prefix to be token-identical. A date or a counter rendered into the system prompt
   changes it every turn and defeats the cache.
 - One store, one cap: `--slot-save-max-mb` is enforced over the whole directory by whichever instance

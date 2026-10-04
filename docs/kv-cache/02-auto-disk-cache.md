@@ -44,7 +44,7 @@ The hash is purely a candidate-*narrowing* accelerator so we don't scan every sn
 
 ## 4. The fingerprint (`model_fp`)
 
-Computed once at load (`auto_compute_fingerprint`), compared by exact equality. Fields: model-desc hash (+ size/n_params/n_embd/n_layer), n_vocab, n_ctx_train, rope_type, **cache_type_k/v**, n_ctx, FULL-vs-attention, block size, **rope_freq_scale**, **rope_freq_base + all five YaRN params**, LoRA-set hash, and an **mmproj-loaded** bit.
+Computed once at load (`auto_compute_fingerprint`), compared by exact equality (`restore_compatible`). Fields: model-desc hash (+ size/n_params/n_embd/n_layer), n_vocab, n_ctx_train, rope_type, **cache_type_k/v**, FULL-vs-attention, block size, **rope_freq_scale**, **rope_freq_base + all five YaRN params**, LoRA-set hash, and an **mmproj-loaded** bit, plus the LongRoPE regime (`n_ctx > n_ctx_orig_yarn`). n_ctx itself is persisted as a capacity record, not compared: a unit restores into any context that holds its cells (`fits_ctx`), checked before its state file is opened.
 
 ### Why so many fields?
 `llama_state_seq_save_file` serializes the raw KV blob. Loading it into a context with *different KV geometry* silently corrupts:
@@ -58,7 +58,7 @@ The "use model default" cases (rope_freq_base==0, YaRN floats <0, yarn_orig_ctx<
 
 ## 5. On-disk format & atomicity
 
-Each snapshot is a 3-file unit sharing a base name `auto-<fp>-<chainhash>-<ntokens>.bin`, where `<fp>` is a fingerprint of the full runtime identity (`model_fp::identity_hash` — model plus cache-type/context/rope/YaRN/projector), so two instances that differ in any of those get disjoint names in a shared dir rather than clobbering each other:
+Each snapshot is a 3-file unit sharing a base name `auto-<fp>-<chainhash>-<ntokens>.bin`, where `<fp>` is a fingerprint of the full runtime identity (`model_fp::identity_hash`: model plus cache-type/rope/YaRN/projector, but not n_ctx, so context rungs share names), so two instances that differ in any of those get disjoint names in a shared dir rather than clobbering each other:
 - `.bin` (the libllama state; this fork does not change its format, but **upstream versions it**:
   see [`README.md`](README.md#engine-state-file-format-bin-and-upstream-version-bumps) for what a
   `LLAMA_STATE_SEQ_VERSION` bump does to an existing store, which happened at the 2026-08-29 merge);
