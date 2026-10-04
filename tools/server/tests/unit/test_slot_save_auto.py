@@ -60,6 +60,28 @@ EMITTED_BIN_SHA256_PER_BACKEND = {
     "cpu":      "c97f4c568102edae478b21e7ac7937e2a437e0e76e8f9410a313d59f0ebc8cc7",
 }
 
+
+def _server_backend() -> str:
+    """The backend the server under test computes on, so the .bin is checked against THAT backend's
+    capture only. LLAMA_TEST_BACKEND overrides; otherwise the GPU backend libraries next to the binary
+    (build tree: bin/, release: ../lib) decide, and a build with none of them is the CPU backend."""
+    env = os.environ.get("LLAMA_TEST_BACKEND", "")
+    if env:
+        assert env in EMITTED_BIN_SHA256_PER_BACKEND, f"LLAMA_TEST_BACKEND={env} has no frozen capture"
+        return env
+    server_bin = os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server")
+    names: set[str] = set()
+    for d in (os.path.dirname(server_bin), os.path.join(os.path.dirname(server_bin), "..", "lib")):
+        if os.path.isdir(d):
+            names |= set(os.listdir(d))
+    if any(n.startswith("libggml-sycl") for n in names):
+        return "gpu-sycl"
+    other_gpu = [n for n in names if n.startswith(("libggml-cuda", "libggml-vulkan", "libggml-hip", "libggml-metal", "libggml-opencl"))]
+    assert not other_gpu, f"no frozen capture for this backend ({other_gpu}); set LLAMA_TEST_BACKEND"
+    assert any(n.startswith("libggml-cpu") for n in names) or not names, \
+        "cannot tell the backend from the files next to the server binary; set LLAMA_TEST_BACKEND"
+    return "cpu"
+
 # exact prompt the fixture was captured with (tokenizes to >= 1 hash block of 256)
 GOLDEN_PROMPT = "Once upon a time there was a little dog named Spot. " * 24
 GOLDEN_REQUEST = {
@@ -147,8 +169,9 @@ def test_text_only_meta_byte_identical():
         with open(os.path.join(CACHE_DIR, name), "rb") as f:
             actual = hashlib.sha256(f.read()).hexdigest()
         if name.endswith(".bin"):
-            assert actual in EMITTED_BIN_SHA256_PER_BACKEND.values(), \
-                f"{name}: emitted bytes match no backend's frozen capture ({actual})"
+            backend = _server_backend()
+            assert actual == EMITTED_BIN_SHA256_PER_BACKEND[backend], \
+                f"{name}: emitted bytes differ from the {backend} frozen capture ({actual})"
         else:
             assert actual == expected, f"{name}: emitted bytes differ from the golden fixture"
 
@@ -1155,6 +1178,29 @@ MEDIA_MARKER = "<__media__>"  # mtmd_default_marker()
 IMG_B64 = IMG_DATA_URI.split(",", 1)[1]
 IMG2_B64 = IMG2_DATA_URI.split(",", 1)[1]
 MEDIA_PROMPT = VISION_TEXT_PRE + MEDIA_MARKER + " Describe it now."
+# Batch-split noise on this tiny Q8 model, measured 2026-10-03 on CPU with NO restore involved: a
+# 386-token text prompt re-sent in-process (its tail re-decoded from a checkpoint, 5 tokens) moves the
+# first token's top-8 logprobs by 0.042 against the cold prefill; a 1-token re-decode after a restore of
+# MEDIA_PROMPT moves them by 0.036 (the same on main-patched 593c2d0d7). Short prompts show exactly 0.
+MEDIA_SPLIT_TOL = 0.1
+
+
+def assert_media_close_to_cold(vs_cold: ServerProcess, prompt: str, files: list, warm_body, other_files: list):
+    """Independent oracle for a restored media state: the first token's top-8 logprobs against a cold
+    prefill of the same prompt in a process that never restored anything. The restored run decodes the
+    last prompt token in another batch split, which on this model moves the logprobs by float noise
+    (MEDIA_SPLIT_TOL, measured), so equality of the greedy text is not a valid criterion. The oracle is
+    shown to discriminate on every run: the same prompt with a different image must differ from the
+    cold one by more than the tolerance, or the check proves nothing and fails."""
+    cold = raw_media_request_body(vs_cold, prompt, files, n_predict=1, n_probs=8)
+    assert cold["timings"]["cache_n"] == 0, "the oracle must prefill cold"
+    other = raw_media_request_body(vs_cold, prompt, other_files, n_predict=1, n_probs=8)
+    lp_warm, lp_cold, lp_other = (first_token_logprobs(b) for b in (warm_body, cold, other))
+    worst = max(abs(lp_warm[k] - lp_cold[k]) if k in lp_warm else float("inf") for k in lp_cold)
+    contrast = max(abs(lp_other[k] - lp_cold[k]) if k in lp_other else float("inf") for k in lp_cold)
+    print(f"restored vs cold first-token logprobs: max diff {worst:.3g}; other image vs cold {contrast:.3g}")
+    assert contrast > MEDIA_SPLIT_TOL, f"the oracle cannot tell two images apart ({contrast:.3g})"
+    assert worst <= MEDIA_SPLIT_TOL, f"restored state differs from cold by {worst:.3g}"
 
 
 def make_manual_vision_server() -> ServerProcess:
@@ -1165,19 +1211,31 @@ def make_manual_vision_server() -> ServerProcess:
     return vs
 
 
-def raw_media_request(vs: ServerProcess, prompt_string: str, files: list, n_predict: int = 8):
-    """/completion with a raw prompt string + media files: byte-stable across resends
-    (no chat-template re-render), which is what snapshot-matching follow-ups need."""
-    res = vs.make_request("POST", "/completion", data={
+def raw_media_request_body(vs: ServerProcess, prompt_string: str, files: list, n_predict: int = 8, n_probs: int = 0):
+    data = {
         "prompt": {"prompt_string": prompt_string, "multimodal_data": files},
         "n_predict": n_predict,
         "temperature": 0,
         "cache_prompt": True,
         "id_slot": 0,
-    })
+    }
+    if n_probs > 0:
+        data.update({"n_probs": n_probs, "post_sampling_probs": False})
+    res = vs.make_request("POST", "/completion", data=data)
     assert res.status_code == 200
-    t = res.body["timings"]
-    return t["prompt_n"], t["cache_n"], res.body["content"]
+    return res.body
+
+
+def raw_media_request(vs: ServerProcess, prompt_string: str, files: list, n_predict: int = 8):
+    """/completion with a raw prompt string + media files: byte-stable across resends
+    (no chat-template re-render), which is what snapshot-matching follow-ups need."""
+    body = raw_media_request_body(vs, prompt_string, files, n_predict)
+    t = body["timings"]
+    return t["prompt_n"], t["cache_n"], body["content"]
+
+
+def first_token_logprobs(body) -> dict:
+    return {t["id"]: t["logprob"] for t in body["completion_probabilities"][0]["top_logprobs"]}
 
 
 def test_manual_slots_text_on_vision_server():
@@ -1295,11 +1353,21 @@ def test_manual_media_save_restore_continues():
     assert _file_bytes("media-rt.bin") == _file_bytes("media.bin")
     assert _file_bytes("media-rt.bin.meta") == _file_bytes("media.bin.meta")
 
-    prompt_n_warm, cache_n_warm, content_warm = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    warm = raw_media_request_body(vs, MEDIA_PROMPT, [IMG_B64], n_probs=8)
+    prompt_n_warm, cache_n_warm, content_warm = warm["timings"]["prompt_n"], warm["timings"]["cache_n"], warm["content"]
     assert cache_n_warm >= media[0]["start_idx"] + n_img  # every image cell came from the restore
     assert prompt_n_warm <= 8                             # the image was NOT re-processed
     assert prompt_n_warm == prompt_n_ref                  # same split as the reference ...
     assert content_warm == content_ref                    # ... so the same answer
+    vs.stop()
+
+    # INDEPENDENT oracle, no restore anywhere: a fresh process prefills the same prompt cold. Its
+    # greedy text may differ from the restored run's on this tiny model (the last prompt token is decoded
+    # in another batch split), so the criterion is the first token's top-8 distribution, which a wrong
+    # restored state would move by far more than float noise.
+    vs = make_manual_vision_server()
+    vs.start()
+    assert_media_close_to_cold(vs, MEDIA_PROMPT, [IMG_B64], warm, [IMG2_B64])
     vs.stop()
 
 
@@ -1335,8 +1403,24 @@ def test_manual_media_restore_stub_never_encoded():
     assert out_b == ref_b
 
     # and the original image request answers exactly like the reference sequence
-    out_a = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
+    body_a = raw_media_request_body(vs, MEDIA_PROMPT, [IMG_B64], n_probs=8)
+    out_a = (body_a["timings"]["prompt_n"], body_a["timings"]["cache_n"], body_a["content"])
     assert out_a == ref_a
+    vs.stop()
+
+    # INDEPENDENT oracles, no restore and no stub anywhere. The different image: on this sliding-window
+    # model it cannot rewind into the restored state, so the stub run processes it in full, exactly as a
+    # fresh cold process does (asserted: same split, same answer). The original image afterwards: its
+    # first-token distribution against a cold prefill, within the measured split noise.
+    vs = make_manual_vision_server()
+    vs.start()
+    cold_b = raw_media_request(vs, MEDIA_PROMPT, [IMG2_B64])
+    vs.stop()
+    assert cold_b[:2] == out_b[:2], f"oracle split {cold_b[:2]} vs stub run {out_b[:2]}"
+    assert cold_b[2] == out_b[2]
+    vs = make_manual_vision_server()
+    vs.start()
+    assert_media_close_to_cold(vs, MEDIA_PROMPT, [IMG_B64], body_a, [IMG2_B64])
     vs.stop()
 
 
