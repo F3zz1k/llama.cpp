@@ -19,8 +19,9 @@ from utils import *
 #
 # Geometry traps: llama_context pads n_ctx to a multiple of 256 and the server caps n_ctx at
 # n_ctx_train, so the rungs are 256 and 512 and every dummy (context_length 256) gets
-# --override-kv context_length=1024. The dummies also carry rope.scaling.original_context_length=256,
-# which would put the 512 rung on the long side of the rope threshold, so it is raised to 1024 too.
+# --override-kv context_length=1024. The dummies also carry rope.scaling.original_context_length=256;
+# it is raised to 1024 so that only the LongRoPE tests below depend on where it sits (on a model without
+# LongRoPE factors it no longer splits anything, test_original_context_splits_only_longrope_models).
 # The instrument asserts the two live n_ctx values differ, so a collapsed geometry fails loudly.
 
 ROOT = "./tmp/slot_save_cross_rung"
@@ -57,7 +58,7 @@ def _arch_of(path):
     return re.sub(r"-(dense|moe)\.gguf$", "", base)
 
 
-def _server(kind, cache_dir, log_path, n_ctx, n_ubatch, auto=True, ctx_train=1024, rope_orig=1024):
+def _server(kind, cache_dir, log_path, n_ctx, n_ubatch, auto=True, ctx_train=1024, rope_orig=1024, **extra):
     if kind == "tinyllama":
         s = ServerPreset.tinyllama2()
     else:
@@ -91,6 +92,9 @@ def _server(kind, cache_dir, log_path, n_ctx, n_ubatch, auto=True, ctx_train=102
         s.slot_restore_min_tokens = 0
         s.slot_save_idle_seconds = IDLE
         s.slot_save_node_prompt = "off"
+    for k, v in extra.items():
+        assert hasattr(s, k), k
+        setattr(s, k, v)
     return s
 
 
@@ -299,6 +303,130 @@ def test_rungs_across_the_rope_threshold_do_not_share(tmp_path):
     n, ids = run(BIG, (768, 32), "same-side")
     assert n >= len(BASE) - 1
     assert len(ids) == 1, ids
+
+
+def _seed_then_read(kind, cache, tmp_path, sub, w_cfg, r_cfg, w_kw=None, r_kw=None):
+    """Writer saves BASE (+gen); a reader with its own config asks for BASE + [42]. Returns the reader's
+    restored token count, its log and the identity prefixes on disk after both ran."""
+    w = _server(kind, cache, str(tmp_path / f"{sub}-w.log"), *w_cfg, **(w_kw or {}))
+    w.start()
+    w_ctx = _n_ctx(w)
+    _complete(w, BASE)
+    _wait_meta(cache, 1, IDLE + 15)
+    w.stop()
+    r = _server(kind, cache, str(tmp_path / f"{sub}-r.log"), *r_cfg, **(r_kw or {}))
+    r.start()
+    r_ctx = _n_ctx(r)
+    body = _complete(r, BASE + [42])
+    _wait_meta(cache, 2, IDLE + 15)
+    r.stop()
+    return body["timings"].get("cache_disk_n", 0), _log(str(tmp_path / f"{sub}-r.log")), _identities(cache), w_ctx, r_ctx
+
+
+def test_rope_threshold_is_the_models_own_not_yarn_orig_ctx(tmp_path):
+    """--yarn-orig-ctx sets cparams.n_ctx_orig_yarn only; get_rope_factors compares n_ctx_seq against
+    hparams.n_ctx_orig_yarn (the GGUF original context, 256 here). Rungs at 512 (long factors) and 256
+    (short) both started with --yarn-orig-ctx 128 are on opposite sides of the REAL threshold and must
+    not share, although a threshold rebuilt from --yarn-orig-ctx puts both on the long side."""
+    kind = "phi3-dense"
+    _need_dummy(kind)
+    kw = {"yarn_orig_ctx": 128, "rope_orig": None}   # keep the GGUF original context (256)
+    cache = os.path.join(ROOT, "c")
+    os.makedirs(cache)
+    n, log, ids, w_ctx, r_ctx = _seed_then_read(kind, cache, tmp_path, "yoc", BIG, SMALL, kw, kw)
+    assert (w_ctx, r_ctx) == (512, 256), (w_ctx, r_ctx)
+    assert n == 0
+    assert "cross-ctx reuse" not in log
+    assert len(ids) == 2, ids
+    # control: two rungs on the long side of the real threshold, same flags, still share
+    cache2 = os.path.join(ROOT, "c2")
+    os.makedirs(cache2)
+    n, _, ids, _, _ = _seed_then_read(kind, cache2, tmp_path, "yoc2", BIG, (768, 32), kw, kw)
+    assert n >= len(BASE) - 1
+    assert len(ids) == 1, ids
+
+
+@pytest.mark.parametrize("kind", ["tinyllama", "llama-dense"])
+def test_original_context_splits_only_longrope_models(kind, tmp_path):
+    """A model without LongRoPE factors may still carry rope.scaling.original_context_length (YaRN baked
+    into the GGUF). Its rungs on both sides of that value write identical bytes and must share."""
+    _need_dummy(kind)
+    cache = os.path.join(ROOT, "c")
+    os.makedirs(cache)
+    if kind == "tinyllama":
+        kw = {"override_kv": ["llama.rope.scaling.original_context_length=int:256"]}
+    else:
+        kw = {"rope_orig": 256}                     # _server writes the override for a dummy
+    n, log, ids, w_ctx, r_ctx = _seed_then_read(kind, cache, tmp_path, "orig", BIG, SMALL, kw, kw)
+    assert w_ctx > 256 >= r_ctx, (w_ctx, r_ctx)
+    assert n >= len(BASE) - 1
+    assert "cross-ctx reuse" in log
+    assert len(ids) == 1, ids
+
+
+@pytest.mark.parametrize("w_kw,r_kw,what", [
+    ({"fa": "on"},  {"fa": "off"}, "v_trans"),
+    ({"n_slots": 1}, {"n_slots": 2}, "n_stream"),
+])
+def test_kv_layout_splits_identity(w_kw, r_kw, what, tmp_path):
+    """V transposition (-fa off) and the KV stream count are refused on mismatch by the state reader.
+    Peers differing in either must name units apart and never attempt each other's units; peers
+    agreeing on them share (the second half, a positive control)."""
+    kind = "tinyllama"
+    cache = os.path.join(ROOT, "c")
+    os.makedirs(cache)
+    r_cfg = (BIG[0] * 2, BIG[1]) if what == "n_stream" else BIG   # n_ctx is split across the streams
+    n, log, ids, _, _ = _seed_then_read(kind, cache, tmp_path, what, BIG, r_cfg, w_kw, r_kw)
+    assert n == 0
+    assert "failed after the slot was cleared" not in log
+    assert "incompatible V transposition" not in log and "n_stream mismatch" not in log
+    assert len(ids) == 2, ids
+    cache2 = os.path.join(ROOT, "c2")
+    os.makedirs(cache2)
+    n, _, ids, _, _ = _seed_then_read(kind, cache2, tmp_path, what + "-ctl", BIG, r_cfg, r_kw, r_kw)
+    assert n >= len(BASE) - 1
+    assert len(ids) == 1, ids
+
+
+def test_store_lock_pairs_publish_and_restore(tmp_path):
+    """The directory flock protocol: a publish waits while a restore holds the lock shared, and a
+    restore is skipped (cold, no failed load) while a publish holds it exclusive."""
+    import fcntl
+    kind = "tinyllama"
+    cache = os.path.join(ROOT, "c")
+    os.makedirs(cache)
+    fd = os.open(cache, os.O_RDONLY)
+    try:
+        # a "restore in progress": the idle save of the writer must not land while it lasts
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        w = _server(kind, cache, str(tmp_path / "w.log"), *BIG)
+        w.start()
+        _complete(w, BASE)
+        time.sleep(IDLE + 4)
+        assert _wait_meta(cache, 1, 0.1) == []
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        assert len(_wait_meta(cache, 1, IDLE + 15)) >= 1     # it lands once the lock is free
+        w.stop()
+
+        # a "publish in progress": a restore must not read the store while it lasts
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        r = _server(kind, cache, str(tmp_path / "r.log"), *BIG)
+        r.start()
+        busy = _complete(r, BASE + [42])
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        r.stop()
+        log = _log(str(tmp_path / "r.log"))
+        assert busy["timings"].get("cache_disk_n", 0) == 0
+        assert "store lock busy" in log
+        assert "failed after the slot was cleared" not in log
+    finally:
+        os.close(fd)
+    # control: with the lock free the same request restores
+    r2 = _server(kind, cache, str(tmp_path / "r2.log"), *BIG)
+    r2.start()
+    hit = _complete(r2, BASE + [42])
+    r2.stop()
+    assert hit["timings"].get("cache_disk_n", 0) >= len(BASE) - 1, hit["timings"]
 
 
 def test_chain_named_under_an_earlier_identity_rule_restores_and_is_not_extended(tmp_path):

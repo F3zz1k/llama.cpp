@@ -110,6 +110,7 @@ class ServerProcess:
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     override_kv: List[str] | None = None  # KEY=TYPE:VALUE entries for --override-kv
+    yarn_orig_ctx: int | None = None
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
@@ -276,6 +277,8 @@ class ServerProcess:
             server_args.append("--verbose")
         if self.override_kv:
             server_args.extend(["--override-kv", ",".join(self.override_kv)])
+        if self.yarn_orig_ctx is not None:
+            server_args.extend(["--yarn-orig-ctx", self.yarn_orig_ctx])
         if self.lora_files:
             for lora_file in self.lora_files:
                 server_args.extend(["--lora", lora_file])
