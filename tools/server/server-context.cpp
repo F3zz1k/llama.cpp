@@ -3322,7 +3322,10 @@ private:
         // invariant 4: a skipped save never affects generation).
         {
             const size_t sz_state = llama_state_seq_get_size(ctx, slot.id);
-            const size_t sz_need  = sz_state + snap_toks.size() * sizeof(llama_token);
+            // the .dft draft sidecar (when a draft context exists) is written beside the state file and
+            // counts against the same filesystem; its whole draft state bounds it from above
+            const size_t sz_dft   = ctx_dft ? llama_state_seq_get_size(ctx_dft, slot.id) : 0;
+            const size_t sz_need  = sz_state + sz_dft + snap_toks.size() * sizeof(llama_token);
             std::error_code sec;
             const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
             if (sec || sinfo.available < sz_need + sz_need / 10) {
