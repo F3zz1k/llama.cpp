@@ -4161,6 +4161,43 @@ private:
         return true;
     }
 
+    // A restore is about to look up the disk index: if the writer still holds a unit that is a usable
+    // prefix of this request (longer than what memory already matches by a block), wait for it to be
+    // published, bounded. Waiting out a write (seconds) beats re-prefilling the prefix, and nothing is
+    // read from the queue itself: the restore then reads only published units.
+    void aw_wait_pending_prefix(const server_tokens & request, int32_t n_past) {
+        if (!aw.running) {
+            return;
+        }
+        std::unique_lock<std::mutex> lk(aw.mtx);
+        if (aw.jobs.empty()) {
+            return;
+        }
+        const llama_tokens & req = request.get_cell_tokens();
+        const size_t floor = (size_t) std::max(0, n_past) + (size_t) std::max(1, params_base.slot_save_block);
+        std::vector<std::shared_ptr<aw_job>> want;
+        for (const auto & j : aw.jobs) {
+            const llama_tokens & t = *j->toks;
+            if (!j->done && t.size() >= floor && t.size() <= req.size() && std::equal(t.begin(), t.end(), req.begin())) {
+                want.push_back(j);
+            }
+        }
+        if (want.empty()) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        const bool all = aw.cv.wait_for(lk, std::chrono::milliseconds(AW_PENDING_WAIT_MS), [&]() {
+            for (const auto & j : want) {
+                if (!j->done) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        SRV_INF("auto-restore: waited %.1f ms for %zu queued unit(s) that prefix this request%s\n",
+                (ggml_time_us() - t0) / 1000.0, want.size(), all ? "" : " (timed out)");
+    }
+
     // ---- publish side (writer thread, or the server thread in sync mode) -------------------------------
 
     void aw_loop() {
@@ -4629,6 +4666,14 @@ private:
                 return;
             }
         }
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            for (const auto & j : aw.jobs) {
+                if (!j->done && j->hash == id && j->toks->size() == (size_t) B_ctx) {
+                    return; // queued already
+                }
+            }
+        }
         // Write cells [0, B_ctx) as a WHOLE-state ROOT (v1 text / v2 media): lo == 0 and hi == B_ctx ==
         // toks.size() so auto_publish_snapshot takes the llama_state_seq_save_file (whole-root) branch,
         // which serialises the true whole recurrent/attention state at B_ctx. Same capacity pre-flight,
@@ -4751,6 +4796,26 @@ private:
                 }
             }
         }
+        // the same rule against the units the writer still holds (the PENDING set): a reclaim save right
+        // after the node that covers it must not queue the unit twice
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            for (const auto & j : aw.jobs) {
+                if (j->done) {
+                    continue;
+                }
+                const bool reaches = std::find(j->bhs.begin(), j->bhs.begin() + std::min(j->kb + 1, j->bhs.size()),
+                                               full_hash) != j->bhs.begin() + std::min(j->kb + 1, j->bhs.size());
+                if (!reaches) {
+                    continue;
+                }
+                const bool same = j->toks->size() == toks.size() && j->hash == unit_id;
+                if (restore_is_whole_prefix_only() ? same : (same || j->toks->size() > toks.size())) {
+                    return; // queued already
+                }
+            }
+        }
+
         // INCREMENTAL SAVE: when --slot-save-incremental, write only the KV cells added since the
         // deepest already-saved snapshot on this branch (a v3 text / v4 media delta node) instead of
         // re-D2H'ing and re-writing the whole prefix. Find the deepest candidate whose persisted cells
@@ -4855,6 +4920,21 @@ private:
                 parent_id   = name_id;
                 have_parent = true;
                 break; // deepest (longest-first) strict-prefix parent
+            }
+            // a deeper parent may still be queued (a prompt node, then the reclaim seconds later in a tool
+            // loop): the writer is FIFO, so it is published before this child, and if it fails the child is
+            // dropped with it (llamacpp:auto_cache_save_orphan_dropped_total)
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            for (const auto & j : aw.jobs) {
+                const llama_tokens & jt = *j->toks;
+                if (j->done || jt.size() <= parent_hi || jt.size() >= toks.size() ||
+                    !std::equal(jt.begin(), jt.end(), toks.begin()) ||
+                    !boundary_is_chunk_safe(toks, media, jt.size()) || !records_match(j->media, jt.size())) {
+                    continue;
+                }
+                parent_hi   = (uint32_t) jt.size();
+                parent_id   = j->hash;
+                have_parent = true;
             }
         }
 
@@ -7739,6 +7819,7 @@ private:
                                     // auto_index_lookup folds each chunk's identity into the boundary hashes.
                                     int n_restored = 0;
                                     auto_not_prefix_skips = 0;
+                                    aw_wait_pending_prefix(input_tokens, n_past);
                                     for (const auto & cand : auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
