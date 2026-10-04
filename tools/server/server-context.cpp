@@ -50,6 +50,7 @@
 #include <unistd.h> // getpid() for per-writer-unique temp filenames (cross-process atomicity)
 #include <fcntl.h>
 #include <sys/file.h> // flock() for the store lock (auto_store_lock)
+#include <signal.h>   // kill(pid, 0): is the writer of a leftover temp still alive
 #else
 #include <process.h> // _getpid()
 #define getpid _getpid
@@ -3590,7 +3591,8 @@ private:
         // interleave -> a corrupt temp gets renamed over a good final file. The temp carries pid + a
         // per-process counter, so each writer owns its own complete temp and the deterministic-name
         // rename is the ONLY shared, atomic step (idempotent: identical content). The sidecar temps
-        // derive from this same unique base.
+        // derive from this same unique base. The pid is also what lets a later instance reap the temps of
+        // a writer that died (auto_reap_dead_temps).
         static std::atomic<uint64_t> s_tmp_nonce{0};
         auto job = std::make_shared<aw_job>();
         job->slot_id = slot.id;
@@ -3880,7 +3882,9 @@ private:
         int64_t                 test_delay_ms  = 0;
         int64_t                 test_fail_meta = 0;
         int64_t                 n_publishes    = 0;
+        int64_t                 reap_age_s     = 600;
         int64_t                 shutdown_ms    = 100 * 1000;
+        int64_t                 last_reap_ms   = -1;
     } aw;
 
     static constexpr size_t  AW_MAX_CHUNK            = 64u << 20;
@@ -3902,7 +3906,9 @@ private:
         aw.chunk          = std::clamp<size_t>(aw.budget / 2, 4096, AW_MAX_CHUNK);
         aw.test_delay_ms  = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", 0);
         aw.test_fail_meta = aw_env_i64("LLAMA_TEST_SLOT_SAVE_FAIL_META_AT", 0);
+        aw.reap_age_s     = aw_env_i64("LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S", 600);
         aw.shutdown_ms    = aw_env_i64("LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS", AW_SHUTDOWN_DEADLINE_MS);
+        auto_reap_dead_temps();
         if (aw.budget == 0) {
             SRV_INF("%s", "auto disk cache: saves are published on the server thread (--slot-save-staging-mb 0)\n");
             return;
@@ -4562,6 +4568,7 @@ private:
                 auto_save_note_failure(job.slot_id, "snapshot is larger than --slot-save-max-mb", job.toks->size());
             }
         }
+        auto_reap_dead_temps();
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto_index_drop_missing_locked();
@@ -4595,6 +4602,65 @@ private:
         finish();
     }
 
+    // Temp files of a writer that died (crash, SIGKILL) are never renamed and nothing else removes them.
+    // Reap "<name>.<pid>.<nonce>.tmp*" whose pid is not alive and that are older than the reap age; a
+    // live peer's temps (its pid is alive) are left alone. Runs at startup and after a publish, at most
+    // once a minute.
+    void auto_reap_dead_temps() {
+#ifndef _WIN32
+        if (!auto_cache_enabled()) {
+            return;
+        }
+        const int64_t now_ms = ggml_time_ms();
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            if (aw.last_reap_ms >= 0 && now_ms - aw.last_reap_ms < 60 * 1000) {
+                return;
+            }
+            aw.last_reap_ms = now_ms;
+        }
+        const auto now = std::filesystem::file_time_type::clock::now();
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            const size_t t = name.find(".tmp");
+            if (t == std::string::npos) {
+                continue;
+            }
+            // "<base>.<pid>.<nonce>" before ".tmp"
+            const size_t d2 = name.rfind('.', t - 1);
+            if (d2 == std::string::npos || d2 == 0) {
+                continue;
+            }
+            const size_t d1 = name.rfind('.', d2 - 1);
+            if (d1 == std::string::npos) {
+                continue;
+            }
+            const std::string spid   = name.substr(d1 + 1, d2 - d1 - 1);
+            const std::string snonce = name.substr(d2 + 1, t - d2 - 1);
+            auto digits = [](const std::string & s) {
+                return !s.empty() && s.size() <= 12 && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
+            };
+            if (!digits(spid) || !digits(snonce)) {
+                continue;
+            }
+            const long pid = std::strtol(spid.c_str(), nullptr, 10);
+            if (pid <= 0 || pid == (long) getpid() || !(::kill((pid_t) pid, 0) != 0 && errno == ESRCH)) {
+                continue;
+            }
+            std::error_code fec;
+            const auto mt = std::filesystem::last_write_time(it->path(), fec);
+            if (fec || now - mt < std::chrono::seconds(aw.reap_age_s)) {
+                continue;
+            }
+            std::filesystem::remove(it->path(), fec);
+            if (!fec) {
+                SRV_INF("auto disk cache: removed %s, a temp of writer pid %ld which is no longer running\n",
+                        name.c_str(), pid);
+            }
+        }
+#endif
+    }
 
     // MID-PREFILL SHARED-CONTEXT BASE (Option A): persist the leading shared preamble [0, B_ctx) ONCE
     // as a deduplicated WHOLE-state v1 ROOT, so N chats sharing that prefix each restore this base via
