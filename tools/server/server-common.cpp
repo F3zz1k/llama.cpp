@@ -1229,8 +1229,12 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                                         const std::vector<server_media_record> & media,
                                         int B,
                                         uint64_t salt,
-                                        uint64_t fp_mmproj) {
+                                        uint64_t fp_mmproj,
+                                        uint64_t * full) {
     std::vector<uint64_t> out;
+    if (full) {
+        *full = 0;
+    }
     if (B <= 0) {
         return out;
     }
@@ -1281,6 +1285,9 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
         if (((i + 1) % (size_t) B == 0 || at_chunk_end) && boundary_is_chunk_safe(cells, media, i + 1)) {
             out.push_back(h);
         }
+    }
+    if (full) {
+        *full = h;
     }
     // No fallback key: a prompt with at least one media record always gets one at its last chunk end
     // (the cell after it is text, another record's start, or the end, so that boundary is chunk-safe),

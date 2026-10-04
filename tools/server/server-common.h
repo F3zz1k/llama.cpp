@@ -578,11 +578,17 @@ static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
 // pre-media algorithm (same filenames, same index keys); a text prompt shorter
 // than one block yields no key. `media` must be ordered by start_idx and tile the NULL cells
 // exactly, as extract_media_records / slot_meta_read produce them.
+//
+// `full`, when given, receives the chain value after the LAST cell: the unit's identity over every
+// cell, including a trailing partial block that no key covers. It equals out.back() exactly when the
+// last cell ends a key boundary. Unit filenames and every exact-length dedup use it, so two prompts
+// of equal length that differ only after their last whole block are two units, not one.
 std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                                         const std::vector<server_media_record> & media,
                                         int B,
                                         uint64_t salt,
-                                        uint64_t fp_mmproj);
+                                        uint64_t fp_mmproj,
+                                        uint64_t * full = nullptr);
 
 
 //

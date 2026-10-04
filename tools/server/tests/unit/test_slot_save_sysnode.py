@@ -96,6 +96,14 @@ def _units():
                   for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")))
 
 
+def _unit_files():
+    return sorted(os.path.basename(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")))
+
+
+def _unit_len(f: str) -> int:
+    return int(f[:-len(".bin.meta")].split("-")[-1])
+
+
 def _metric(s, name: str) -> float:
     res = s.make_request("GET", "/metrics")
     assert res.status_code == 200
@@ -278,3 +286,44 @@ def test_system_node_survives_prefill(tmpl_name):
         assert probed >= 1 and failed == 0
         n = res.body["timings"]["prompt_n"]
         assert [u for u in _units() if u < n] == plain, (extra, _units(), plain)
+
+
+# Same-length system prompts that differ only after their last whole block (a date at the end: the same
+# length every day, a different tail). Each must get its own node and restore it: the node is named and
+# deduplicated by its identity over every token, not by the hash of its last whole block. On a model that
+# cannot rewind (qwen35-dense) the other day's node is useless, so a suppressed node is a full miss.
+DAYS = ["Monday.", "Friday.", "Sunday."]
+
+
+@pytest.mark.parametrize("model_name", ["qwen35-dense", "gemma3-dense"])
+@pytest.mark.parametrize("tmpl_name", ["GLM-4.7-Flash", "Qwen3.5-4B", "google-gemma-4-31B-it"])
+def test_same_length_system_prompts_differing_in_the_tail(tmpl_name, model_name):
+    model, tmpl = _paths(model_name, tmpl_name)
+    nodes = {}
+    for d in DAYS:
+        msgs = [{"role": "system", "content": SYSTEM + " Today is " + d},
+                {"role": "user", "content": "What is the capital of France?"}]
+        before = set(_unit_files())
+        s = _server(model, tmpl)
+        s.start()
+        body = _chat(s, msgs)
+        s.stop()
+        n = body["timings"]["prompt_n"] + body["timings"].get("cache_n", 0)
+        new_inside = sorted(_unit_len(f) for f in set(_unit_files()) - before if _unit_len(f) < n)
+        assert len(new_inside) == 1, f"{d}: new units inside the prompt {new_inside}, all {_units()}"
+        nodes[d] = new_inside[0]
+    assert len(set(nodes.values())) == 1, f"the days' system prompts are not the same length: {nodes}"
+    for d in DAYS:
+        msgs = [{"role": "system", "content": SYSTEM + " Today is " + d},
+                {"role": "user", "content": "Another question here?"}]
+        s = _server(model, tmpl)
+        s.start()
+        body = _chat(s, msgs)
+        s.stop()
+        t = body["timings"]
+        if model_name == "qwen35-dense":
+            assert t.get("cache_disk_n", 0) == nodes[d], (d, t)
+        else:
+            assert t.get("cache_disk_n", 0) >= nodes[d], (d, t)
+        _assert_equals_cold(model, tmpl, msgs, body)
+

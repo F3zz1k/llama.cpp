@@ -1022,6 +1022,10 @@ struct auto_cache_entry {
     // warm siblings. Set from disk during the scan; re-stat'd authoritatively when a drop is forced (a
     // .pin touched AFTER the entry was first indexed — the normal deploy order — is still honoured).
     bool        pinned = false;
+    // the unit's identity over EVERY cell (auto_block_hashes' `full`): the chain value after its last
+    // cell, so it also commits the trailing partial block that no boundary key covers. Two units of
+    // equal length at one boundary are the same unit only when this matches too.
+    uint64_t    id     = 0;
 };
 
 // boundary-hash -> best (longest) entry covering that prefix length. Touched only
@@ -2342,8 +2346,8 @@ private:
     void auto_index_insert_locked(uint64_t boundary, const auto_cache_entry & e) {
         auto & v = auto_idx.by_boundary[boundary];
         for (auto & c : v) {
-            if (c.n_tokens == e.n_tokens) {
-                c.state_path = e.state_path; // same length/prefix: keep the newest file for this length
+            if (c.n_tokens == e.n_tokens && c.id == e.id) {
+                c.state_path = e.state_path; // the same unit: keep the newest file for it
                 c.fp         = e.fp;
                 c.pinned     = e.pinned;
                 return;
@@ -2387,19 +2391,20 @@ private:
         }
     }
 
-    // True iff an entry of EXACTLY n_tokens length is already indexed at `boundary`. The
-    // shared-context checkpoint uses this for its redundant-write dedup: the 2nd..Nth chat sharing
-    // the same [0,B) prefix finds the base already published at bhs[B/block-1] and writes nothing.
-    // Unlike the whole-save path's equal-or-longer dedup, the base must match on EXACT length — a
+    // True iff this exact unit (EXACTLY n_tokens cells with identity `id`) is already indexed at
+    // `boundary`. The shared-context checkpoint uses this for its redundant-write dedup: the 2nd..Nth
+    // chat sharing the same [0,B) prefix finds the base already published and writes nothing. A
     // LONGER snapshot at the same boundary is a divergent sibling prefix, not this base, so it must
-    // not suppress the base write. CALLER MUST HOLD auto_idx.mtx.
-    bool auto_index_has_exact_locked(uint64_t boundary, uint32_t n_tokens) const {
+    // not suppress the base write; nor may an equal-length one whose cells after the last whole block
+    // differ (a system prompt ending in a date: same length every day, a different tail), which the
+    // boundary key alone cannot tell apart. CALLER MUST HOLD auto_idx.mtx.
+    bool auto_index_has_exact_locked(uint64_t boundary, uint32_t n_tokens, uint64_t id) const {
         auto it = auto_idx.by_boundary.find(boundary);
         if (it == auto_idx.by_boundary.end()) {
             return false;
         }
         for (const auto_cache_entry & c : it->second) {
-            if (c.n_tokens == n_tokens) {
+            if (c.n_tokens == n_tokens && c.id == id) {
                 return true;
             }
         }
@@ -2470,13 +2475,14 @@ private:
             // text-only chain, bit-identical to what the writer keyed the file with). Only
             // chunk-safe boundaries are emitted — including a media unit's pure-text
             // pre-image boundaries, so a text request can reuse a media snapshot's prefix.
+            uint64_t id = 0;
             const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
-                                               cur_fp.fp_model, cur_fp.fp_mmproj);
+                                               cur_fp.fp_model, cur_fp.fp_mmproj, &id);
             // pin-awareness: a sibling "<state>.pin" marks this snapshot pinned so the per-boundary cap
             // never drops it (protects a pinned base that shares a bucket with >32 divergent siblings).
             std::error_code pec;
             const bool pinned = std::filesystem::exists(p + ".pin", pec) && !pec;
-            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned };
+            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned, id };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
             }
@@ -3312,8 +3318,9 @@ private:
     //     prompt, byte-identical to the pre-refactor save_file path. hi must equal toks.size():
     //     partial [0, hi < N) roots are refused (see the guard at the top of the body);
     //   - a v3 DELTA node when lo > 0 (lo == parent_hi): cells [lo, hi=N) parented on `parent_id`.
-    // `hash` is the chain hash that names the file and commits the prefix; the index is populated at
-    // boundaries bhs[0..kb] inclusive. Behaviour-preserving for the whole-save and delta callers.
+    // `hash` is the unit's identity over every cell (auto_block_hashes' `full`), which names the file
+    // and is the entry id the exact-unit dedup compares; the index is populated at boundaries
+    // bhs[0..kb] inclusive. Behaviour-preserving for the whole-save and delta callers.
     void auto_publish_snapshot(server_slot & slot,
                                llama_context * ctx,
                                const llama_tokens & toks,
@@ -3586,7 +3593,7 @@ private:
         // index insert (bhs[0..kb] -> this snapshot), then bounded-LRU + reconcile.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp };
+            auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp, /*pinned=*/false, /*id=*/hash };
             for (size_t i = 0; i <= kb && i < bhs.size(); ++i) {
                 auto_index_insert_locked(bhs[i], e);
             }
@@ -3643,30 +3650,37 @@ private:
     // checkpoint, taken with the slot sitting at N, mislabelled the state-after-N as a B-length prefix
     // and had to be hard-gated to PART && n_swa == 0; the mid-prefill whole-save removes that unsoundness
     // for every class). Every early return is a clean no-op (invariant 4). Remaining gates:
-    //   - TEXT-ONLY: media makes the block-hash array sparse (auto_block_hashes only emits at chunk-safe
-    //     boundaries), so bhs[B_ctx/block-1] would index the wrong prefix length. Arming already excludes
-    //     media requests; re-checked here for safety.
+    //   - MEDIA: a prompt carrying media is saved like a text one, from its cell tokens and media records
+    //     (the media-aware chain, keyed at its deepest chunk-safe boundary). Arming only ever picks a
+    //     position whose previous cell is text, so the cut never splits a chunk.
     //   - LoRA-equal: the fingerprint captures the global LoRA set; refuse a base taken under a per-request
     //     adapter override (invariant 3), same guard as the whole-prefix save path.
     void auto_save_context_base(server_slot & slot) {
         if (!auto_cache_enabled()) {
             return; // off by default
         }
-        if (slot.prompt.tokens.has_media()) {
-            return; // text-only keeps bhs dense so the positional hash lookup below is exact
-        }
         if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
             return; // fp captures the global LoRA set (invariant 3)
         }
         // B_ctx = the armed target. The slot is resident at EXACTLY B_ctx here (clamped there and this
-        // batch decoded), so get_text_tokens() has length B_ctx and a whole-save serialises the whole
-        // state at B_ctx. The two equalities below are guaranteed by the arm gates + clamp; re-checked
-        // defensively so a spurious call can only no-op, never write a mislabelled prefix.
+        // batch decoded), so the cell list has length B_ctx and a whole-save serialises the whole state
+        // at B_ctx. Re-checked defensively so a spurious call can only no-op, never write a mislabelled
+        // prefix.
         const int32_t B_ctx = slot.ctx_save_pos;
         if (B_ctx <= 0) {
             return;
         }
-        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        std::vector<server_media_record> media;
+        if (slot.prompt.tokens.has_media()) {
+            try {
+                media = slot.prompt.tokens.extract_media_records();
+            } catch (const std::exception & e) {
+                SLT_WRN(slot, "auto-save: system node skipped, %s\n", e.what());
+                return; // identity-less chunk: never re-verifiable (invariant 4)
+            }
+        }
+        const llama_tokens toks = media.empty() ? slot.prompt.tokens.get_text_tokens()
+                                                : slot.prompt.tokens.get_cell_tokens();
         if ((int32_t) toks.size() != B_ctx) {
             return; // defensive: the hook must fire with the slot resident at exactly B_ctx
         }
@@ -3674,30 +3688,31 @@ private:
         if (B <= 0 || B_ctx < B) {
             return; // defensive: the arm floor keeps B_ctx >= one block
         }
-        // dense (text) block-hash chain over [0, B_ctx); the deepest boundary hash names the base. B_ctx
-        // is block-aligned for a first-user boundary; a system-only pre-cache ends where the system
-        // prompt ends, and like any other unit it is keyed by its last whole block and holds every cell.
-        const auto bhs = auto_block_hashes(toks, {}, B, cur_fp.fp_model, cur_fp.fp_mmproj);
-        const size_t kb = (size_t) (B_ctx / B) - 1;                  // bhs dense (text) => positional index OK
-        if (kb >= bhs.size()) {
-            return;                                                  // defensive: never index past the chain
+        // block-hash chain over [0, B_ctx). Like every other unit, the node is indexed at its boundaries
+        // up to the deepest one (bhs.back(): the last whole block for text, or a later chunk end) and
+        // named by its identity over every cell, so a node at an exact, unaligned preamble end is
+        // distinct from another of the same length that differs only in its last partial block.
+        uint64_t id = 0;
+        const auto bhs = auto_block_hashes(toks, media, B, cur_fp.fp_model, cur_fp.fp_mmproj, &id);
+        if (bhs.empty()) {
+            return;
         }
-        const uint64_t ckpt_hash = bhs[kb];                         // NO re-hash: the boundary hash is in bhs
-        // EXACT-LENGTH redundant-write dedup (not equal-or-longer): the 2nd..Nth chat sharing this
-        // [0, B_ctx) preamble finds the base already published at this boundary and writes nothing.
+        const size_t   kb        = bhs.size() - 1;
+        const uint64_t ckpt_hash = bhs[kb];
+        // EXACT-unit redundant-write dedup (not equal-or-longer): the 2nd..Nth chat sharing this
+        // [0, B_ctx) preamble finds the base already published and writes nothing.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            if (auto_index_has_exact_locked(ckpt_hash, (uint32_t) B_ctx)) {
+            if (auto_index_has_exact_locked(ckpt_hash, (uint32_t) B_ctx, id)) {
                 return;
             }
         }
-        // Write cells [0, B_ctx) as a WHOLE-state v1 ROOT: lo == 0 and hi == B_ctx == toks.size() so
-        // auto_publish_snapshot takes the llama_state_seq_save_file (whole-root) branch — NOT the range
-        // branch — which serialises the true whole recurrent/attention state at B_ctx (text-only =>
-        // media empty, parent_id 0). Same capacity pre-flight, pid+nonce temp, three-file temp->rename
-        // (meta last) publish + per-boundary index insert as every other save.
+        // Write cells [0, B_ctx) as a WHOLE-state ROOT (v1 text / v2 media): lo == 0 and hi == B_ctx ==
+        // toks.size() so auto_publish_snapshot takes the llama_state_seq_save_file (whole-root) branch,
+        // which serialises the true whole recurrent/attention state at B_ctx. Same capacity pre-flight,
+        // pid+nonce temp, temp->rename (meta last) publish and index insert as every other save.
         auto_publish_snapshot(slot, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
-                              ckpt_hash, bhs, /*kb=*/kb, cur_fp);
+                              /*hash=*/id, bhs, kb, cur_fp, media);
     }
 
     void auto_save_slot_if_useful(server_slot & slot) {
@@ -3765,8 +3780,9 @@ private:
         // pre-media chain for a text-only prompt), media cells their record identity; only
         // chunk-safe block boundaries are emitted, so a media prompt with no safe boundary
         // yields an empty chain and is skipped below.
+        uint64_t unit_id = 0; // identity over every cell: names the file, decides the exact-length dedup
         const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
-                                           cur_fp.fp_model, cur_fp.fp_mmproj);
+                                           cur_fp.fp_model, cur_fp.fp_mmproj, &unit_id);
         if (bhs.empty()) {
             return;
         }
@@ -3775,7 +3791,7 @@ private:
         // slot is resident at exactly the block-aligned first-user boundary B_ctx), which is sound for
         // dense, SWA AND recurrent/hybrid. The old idle-flush [0,B_ctx) sub-range checkpoint — unsound
         // for FULL/RS and SWA and therefore a no-op on the production qwen3.6 (hybrid) — is gone.
-        const uint64_t full_hash = bhs.back(); // commits the whole whole-block prefix
+        const uint64_t full_hash = bhs.back(); // the deepest boundary key: the index bucket to check
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto it = auto_idx.by_boundary.find(full_hash);
@@ -3802,7 +3818,12 @@ private:
                     // the production miss this branch exists to fix. Give a shared store enough
                     // --slot-save-max-mb headroom for both identities, or point each model at its own
                     // directory.
-                    if (restore_is_whole_prefix_only() ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
+                    // "Exact" means the same unit: equal length AND equal identity over every cell, since
+                    // the bucket key does not cover cells after the last whole block. (PART still lets
+                    // a longer sibling suppress: it can rewind to the shared prefix, losing at most the
+                    // trailing partial block when the two differ there.)
+                    const bool same = c.n_tokens == toks.size() && c.id == unit_id;
+                    if (restore_is_whole_prefix_only() ? same : (same || c.n_tokens > toks.size())) {
                         return; // a usable snapshot for this exact prefix already exists
                     }
                 }
@@ -3896,27 +3917,17 @@ private:
                 if (!records_ok) {
                     continue;
                 }
-                // parent_id = the parent node's chain_hash = the last whole-block boundary hash of its
-                // cell prefix under the MEDIA-AWARE hash (prefix cells + the records fully inside
-                // [0, parent_hi)). Since disk_toks == toks[0:parent_hi], this reproduces the parent's
-                // own full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's
-                // file (the deterministic link the restore walk resolves). For a text delta prefix_media
-                // is empty and this is bit-identical to the pre-media parent hash. The parent cleared
-                // save_floor >= block, so its prefix has at least one boundary; guard defensively.
-                const llama_tokens prefix(toks.begin(), toks.begin() + parent_hi_sz);
-                std::vector<server_media_record> prefix_media;
-                for (const auto & rec : media) {
-                    if ((size_t) rec.start_idx + rec.n_tokens <= parent_hi_sz) {
-                        prefix_media.push_back(rec);
-                    }
-                }
-                const auto pbhs = auto_block_hashes(prefix, prefix_media, params_base.slot_save_block,
-                                                    cur_fp.fp_model, cur_fp.fp_mmproj);
-                if (pbhs.empty()) {
+                // parent_id = the parent's own file id, read from its filename: the restore walk resolves
+                // the link as auto_state_filename(parent_id, parent_hi), so the name is the authority.
+                // (Re-deriving it from the prefix would break the link to a unit named under an
+                // earlier naming rule.) A candidate whose name does not parse cannot be a parent.
+                uint64_t name_id  = 0;
+                uint32_t name_len = 0;
+                if (!slot_save_parse_node_id(cand.state_path, name_id, name_len) || name_len != parent_hi_sz) {
                     continue;
                 }
                 parent_hi   = (uint32_t) parent_hi_sz;
-                parent_id   = pbhs.back();
+                parent_id   = name_id;
                 have_parent = true;
                 break; // deepest (longest-first) strict-prefix parent
             }
@@ -3929,7 +3940,7 @@ private:
         auto_publish_snapshot(slot, ctx_tgt, toks,
                               /*lo=*/ have_parent ? (int32_t) parent_hi : 0,
                               /*hi=*/ (int32_t) toks.size(),
-                              full_hash, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
+                              /*hash=*/ unit_id, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
                               /*media=*/ media, /*parent_id=*/ have_parent ? parent_id : 0);
     }
 
