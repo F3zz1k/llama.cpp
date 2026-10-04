@@ -1722,10 +1722,16 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
 //
 
 int32_t server_preamble_cache::chars(const common_chat_templates * tmpls, const common_chat_templates_inputs & inputs, const std::string & prompt) {
+    // a sound bound, not an estimate: a token covers at least one byte of the rendered text (BOS and
+    // other added tokens aside, hence the slack), so a shorter prompt can never reach the floor
+    if (prompt.size() + 8 < (size_t) std::max(0, min_tokens)) {
+        n_probe_short++;
+        return -1;
+    }
     n_probed++;
 
-    // everything that renders into the preamble: the leading system / developer messages, the tools
-    // and the flags and kwargs the template reads (not the clock: the stored preamble text is
+    // everything that renders into the preamble: the leading system / developer messages, the tools,
+    // the json_schema and the flags and kwargs the template reads (not the clock: the stored preamble text is
     // compared instead, which also catches a template that renders the date)
     size_t k = 0;
     while (k < inputs.messages.size() &&
@@ -1735,6 +1741,7 @@ int32_t server_preamble_cache::chars(const common_chat_templates * tmpls, const 
     std::string key = std::to_string((uintptr_t) tmpls);
     key += common_chat_msgs_to_json_oaicompat(std::vector<common_chat_msg>(inputs.messages.begin(), inputs.messages.begin() + k)).dump();
     key += common_chat_tools_to_json_oaicompat(inputs.tools).dump();
+    key += "|" + inputs.json_schema; // rendered into the probes: some templates write it into the system turn
     key += string_format("|%d|%d|%d|%d|%d|%d|%d|%d", (int) inputs.tool_choice, (int) inputs.parallel_tool_calls,
                          (int) inputs.reasoning_format, (int) inputs.enable_thinking, (int) inputs.use_jinja,
                          (int) inputs.add_bos, (int) inputs.add_eos, (int) inputs.force_pure_content);

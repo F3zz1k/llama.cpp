@@ -687,6 +687,12 @@ public:
     std::atomic<uint64_t> n_probe_renders{0}; // requests that had to render the probes (cache miss)
     std::atomic<uint64_t> n_probe_failed {0}; // requests where no probe rendered (falls back to the message delimiters)
     std::atomic<uint64_t> n_seam_mismatch{0}; // preambles whose tokens were not a prefix of the request (no node)
+    std::atomic<uint64_t> n_probe_short  {0}; // prompts too short in bytes to reach min_tokens: not probed
+
+    // the system node's floor in tokens. A prompt of fewer bytes (plus a few for BOS and the like) than
+    // this cannot hold that many tokens, since no token is shorter than a byte of text, so it is not
+    // probed at all: the node could never be written.
+    int32_t min_tokens = 0;
 
 private:
     struct chars_entry {
@@ -919,6 +925,7 @@ struct server_metrics {
     uint64_t n_sysnode_probe_renders       = 0; // of those, rendered (not cached)
     uint64_t n_sysnode_probe_failed        = 0; // no probe rendered: the message delimiters decide the node
     uint64_t n_sysnode_seam_mismatch       = 0; // preamble tokens not a prefix of the request: no node
+    uint64_t n_sysnode_probe_short         = 0; // prompts too short in bytes to reach the node floor: not probed
 
     void init() {
         t_start = ggml_time_us();

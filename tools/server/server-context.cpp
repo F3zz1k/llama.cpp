@@ -4671,6 +4671,7 @@ private:
             // the system node's template-generic position (server_preamble_cache), only when the node is on
             if (auto_cache_enabled() && params_base.slot_save_node_system) {
                 chat_params.preamble_cache = std::make_shared<server_preamble_cache>();
+                chat_params.preamble_cache->min_tokens = std::max(params_base.slot_save_block, params_base.slot_save_context_min_tokens);
             }
 
             {
@@ -5836,6 +5837,7 @@ private:
                         res->metrics.n_sysnode_probe_renders = pc->n_probe_renders.load();
                         res->metrics.n_sysnode_probe_failed  = pc->n_probe_failed.load();
                         res->metrics.n_sysnode_seam_mismatch = pc->n_seam_mismatch.load();
+                        res->metrics.n_sysnode_probe_short   = pc->n_probe_short.load();
                     }
 
                     if (task.metrics_reset_bucket) {

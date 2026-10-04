@@ -1679,6 +1679,11 @@ std::string server_task_result_metrics::to_metrics() {
             "Auto disk KV cache: requests whose system-prompt tokens were not a prefix of the prompt (no system node)",
             (double) metrics.n_sysnode_seam_mismatch
         },
+        {
+            "auto_cache_sysnode_probe_short_total",
+            "Auto disk KV cache: chat prompts too short in bytes to reach the system node's floor, so not probed",
+            (double) metrics.n_sysnode_probe_short
+        },
     };
 
     const std::vector<metric_item> gauges = {
