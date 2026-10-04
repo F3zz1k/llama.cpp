@@ -958,6 +958,14 @@ struct server_metrics {
     uint64_t n_auto_restore_discarded      = 0; // restores whose tokens a later n_past clamp threw away (counted as misses)
     uint64_t n_auto_save_draft             = 0; // draft-context (.dft) sidecars written next to a unit
     uint64_t n_auto_save_draft_skipped     = 0; // units published without one (no cells, or the range was ignored)
+    // background writer (filled from the shared counters when the metrics are read)
+    uint64_t n_auto_save_queued             = 0; // saves handed to the writer
+    uint64_t n_auto_save_streamed           = 0; // of those, larger than the free staging: streamed while the writer was idle
+    uint64_t n_auto_save_dropped_staging    = 0; // saves dropped because the staging was full and the writer busy
+    uint64_t n_auto_save_orphan_dropped     = 0; // queued deltas dropped because their parent failed or vanished
+    uint64_t n_auto_save_shutdown_abandoned = 0; // queued saves abandoned at the shutdown deadline
+    uint64_t n_auto_save_staging_bytes      = 0; // gauge: host bytes held by saves not yet written
+    uint64_t n_auto_save_queue_depth        = 0; // gauge: saves queued or being written
     uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars
     uint64_t n_auto_restore_draft_cold     = 0; // disk restores with a draft context left cold (a node lacked a sidecar)
     uint64_t n_auto_node_media_skipped     = 0; // mid-prefill nodes not armed: no text-after-text cut above the floor before a media chunk

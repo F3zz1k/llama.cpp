@@ -23,8 +23,11 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
@@ -434,19 +437,6 @@ static int slot_fp_read(const std::string & state_filepath, slot_fp_record & r) 
 // never reads past: [blob][i32 tail_pos][u32 blob_size][u32 SLOT_DRAFT_TRAILER_MAGIC]. tail_pos is
 // the target position the blob belongs to, so a restore only applies it to a tail that ends there.
 static constexpr uint32_t SLOT_DRAFT_TRAILER_MAGIC = 0x44465431; // "DFT1"
-
-static bool slot_draft_trailer_append(const std::string & path, llama_pos tail_pos, const std::vector<uint8_t> & blob) {
-    std::ofstream f(path, std::ios::binary | std::ios::app);
-    if (!f) {
-        return false;
-    }
-    const uint32_t n = (uint32_t) blob.size();
-    f.write((const char *) blob.data(), blob.size());
-    f.write((const char *) &tail_pos, sizeof(tail_pos));
-    f.write((const char *) &n, sizeof(n));
-    f.write((const char *) &SLOT_DRAFT_TRAILER_MAGIC, sizeof(SLOT_DRAFT_TRAILER_MAGIC));
-    return (bool) f;
-}
 
 static bool slot_draft_trailer_read(const std::string & path, llama_pos & tail_pos, std::vector<uint8_t> & blob) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -1080,19 +1070,20 @@ static void slot_save_enforce_limits(const std::string & dir,
 //   4. Fallback totality: any failure (corrupt file, fp/vocab mismatch, IO error,
 //      no match) falls back to a normal prefill — never crash, never wrong output.
 //   5. Hot-path purity: no save runs during generation (token decode); restore happens
-//      once before prefill. Saves run on slot release/reassign (idle flush, reclaim,
-//      shutdown) AND, for the two mid-prefill nodes (system node, prompt node), inside
-//      a cold prefill at the node position, synchronously on the server-loop thread.
-//      Those two delay that request's first token by the write (whole root, or a
-//      delta under --slot-save-incremental) and stall other slots for as long; the cost
-//      is measured per class at the GPU gate. If it proves material, the fix is to
-//      move publishing to a writer thread (see Concurrency), not to narrow the nodes.
+//      once before prefill. Saves are decided on slot release/reassign (idle flush, reclaim,
+//      shutdown) AND, for the two mid-prefill nodes (system node, prompt node), inside a
+//      cold prefill at the node position. The server-loop thread pays only the CAPTURE: the
+//      gates and the copy of the state off the device into host memory. Writing, syncing and
+//      publishing run on the background writer (see Concurrency); the copy itself still
+//      delays a node's first token and stalls other slots for as long.
 //
-// Concurrency: all slot work runs on the single server-loop thread, so the index is
-// single-threaded and the mutex below is uncontended today; it becomes load-bearing
-// only if the save I/O is later moved to a worker thread (do not make save async
-// without keeping the mutex honest). Independent of legacy --prompt-cache and the
-// in-memory prefix-reuse path; auto-restore fires only when in-memory reuse is poor.
+// Concurrency: all slot work runs on the single server-loop thread. The background writer
+// (aw_*, one thread per instance) publishes captured units in FIFO order and owns no llama
+// object; it shares the index (auto_idx.mtx), the writer state (aw.mtx, never held together
+// with auto_idx.mtx) and atomic counters with the server thread. Restores read only published
+// units; the save-side dedup and parent choice also see the writer's queue. Independent of
+// legacy --prompt-cache and the in-memory prefix-reuse path; auto-restore fires only when
+// in-memory reuse is poor.
 // ---------------------------------------------------------------------------
 
 // The .meta sidecar format layer (model_fp, SLOT_META_* constants incl. the v3 delta-node
@@ -1219,8 +1210,8 @@ struct auto_cache_entry {
     uint64_t    deepest = 0;
 };
 
-// boundary-hash -> best (longest) entry covering that prefix length. Touched only
-// from the single server-loop thread in v1 (mtx documented above). `scanned`
+// boundary-hash -> best (longest) entry covering that prefix length. Touched by the
+// server-loop thread and the background writer, always under mtx (see Concurrency above). `scanned`
 // guards the one-time startup scan; `dir_mtime`/`last_refresh` drive the cheap
 // cross-process refresh (see auto_index_refresh): a peer process that writes a new
 // snapshot bumps the slot-save directory's mtime, which the next lookup notices and
@@ -2025,6 +2016,8 @@ public:
     }
 
     ~server_context_impl() {
+        // the writer touches the index and the counters below; whatever it still holds is abandoned
+        aw_stop(ggml_time_ms());
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2032,8 +2025,10 @@ public:
         }
     }
 
-    server_metrics get_metrics() const {
-        return metrics;
+    server_metrics get_metrics() {
+        server_metrics m = metrics;
+        auto_metrics_fill(m);
+        return m;
     }
 
     void reset_metrics_bucket() {
@@ -2102,19 +2097,50 @@ private:
         }
     }
 
+    // Auto-save counters the background writer updates too. They live outside server_metrics, which is
+    // copied as a plain struct into every metrics result, and are folded into that copy when it is taken
+    // (auto_metrics_fill).
+    struct auto_save_counters {
+        std::atomic<uint64_t> failed{0}, root{0}, delta{0}, bytes{0}, evicted{0}, draft{0}, draft_skipped{0};
+        std::atomic<uint64_t> queued{0}, streamed{0}, dropped_staging{0}, orphan_dropped{0}, shutdown_abandoned{0};
+    } aw_cnt;
+
     // A save that is DROPPED (nothing published) is never silent either: a WRN naming the reason,
     // rate-limited to one line per minute so a full disk cannot flood the journal, plus a cumulative
-    // counter (llamacpp:auto_cache_save_failed_total). Generation is unaffected (invariant 4).
-    int64_t auto_save_fail_last_wrn_ms = -1;
-    void auto_save_note_failure(const server_slot & slot, const char * reason, size_t n_tokens) {
-        metrics.n_auto_save_failed++;
-        const int64_t now_ms = ggml_time_ms();
-        if (auto_save_fail_last_wrn_ms < 0 || now_ms - auto_save_fail_last_wrn_ms >= 60 * 1000) {
-            auto_save_fail_last_wrn_ms = now_ms;
-            SLT_WRN(slot, "auto-save: dropped a %zu-token save: %s (dropped so far = %" PRIu64 "; "
-                          "this line is rate-limited to one per minute, see llamacpp:auto_cache_save_failed_total)\n",
-                    n_tokens, reason, metrics.n_auto_save_failed);
+    // counter (llamacpp:auto_cache_save_failed_total). Generation is unaffected (invariant 4). Called from
+    // the server thread and from the writer.
+    std::atomic<int64_t> auto_save_fail_last_wrn_ms{-1};
+    void auto_save_note_failure(int slot_id, const char * reason, size_t n_tokens) {
+        const uint64_t n_failed = ++aw_cnt.failed;
+        const int64_t  now_ms   = ggml_time_ms();
+        int64_t last = auto_save_fail_last_wrn_ms.load();
+        if ((last < 0 || now_ms - last >= 60 * 1000) && auto_save_fail_last_wrn_ms.compare_exchange_strong(last, now_ms)) {
+            SRV_WRN("slot %d: auto-save: dropped a %zu-token save: %s (dropped so far = %" PRIu64 "; "
+                    "this line is rate-limited to one per minute, see llamacpp:auto_cache_save_failed_total)\n",
+                    slot_id, n_tokens, reason, n_failed);
         }
+    }
+    void auto_save_note_failure(const server_slot & slot, const char * reason, size_t n_tokens) {
+        auto_save_note_failure(slot.id, reason, n_tokens);
+    }
+
+    // the metrics result: the plain struct plus the counters the writer shares
+    void auto_metrics_fill(server_metrics & m) {
+        m.n_auto_save_failed             = aw_cnt.failed.load();
+        m.n_auto_save_root               = aw_cnt.root.load();
+        m.n_auto_save_delta              = aw_cnt.delta.load();
+        m.n_auto_save_bytes              = aw_cnt.bytes.load();
+        m.n_auto_cache_evicted          += aw_cnt.evicted.load();
+        m.n_auto_save_draft              = aw_cnt.draft.load();
+        m.n_auto_save_draft_skipped      = aw_cnt.draft_skipped.load();
+        m.n_auto_save_queued             = aw_cnt.queued.load();
+        m.n_auto_save_streamed           = aw_cnt.streamed.load();
+        m.n_auto_save_dropped_staging    = aw_cnt.dropped_staging.load();
+        m.n_auto_save_orphan_dropped     = aw_cnt.orphan_dropped.load();
+        m.n_auto_save_shutdown_abandoned = aw_cnt.shutdown_abandoned.load();
+        std::lock_guard<std::mutex> lk(aw.mtx);
+        m.n_auto_save_staging_bytes      = aw.staged;
+        m.n_auto_save_queue_depth        = aw.jobs.size();
     }
 
     // Disk-restore accounting, at the point where the request's cached prefix is final. A restore whose
@@ -2143,59 +2169,65 @@ private:
         }
     }
 
-    // DRAFT SIDECAR (see slot_draft_sidecar_path). Writes the draft context's cells for [cell_lo, N) of
-    // this slot, bounded by POSITION on both ends: the draft may hold drafted-but-rejected cells past
-    // the target's end, and those must never reach a sidecar or a later delta would duplicate them.
-    // Kept only if it holds at least one cell and no more cells than the target range it shadows (a
-    // memory type that ignores the range would write every cell, which a NO_CLEAR compose would
-    // duplicate). Best-effort: a skipped sidecar only means that unit restores with a cold draft.
-    void auto_write_draft_sidecar(const server_slot & slot, const std::string & path,
-                                  const llama_tokens & snap_toks, uint32_t cell_lo) {
-        const size_t    n_cells = snap_toks.size();
-        const llama_pos p0      = cell_lo > 0 ? slot.prompt.tokens.pos_next((int64_t) cell_lo) : -1;
-        const llama_pos p1      = slot.prompt.tokens.pos_next((int64_t) n_cells);
+    // DRAFT SIDECAR (see slot_draft_sidecar_path). Plans the draft context's cells for [cell_lo, N) of this
+    // slot, bounded by POSITION on both ends: the draft may hold drafted-but-rejected cells past the
+    // target's end, and those must never reach a sidecar or a later delta would duplicate them. Kept only if
+    // it holds at least one cell and no more cells than the target range it shadows (a memory type that
+    // ignores the range would write every cell, which a NO_CLEAR compose would duplicate), checked from the
+    // size query before anything is copied. Returns the range, the file size and the carry-over trailer.
+    // Best-effort: a skipped sidecar only means that unit restores with a cold draft.
+    bool auto_draft_sidecar_plan(const server_slot & slot, const llama_tokens & snap_toks, uint32_t cell_lo, size_t hdr,
+                                 llama_pos & p0, llama_pos & p1, size_t & n_bytes, std::vector<uint8_t> & trailer) {
+        const size_t n_cells = snap_toks.size();
+        p0 = cell_lo > 0 ? slot.prompt.tokens.pos_next((int64_t) cell_lo) : -1;
+        p1 = slot.prompt.tokens.pos_next((int64_t) n_cells);
         // the draft must cover the unit up to its last cell (a save cut while the draft still lags the
         // target, e.g. mid-prefill, would otherwise publish a sidecar that ends short of its unit)
         if (llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) < p1 - 1) {
-            metrics.n_auto_save_draft_skipped++;
+            aw_cnt.draft_skipped++;
             SLT_DBG(slot, "auto-save: no draft sidecar for [%u, %zu), the draft has not reached pos %d\n",
                     cell_lo, n_cells, (int) (p1 - 1));
-            return;
+            return false;
         }
-        const size_t nwrite = llama_state_seq_save_file_range(ctx_dft, path.c_str(), slot.id, p0, p1,
-                                                              snap_toks.data(), n_cells);
+        std::vector<uint8_t> head(4096);
+        const size_t np = llama_state_seq_get_size_range(ctx_dft, slot.id, p0, p1, head.data(), head.size());
         uint32_t cells = 0;
-        const bool ok = nwrite > 0 &&
-                        delta_bin_cell_count(path, n_cells, cells) &&
+        const bool ok = np > 0 &&
+                        state_payload_cell_count(head.data(), std::min(head.size(), np), cells) &&
                         cells > 0 && (size_t) cells <= n_cells - cell_lo;
         if (!ok) {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-            metrics.n_auto_save_draft_skipped++;
-            SLT_DBG(slot, "auto-save: no draft sidecar for [%u, %zu) (%zu B, %u cells)\n", cell_lo, n_cells, nwrite, cells);
-            return;
+            aw_cnt.draft_skipped++;
+            SLT_DBG(slot, "auto-save: no draft sidecar for [%u, %zu) (%zu B, %u cells)\n", cell_lo, n_cells, np, cells);
+            return false;
         }
+        n_bytes = hdr + np;
         // the draft's carry-over for the unit's last cell (MTP: h of that cell, which the first cell
-        // decoded after a restore pairs with); without it that cell is built from a stale h
+        // decoded after a restore pairs with); without it that cell is built from a stale h.
         // The trailer is stamped with the position the blob ITSELF records, and written only when that
         // is the unit's last cell: a carry-over that lags the target tail would otherwise be labelled as
         // matching it and applied on restore (the restore compares the stamp with the target tail, and
         // set_state adopts the blob's pos unchecked). Without a trailer the draft KV still restores; only
-        // the first suffix cell is built without the carry-over.
+        // the first suffix cell is built without the carry-over. Layout (slot_draft_trailer_read):
+        // [blob][i32 tail_pos][u32 blob_size][u32 SLOT_DRAFT_TRAILER_MAGIC].
+        trailer.clear();
         std::vector<uint8_t> st;
         llama_pos st_pos = -1;
         if (common_speculative_get_state_at(spec.get(), slot.id, st, st_pos)) {
             if (st_pos != p1 - 1) {
                 SLT_DBG(slot, "auto-save: draft carry-over is at pos %d, not the unit tail %d; sidecar written without it\n",
                         (int) st_pos, (int) (p1 - 1));
-            } else if (!slot_draft_trailer_append(path, st_pos, st)) {
-                std::error_code ec;
-                std::filesystem::remove(path, ec);
-                metrics.n_auto_save_draft_skipped++;
-                return;
+            } else {
+                const uint32_t n = (uint32_t) st.size();
+                trailer = st;
+                const auto put = [&](const void * v, size_t k) {
+                    trailer.insert(trailer.end(), (const uint8_t *) v, (const uint8_t *) v + k);
+                };
+                put(&st_pos, sizeof(st_pos));
+                put(&n, sizeof(n));
+                put(&SLOT_DRAFT_TRAILER_MAGIC, sizeof(SLOT_DRAFT_TRAILER_MAGIC));
             }
         }
-        metrics.n_auto_save_draft++;
+        return true;
     }
 
     // Loads the draft sidecars of a restored chain into ctx_dft, in the same order and with the same
@@ -3135,67 +3167,6 @@ private:
         return true;
     }
 
-    // Peek the number of KV cells a range-save .bin actually serialized, WITHOUT loading the
-    // multi-GB state into a seq. The .bin layout is: magic(u32) version(u32) n_token_count(u32)
-    // tokens[n_token_count] then the memory state — and for every media-relevant family the state
-    // opens with n_stream(u32) followed by, per stream, cell_count(u32) [+ meta + data when the
-    // count is non-zero, nothing when zero]. A range save writes the delta sub-cache FIRST (plain
-    // FULL attention writes the single cache; iSWA writes kv_base's [p0,p1) delta before the whole
-    // kv_swa; hybrid writes the attention delta before the whole recurrent state), and a single-seq
-    // slot save populates exactly ONE stream, so the first non-zero cell_count is the delta's cell
-    // count. Returns true and sets `cells_out` on a well-formed header whose n_token_count matches
-    // `n_tokens` (a guard that this is the file we just wrote); false on any short read / mismatch,
-    // which the caller treats as a failed verify. Best-effort, never throws.
-    bool delta_bin_cell_count(const std::string & bin_path, size_t n_tokens, uint32_t & cells_out) {
-        std::ifstream f(bin_path, std::ios::binary);
-        if (!f) {
-            return false;
-        }
-        auto rd_u32 = [&](uint32_t & v) -> bool {
-            unsigned char b[4];
-            f.read((char *) b, 4);
-            if (f.gcount() != 4) {
-                return false;
-            }
-            v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
-            return true;
-        };
-        uint32_t magic = 0, version = 0, tok_count = 0, n_stream = 0;
-        if (!rd_u32(magic) || !rd_u32(version) || !rd_u32(tok_count)) {
-            return false;
-        }
-        if ((size_t) tok_count != n_tokens) {
-            return false; // header token count disagrees -> not the delta we just wrote
-        }
-        f.seekg((std::streamoff) tok_count * (std::streamoff) sizeof(llama_token), std::ios::cur);
-        if (!f || !rd_u32(n_stream)) {
-            return false;
-        }
-        // DeepSeek-V4 (llama_kv_cache_dsv4) prefixes its state with magic, version and mode before the
-        // raw cache's own n_stream; skip that prefix so the count below is the raw cache's delta cells.
-        static constexpr uint32_t DSV4_STATE_MAGIC = 0x34565344; // "DSV4", src/llama-kv-cache-dsv4.cpp
-        if (n_stream == DSV4_STATE_MAGIC) {
-            uint32_t dsv4_version = 0, dsv4_mode = 0;
-            if (!rd_u32(dsv4_version) || !rd_u32(dsv4_mode) || !rd_u32(n_stream)) {
-                return false;
-            }
-        }
-        // exactly one stream holds this seq's cells; empty streams write only cell_count == 0 with no
-        // meta/data following, so scan cell_counts until the first non-zero one (the delta count).
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            uint32_t cell_count = 0;
-            if (!rd_u32(cell_count)) {
-                return false;
-            }
-            if (cell_count != 0) {
-                cells_out = cell_count;
-                return true;
-            }
-        }
-        cells_out = 0; // every stream empty: a delta that serialized nothing (a mismatch upstream)
-        return true;
-    }
-
     // Build the root->tip chain of node .bin paths for a (possibly delta) tip by walking parent
     // links ON DISK (the tree is DERIVED FROM DISK — no in-RAM map) and verifying every hop.
     // `tip_path` is the tip's .bin; `tip_toks` is its authoritative full [0, range_hi) cell-token
@@ -3544,21 +3515,21 @@ private:
     // Text-only prompts publish v1 .meta sidecars byte-identical to the pre-media format; media
     // prompts publish v2 sidecars carrying per-chunk identity records (the KV state file already
     // holds the embeddings, so identity metadata is all the disk side needs).
-    // Skips redundant writes (an equal-or-longer snapshot already covers this prefix), writes the
-    // state + .logits + .meta as a 3-file unit (atomically, .meta LAST so a torn write is never
-    // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
-    // is the gate; invariant 5: never during generation (release/reassign, or a mid-prefill node).
-    // SHARED atomic-publish tail, factored out of auto_save_slot_if_useful so the temp->fsync->
-    // rename (meta last) publish invariant, the capacity pre-flight and the per-boundary index
-    // insert live in ONE place. Persists KV cells [lo, hi) of slot.id's sequence as one disk unit
-    // named auto_state_filename(hash, hi):
+    // The callers skip redundant writes (an equal-or-longer snapshot already covers this prefix). This is
+    // the CAPTURE half shared by every save site: the capacity pre-flight, the delta probe and both
+    // fallbacks, the copy of the state into host memory, then the hand-off to the background writer
+    // (aw_publish), which writes the state + .logits + .dft + .meta temps, syncs them, renames them with
+    // .meta LAST so a torn write is never indexed, inserts the index entry, enforces the bounded LRU and
+    // reconciles. Invariant 1: first statement is the gate; invariant 5: never during generation
+    // (release/reassign, or a mid-prefill node). Persists KV cells [lo, hi) of slot.id's sequence as one
+    // disk unit named auto_state_filename(hash, hi):
     //   - a ROOT snapshot when lo == 0 (v1 text / v2 media, `media` selecting which) of the WHOLE
-    //     prompt, byte-identical to the pre-refactor save_file path. hi must equal toks.size():
+    //     prompt, byte-identical to llama_state_seq_save_file. hi must equal toks.size():
     //     partial [0, hi < N) roots are refused (see the guard at the top of the body);
     //   - a v3 DELTA node when lo > 0 (lo == parent_hi): cells [lo, hi=N) parented on `parent_id`.
     // `hash` is the unit's identity over every cell (auto_block_hashes' `full`), which names the file
     // and is the entry id the exact-unit dedup compares; the index is populated at boundaries
-    // bhs[0..kb] inclusive. Behaviour-preserving for the whole-save and delta callers.
+    // bhs[0..kb] inclusive.
     void auto_publish_snapshot(server_slot & slot,
                                llama_context * ctx,
                                const llama_tokens & toks,
@@ -3583,19 +3554,26 @@ private:
             return;
         }
         const llama_tokens & snap_toks = toks;
+        const size_t hdr = 3 * sizeof(uint32_t) + snap_toks.size() * sizeof(llama_token);
 
         // capacity pre-flight (statvfs via std::filesystem::space): refuse to START a multi-GB
         // write the filesystem cannot hold — on btrfs an ENOSPC mid-write can flip the whole
         // filesystem read-only, a far worse failure than a skipped opportunistic save. Exact
         // state size + the token array, with 10% slack covering the file header and the
-        // .logits/.meta sidecars. An unanswerable space query skips too (conservative;
-        // invariant 4: a skipped save never affects generation).
+        // .logits/.meta sidecars, plus what the writer still has queued. An unanswerable space
+        // query skips too (conservative; invariant 4: a skipped save never affects generation).
+        // The writer checks nothing again: ENOSPC there fails the write cleanly.
         {
             const size_t sz_state = llama_state_seq_get_size(ctx, slot.id);
             // the .dft draft sidecar (when a draft context exists) is written beside the state file and
             // counts against the same filesystem; its whole draft state bounds it from above
             const size_t sz_dft   = ctx_dft ? llama_state_seq_get_size(ctx_dft, slot.id) : 0;
-            const size_t sz_need  = sz_state + sz_dft + snap_toks.size() * sizeof(llama_token);
+            size_t sz_queued = 0;
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                sz_queued = aw.queued_bytes;
+            }
+            const size_t sz_need  = sz_state + sz_dft + snap_toks.size() * sizeof(llama_token) + sz_queued;
             std::error_code sec;
             const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
             if (sec || sinfo.available < sz_need + sz_need / 10) {
@@ -3606,279 +3584,947 @@ private:
             }
         }
 
-        const std::string fname = auto_state_filename(hash, snap_toks.size());
-        // cross-process atomicity: the temp path MUST be unique per writer. The final
-        // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
-        // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
-        // and interleave -> a corrupt temp gets renamed over a good final file. We disambiguate the
-        // temp with pid + a per-process monotonic counter, so each writer owns its own complete temp
-        // and the deterministic-name rename is the ONLY shared, atomic step (idempotent: identical
-        // content). The sidecar temps derive from this same unique base so they are unique too.
-        // (nonce is atomic so it stays correct if save I/O is later threaded.)
+        // cross-process atomicity: the temp path MUST be unique per writer. The final name (fname) is
+        // deterministic (identity + chain hash + tok count), so two processes sharing one
+        // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp" and
+        // interleave -> a corrupt temp gets renamed over a good final file. The temp carries pid + a
+        // per-process counter, so each writer owns its own complete temp and the deterministic-name
+        // rename is the ONLY shared, atomic step (idempotent: identical content). The sidecar temps
+        // derive from this same unique base.
         static std::atomic<uint64_t> s_tmp_nonce{0};
-        const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
-        const std::string tmp = fname + "." + std::to_string((long) getpid()) + "." +
-                                std::to_string(nonce) + ".tmp";
+        auto job = std::make_shared<aw_job>();
+        job->slot_id = slot.id;
+        job->fname   = auto_state_filename(hash, snap_toks.size());
+        job->tmp     = job->fname + "." + std::to_string((long) getpid()) + "." +
+                       std::to_string(s_tmp_nonce.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+        job->toks    = std::make_shared<const llama_tokens>(snap_toks);
+        job->hash    = hash;
+        job->bhs     = bhs;
+        job->kb      = kb;
+        job->fp      = fp;
+        job->media   = media;
 
-        // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
-        //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
-        //    crash mid-write never leaves a corrupt state file the index would trust.
-        //    A DELTA node (lo > 0) writes only cells [lo, N) via the range save; a ROOT takes the
-        //    byte-identical whole save_file path.
-        size_t nwrite;
-        // P0.1: a class that does not honour ranges must never publish a delta. Probe once, here,
-        // where real resident state exists and the range save is about to happen anyway.
-        // F1: a NO answer must not drop the save. Returning here used to discard EVERY parented save
-        // on a non-delta class (only the first, unparented save of a chain ever reached disk), so
-        // the deeper prefixes were never cached at all. Publish the same prefix as a WHOLE root
-        // instead, exactly as the U6 cell-count fallback below does.
+        // Sizes, the delta probe and the U6 check, all from the size query: no state is copied and nothing
+        // is written until the unit is known to be publishable.
+        // P0.1: a class that does not honour ranges must never publish a delta. The probe compares the
+        // range payload with the whole payload of the same prefix (the file headers are identical, so this
+        // is the old range-file vs whole-file test without writing either). Once per instance.
+        // F1: a NO answer publishes the same prefix as a WHOLE root instead of dropping it.
+        std::vector<uint8_t> head(4096);
+        size_t n_payload = 0;
         if (is_node && delta_capable == delta_cap::no) {
             auto_save_note_whole_fallback(slot, snap_toks.size(), parent_hi);
             is_node   = false;
             parent_id = 0;
             parent_hi = 0;
         }
+        // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
+        // slot.prompt.tokens.pos_next(parent_hi), the same function that assigned the cell positions
+        // (mtmd decode seeds on pos_next). For text pos_next == parent_hi; for media pos_next is correct.
+        const llama_pos lo_pos = is_node ? slot.prompt.tokens.pos_next((llama_pos) lo) : -1;
         if (is_node) {
-            // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
-            // slot.prompt.tokens.pos_next(parent_hi) — the same function that assigned the cell
-            // positions (mtmd decode seeds on pos_next). For text pos_next == parent_hi (byte-identical
-            // delta); for media the two differ and pos_next is the correct boundary.
-            nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
-                                                     slot.prompt.tokens.pos_next((llama_pos) lo), -1,
-                                                     snap_toks.data(), snap_toks.size());
-        } else {
-            nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
-        }
-        if (nwrite == 0) {
-            std::error_code ec; std::filesystem::remove(tmp, ec);
-            auto_save_note_failure(slot, "state write failed (disk full or IO error)", snap_toks.size());
-            return; // invariant 4: disk full / IO error -> generation unaffected
-        }
-
-        // P0.1: resolve the probe on the FIRST delta write. Cost: one extra whole-sequence write,
-        // once per instance. If the range was ignored the two byte counts match (the "delta" is a
-        // whole save wearing a delta's .meta) and composing it would duplicate cells -> refuse, and
-        // never attempt a delta again on this instance.
-        if (is_node && delta_capable == delta_cap::unknown) {
-            const std::string probe = tmp + ".probe";
-            const size_t nwhole = llama_state_seq_save_file(ctx, probe.c_str(), slot.id,
-                                                            snap_toks.data(), snap_toks.size());
-            if (nwhole == 0) {
-                std::error_code ec;
-                std::filesystem::remove(probe, ec);
-                std::filesystem::remove(tmp, ec);
-                auto_save_note_failure(slot, "delta probe whole-save failed (disk full or IO error)", snap_toks.size());
-                return; // could not probe; try again on the next save rather than guess
-            }
-            delta_capable = (nwrite < nwhole) ? delta_cap::yes : delta_cap::no;
-            SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
-                    delta_capable == delta_cap::yes ? "YES" : "NO (whole roots only)", nwrite, nwhole);
-            if (delta_capable == delta_cap::no) {
-                // F1: the probe file IS a whole save of this exact prefix, so it is published as a
-                // whole root in place of the (unusable) delta instead of being thrown away.
-                auto_save_note_whole_fallback(slot, snap_toks.size(), parent_hi);
-                is_node   = false;
-                parent_id = 0;
-                parent_hi = 0;
-                std::error_code ec;
-                std::filesystem::rename(probe, tmp, ec);
-                if (ec) {
-                    std::filesystem::remove(probe, ec);
-                    nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
-                    if (nwrite == 0) {
-                        std::filesystem::remove(tmp, ec);
-                        auto_save_note_failure(slot, "whole-root rewrite after the delta probe failed", snap_toks.size());
-                        return; // invariant 4
-                    }
-                } else {
-                    nwrite = nwhole;
+            n_payload = llama_state_seq_get_size_range(ctx, slot.id, lo_pos, -1, head.data(), head.size());
+            if (n_payload > 0 && delta_capable == delta_cap::unknown) {
+                const size_t n_whole = llama_state_seq_get_size_range(ctx, slot.id, -1, -1, nullptr, 0);
+                if (n_whole == 0) {
+                    auto_save_note_failure(slot, "state size query failed", snap_toks.size());
+                    return;
                 }
-            } else {
-                std::error_code pec; std::filesystem::remove(probe, pec);
+                delta_capable = n_payload < n_whole ? delta_cap::yes : delta_cap::no;
+                SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
+                        delta_capable == delta_cap::yes ? "YES" : "NO (whole roots only)", hdr + n_payload, hdr + n_whole);
+                if (delta_capable == delta_cap::no) {
+                    auto_save_note_whole_fallback(slot, snap_toks.size(), parent_hi);
+                    is_node   = false;
+                    parent_id = 0;
+                    parent_hi = 0;
+                }
             }
         }
-
-        // P0.4: refuse to publish a snapshot with NO memory payload. llama_kv_cache::state_write and
-        // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return;`,
-        // src/llama-kv-cache.cpp:2125-2127 / :2204-2206) — as on LLM_ARCH_GEMMA4_ASSISTANT, whose
-        // sub-caches both carry mem_other. llama_state_seq_save_file still returns nwrite > 0 (file
-        // header + token array), so the existing nwrite==0 gate passes, the .meta claims N tokens,
-        // and a later restore loads NOTHING while reporting success. Class-agnostic guard: a real
-        // snapshot must be substantially larger than its own header + token array. (The early return
-        // in the engine is CORRECT for a pure view sharing v_cells_impl — we refuse the empty
-        // SNAPSHOT, never the model.)
-        {
-            const size_t hdr_and_toks = 256 + snap_toks.size() * sizeof(llama_token);
-            if (nwrite <= hdr_and_toks) {
-                SRV_WRN("auto disk cache: refusing to publish a snapshot with no memory payload "
-                        "(%zu B for %zu tokens) - the memory type serialised nothing\n",
-                        nwrite, snap_toks.size());
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                metrics.n_auto_save_failed++;
-                return;
-            }
-        }
-        // 1b) U6 (mm-delta decision 4): a range-save delta selects suffix cells by POSITION, so a
-        //     mid-chunk anomaly could leave the boundary value right yet silently drop/duplicate suffix
-        //     cells — and restore's byte-verify is NULL-blind. Peek the delta .bin's serialized cell
-        //     count (no multi-GB load) and require it to equal N - parent_hi. On any mismatch do NOT
-        //     persist a corrupt delta: discard and fall back to a WHOLE save of this exact prefix
-        //     (is_node cleared => the meta below is v1/v2 by `media`, byte-identical to a no-parent save).
-        if (is_node) {
-            uint32_t written_cells = 0;
-            const bool ok = delta_bin_cell_count(tmp, snap_toks.size(), written_cells) &&
-                            (size_t) written_cells == snap_toks.size() - parent_hi;
+        // 1b) U6 (mm-delta decision 4): a range save selects suffix cells by POSITION, so a mid-chunk anomaly
+        //     could leave the boundary value right yet silently drop or duplicate suffix cells, and the
+        //     restore's byte-verify is NULL-blind. The size query reports the payload's leading cell count:
+        //     require it to equal N - parent_hi, and otherwise fall back to a WHOLE save of this exact prefix
+        //     (is_node cleared => the meta is v1/v2 by `media`, byte-identical to a no-parent save).
+        if (is_node && n_payload > 0) {
+            uint32_t cells = 0;
+            const bool ok = state_payload_cell_count(head.data(), std::min(head.size(), n_payload), cells) &&
+                            (size_t) cells == snap_toks.size() - parent_hi;
             if (!ok) {
                 SLT_WRN(slot, "auto-save: delta cell-count check failed (expected %zu, got %u); "
                               "falling back to a whole snapshot\n",
-                        snap_toks.size() - parent_hi, written_cells);
-                std::error_code ec; std::filesystem::remove(tmp, ec);
+                        snap_toks.size() - parent_hi, cells);
                 is_node   = false;
                 parent_id = 0;
                 parent_hi = 0;
-                nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
-                if (nwrite == 0) {
-                    std::filesystem::remove(tmp, ec);
-                    auto_save_note_failure(slot, "whole-root rewrite after a failed delta cell-count check failed", snap_toks.size());
-                    return; // invariant 4
-                }
             }
         }
-        // 2) regenerate logits sidecar on the temp path (FULL and RS, and only when the captured
-        //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
+        if (!is_node) {
+            n_payload = llama_state_seq_get_size_range(ctx, slot.id, -1, -1, nullptr, 0);
+        }
+        if (n_payload == 0) {
+            auto_save_note_failure(slot, "state size query failed", snap_toks.size());
+            return;
+        }
+        // P0.4: refuse to publish a snapshot with NO memory payload. llama_kv_cache::state_write and
+        // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return;`,
+        // src/llama-kv-cache.cpp), as on LLM_ARCH_GEMMA4_ASSISTANT, whose sub-caches both carry mem_other.
+        // The .meta would claim N tokens and a later restore would load NOTHING while reporting success.
+        // Class-agnostic guard: a real snapshot must be substantially larger than its own header + token
+        // array. (The early return in the engine is CORRECT for a pure view sharing v_cells_impl: we refuse
+        // the empty SNAPSHOT, never the model.)
+        if (hdr + n_payload <= 256 + snap_toks.size() * sizeof(llama_token)) {
+            SRV_WRN("auto disk cache: refusing to publish a snapshot with no memory payload "
+                    "(%zu B for %zu tokens) - the memory type serialised nothing\n",
+                    hdr + n_payload, snap_toks.size());
+            aw_cnt.failed++;
+            return;
+        }
+        job->is_node        = is_node;
+        job->parent_id      = is_node ? parent_id : 0;
+        job->parent_hi      = is_node ? parent_hi : 0;
+        job->parent_fname   = is_node ? auto_state_filename(parent_id, parent_hi) : std::string();
+        job->bin.n_expected = hdr + n_payload;
+
+        // 2) logits sidecar (FULL and RS, and only when the captured distribution provably belongs to this
+        //    exact state, the same stamp check SLOT_SAVE uses)
+        const int64_t t_l0 = ggml_time_us();
         if (logits_sidecar_class() &&
             slot.logits_last_n_tokens == (int32_t) snap_toks.size() && !slot.logits_last.empty()) {
-            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-            slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) snap_toks.size());
+            job->logits  = slot.logits_last;
+            job->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
         }
-        // 2b) draft sidecar on the temp path, with the same [lo, N) split the state file ended up with
-        //     (parent_hi is 0 when this save became, or always was, a whole root).
+        job->t_logits = ggml_time_us() - t_l0;
+
+        // 2b) draft sidecar, with the same [lo, N) split the state file ended up with. Sized and checked
+        //     here; its trailer (the draft's carry-over for the unit's last cell) is captured with it.
+        llama_pos dft_p0 = -1, dft_p1 = -1;
+        std::vector<uint8_t> dft_trailer;
         if (ctx_dft) {
-            auto_write_draft_sidecar(slot, slot_draft_sidecar_path(tmp), snap_toks, is_node ? parent_hi : 0);
+            const uint32_t cell_lo = is_node ? parent_hi : 0;
+            if (auto_draft_sidecar_plan(slot, snap_toks, cell_lo, hdr, dft_p0, dft_p1, job->dft.n_expected, dft_trailer)) {
+                job->has_dft         = true;
+                job->dft.n_expected += dft_trailer.size();
+            }
         }
-        // 3) meta sidecar on the temp path. Written but renamed LAST. A whole/partial ROOT writes the
-        //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
-        //    records). A DELTA (is_node) passes the FULL `media` records so slot_meta_write's
-        //    (is_node, media-empty) dispatch selects v3 for a text delta (byte-identical) and v4 for a
-        //    media delta; the meta stays WHOLE ([0,N) tokens + full tiling) while the .bin holds only
-        //    cells [lo, N), so restore's byte-verify is the exact v2 path and the .bin composes via NO_CLEAR.
-        const bool meta_ok = is_node
-            ? slot_meta_write(tmp, fp, snap_toks, hash, /*media=*/media, /*is_node=*/true,
-                              parent_id, parent_hi, (uint32_t) snap_toks.size())
-            : slot_meta_write(tmp, fp, snap_toks, hash, media);
-        if (!meta_ok) {
+
+        // 3) admission, then the copy. The job is queued before the copy starts, so a staged job's first
+        //    chunks are already being written while the rest is copied.
+        const size_t n_total = job->bin.n_expected + job->dft.n_expected + job->logits.size() * sizeof(float);
+        FILE * f_bin = nullptr;
+        FILE * f_dft = nullptr;
+        if (!aw.running) {
+            job->mode = aw_mode::sync;
+            f_bin = fopen(job->tmp.c_str(), "wb");
+            if (!f_bin) {
+                auto_save_note_failure(slot, "state write failed (disk full or IO error)", snap_toks.size());
+                return;
+            }
+        } else if (!aw_admit(job, n_total)) {
+            return;
+        }
+        const int64_t t_t0 = ggml_time_us();
+        const bool ok_bin = aw_capture_stream(*job, job->bin, ctx, is_node ? lo_pos : -1, -1, f_bin, job->bin.n_expected);
+        job->t_d2h_tgt = ggml_time_us() - t_t0;
+        if (f_bin) {
+            const bool ok_file = fflush(f_bin) == 0 &&
+#ifndef _WIN32
+                                 ::fdatasync(fileno(f_bin)) == 0 &&
+#endif
+                                 true;
+            fclose(f_bin);
+            if (!ok_bin || !ok_file) {
+                std::error_code ec;
+                std::filesystem::remove(job->tmp, ec);
+                auto_save_note_failure(slot, "state write failed (disk full or IO error)", snap_toks.size());
+                return;
+            }
+        } else {
+            aw_finish_stream(job->bin, ok_bin);
+            if (!ok_bin) {
+                aw_finish_stream(job->dft, false);
+                auto_save_note_failure(slot, "the state copy failed or changed size during the copy", snap_toks.size());
+                return; // the writer drops the job and its queued children
+            }
+        }
+        if (job->has_dft) {
+            const int64_t t_d0 = ggml_time_us();
+            bool ok_dft = true;
+            if (job->mode == aw_mode::sync) {
+                f_dft  = fopen(slot_draft_sidecar_path(job->tmp).c_str(), "wb");
+                ok_dft = f_dft != nullptr;
+            }
+            // the engine produces the state part, the trailer follows it
+            ok_dft = ok_dft && aw_capture_stream(*job, job->dft, ctx_dft, dft_p0, dft_p1, f_dft,
+                                                 job->dft.n_expected - dft_trailer.size());
+            if (ok_dft && !dft_trailer.empty()) {
+                aw_sink_ctx sc;
+                sc.self = this; sc.job = job.get(); sc.st = &job->dft; sc.direct = f_dft;
+                ok_dft = aw_push_bytes(sc, dft_trailer.data(), dft_trailer.size());
+                if (ok_dft && sc.cur.n > 0) {
+                    aw_push_chunk(sc);
+                }
+                ok_dft = ok_dft && !sc.failed;
+            }
+            if (!ok_dft) {
+                aw_cnt.draft_skipped++;
+                SLT_DBG(slot, "auto-save: no draft sidecar for this unit (the draft copy failed)%s\n", "");
+            }
+            // the writer reads the timing once the stream is finished, so it is set before that
+            job->t_d2h_dft = ggml_time_us() - t_d0;
+            if (f_dft) {
+                ok_dft = fflush(f_dft) == 0 && ok_dft;
+#ifndef _WIN32
+                ok_dft = ::fdatasync(fileno(f_dft)) == 0 && ok_dft;
+#endif
+                fclose(f_dft);
+                if (!ok_dft) {
+                    std::error_code ec;
+                    std::filesystem::remove(slot_draft_sidecar_path(job->tmp), ec);
+                }
+            }
+            if (job->mode == aw_mode::sync) {
+                job->has_dft = ok_dft;
+            } else {
+                aw_finish_stream(job->dft, ok_dft); // an aborted stream makes the writer drop the file
+            }
+        }
+        if (job->mode == aw_mode::sync) {
+            aw_publish(*job);
+        }
+    }
+
+    // ===== BACKGROUND WRITER (auto disk cache) ==========================================================
+    // A save is split in two. CAPTURE runs on the server thread, at the instant the save is decided: every
+    // gate, the delta probe, the parent choice, and the device-to-host copy of the state into host memory
+    // (llama_state_seq_save_sink). PUBLISH runs on one writer thread per instance, FIFO: the temp files,
+    // fdatasync, the renames under the store lock (.bin, .logits, .dft, then .meta), the index insert, the
+    // LRU and the success log. The writer owns no llama object, so it never touches a context.
+    //
+    // Staging (--slot-save-staging-mb, default 1024): a job whose bytes fit in the free budget is staged
+    // whole and the server pays only the copy. One that does not fit streams through a two-chunk ring
+    // when the writer is idle (the server then pays about max(copy, write)), and is DROPPED, with a WRN
+    // and llamacpp:auto_cache_save_dropped_staging_total, when the writer is busy: the server never waits
+    // on the writer during prefill or decode. The shutdown flush is the exception: it waits. Staging is
+    // allocated per job and freed as the writer drains it, so an idle instance holds none. A budget of 0
+    // publishes on the server thread instead (the synchronous mode, streaming straight into the temp).
+    //
+    // A unit is visible to restores only once its .meta is renamed into place (restores read the index,
+    // never the queue). The queue itself (the PENDING set) is consulted by the save-side dedup and parent
+    // choice, so a child can be a delta on a parent that is still queued; a parent that fails takes its
+    // queued children with it (llamacpp:auto_cache_save_orphan_dropped_total), because staged delta bytes
+    // cannot become a root.
+
+    struct aw_chunk {
+        std::unique_ptr<uint8_t[]> buf;
+        size_t cap = 0;
+        size_t n   = 0;
+    };
+
+    // one file's bytes, produced by the server thread and consumed by the writer (guarded by aw.mtx)
+    struct aw_stream {
+        std::deque<aw_chunk> chunks;    // produced, not yet written
+        bool   sealed     = false;      // the producer is done
+        bool   aborted    = false;      // the producer gave up: the consumer drops the file
+        size_t n_expected = 0;          // exact size the producer announced
+        size_t n_produced = 0;
+    };
+
+    enum class aw_mode : uint8_t { staged, streamed, sync };
+
+    struct aw_job {
+        int         slot_id = -1;
+        std::string fname;                         // final .bin name
+        std::string tmp;                           // "<fname>.<pid>.<nonce>.tmp"
+        std::string parent_fname;                  // the parent's .bin (delta only)
+        std::shared_ptr<const llama_tokens> toks;  // the unit's cell tokens
+        uint64_t    hash      = 0;                 // identity over every cell (names the file)
+        std::vector<uint64_t> bhs;                 // boundary keys, indexed at [0, kb]
+        size_t      kb        = 0;
+        model_fp    fp;
+        std::vector<server_media_record> media;
+        bool        is_node   = false;
+        uint64_t    parent_id = 0;
+        uint32_t    parent_hi = 0;
+        std::vector<float> logits;                 // empty: no .logits sidecar
+        int32_t     n_vocab   = 0;
+        bool        has_dft   = false;
+        aw_stream   bin;
+        aw_stream   dft;
+        aw_mode     mode      = aw_mode::sync;
+        size_t      reserved  = 0;                 // staged budget still held by this job
+        bool        done      = false;
+        // timings, microseconds
+        int64_t     t_d2h_tgt = 0;
+        int64_t     t_d2h_dft = 0;
+        int64_t     t_logits  = 0;
+        int64_t     t_enq     = 0;
+    };
+
+    struct aw_state {
+        std::mutex              mtx;
+        std::condition_variable cv;              // every wait (jobs, chunks, budget, publish) uses this one
+        std::deque<std::shared_ptr<aw_job>> jobs; // FIFO; the front is the one being published
+        std::thread             th;
+        bool                    started   = false;
+        bool                    running   = false;
+        bool                    closing   = false;
+        bool                    shutdown  = false; // the shutdown flush: admission waits instead of dropping
+        int64_t                 deadline_ms = -1;  // shutdown: abandon what is left after this
+        size_t                  budget    = 0;
+        size_t                  chunk     = 0;
+        size_t                  staged    = 0;     // bytes held in chunks not yet written
+        size_t                  queued_bytes = 0;  // bytes of queued jobs not yet on disk (capacity check)
+        std::deque<uint64_t>    failed_units;      // recent failed unit ids (orphan detection), bounded
+        // test hooks (environment, read once): slow the writer down, fail the k-th .meta rename
+        int64_t                 test_delay_ms  = 0;
+        int64_t                 test_fail_meta = 0;
+        int64_t                 n_publishes    = 0;
+        int64_t                 shutdown_ms    = 100 * 1000;
+    } aw;
+
+    static constexpr size_t  AW_MAX_CHUNK            = 64u << 20;
+    static constexpr int64_t AW_SHUTDOWN_DEADLINE_MS = 100 * 1000; // inside TimeoutStopSec 120 / router 150
+    static constexpr int64_t AW_PENDING_WAIT_MS      = 30 * 1000;  // a restore waits this long for a queued prefix
+
+    static int64_t aw_env_i64(const char * name, int64_t def) {
+        const char * v = getenv(name);
+        return v && *v ? std::strtoll(v, nullptr, 10) : def;
+    }
+
+    void aw_start() {
+        if (aw.started || !auto_cache_enabled()) {
+            return; // once per process (load_model runs again when the server wakes from sleep)
+        }
+        aw.started = true;
+        const int64_t mb = std::max<int64_t>(0, params_base.slot_save_staging_mb);
+        aw.budget         = (size_t) mb << 20;
+        aw.chunk          = std::clamp<size_t>(aw.budget / 2, 4096, AW_MAX_CHUNK);
+        aw.test_delay_ms  = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", 0);
+        aw.test_fail_meta = aw_env_i64("LLAMA_TEST_SLOT_SAVE_FAIL_META_AT", 0);
+        aw.shutdown_ms    = aw_env_i64("LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS", AW_SHUTDOWN_DEADLINE_MS);
+        if (aw.budget == 0) {
+            SRV_INF("%s", "auto disk cache: saves are published on the server thread (--slot-save-staging-mb 0)\n");
+            return;
+        }
+        aw.running = true;
+        aw.th = std::thread([this]() { aw_loop(); });
+        SRV_INF("auto disk cache: background writer started, staging budget %zu MiB, chunk %zu KiB\n",
+                aw.budget >> 20, aw.chunk >> 10);
+    }
+
+    // Closes the queue and joins the writer. What is still queued at `deadline_ms` is abandoned: the
+    // writer stops between chunks, unlinks its temps and never renames a partial unit.
+    void aw_stop(int64_t deadline_ms) {
+        if (!aw.running) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            aw.closing     = true;
+            aw.deadline_ms = deadline_ms;
+        }
+        aw.cv.notify_all();
+        aw.th.join();
+        aw.running = false;
+    }
+
+    bool aw_past_deadline() const {
+        return aw.deadline_ms >= 0 && ggml_time_ms() >= aw.deadline_ms;
+    }
+
+    // ---- capture side (server thread) -----------------------------------------------------------------
+
+    // the sink the engine copies the state into, one per stream being captured
+    struct aw_sink_ctx {
+        server_context_impl * self = nullptr;
+        aw_job *              job  = nullptr;
+        aw_stream *           st   = nullptr;
+        aw_chunk              cur;
+        FILE *                direct = nullptr; // sync mode: chunks go straight into this temp file
+        bool                  failed = false;
+    };
+
+    // hand a filled chunk to the consumer (the writer, or the temp file in sync mode)
+    void aw_push_chunk(aw_sink_ctx & sc) {
+        if (sc.cur.n == 0) {
+            return;
+        }
+        if (sc.direct) {
+            if (fwrite(sc.cur.buf.get(), 1, sc.cur.n, sc.direct) != sc.cur.n) {
+                sc.failed = true;
+            }
+            sc.cur.n = 0; // the buffer is reused
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            sc.st->chunks.push_back(std::move(sc.cur));
+        }
+        sc.cur = {};
+        aw.cv.notify_all();
+    }
+
+    // appends bytes the engine does not produce (the .dft trailer) to a stream being captured
+    bool aw_push_bytes(aw_sink_ctx & sc, const void * src, size_t n) {
+        const uint8_t * p = (const uint8_t *) src;
+        while (n > 0) {
+            size_t avail = 0;
+            void * dst = aw_reserve(sc, n, &avail);
+            if (dst == nullptr) {
+                return false;
+            }
+            memcpy(dst, p, avail);
+            aw_sink_commit(&sc, avail);
+            p += avail;
+            n -= avail;
+        }
+        return true;
+    }
+
+    static void * aw_sink_reserve(void * ud, size_t n, size_t * n_avail) {
+        auto & sc = *(aw_sink_ctx *) ud;
+        return sc.self->aw_reserve(sc, n, n_avail);
+    }
+
+    static void aw_sink_commit(void * ud, size_t n) {
+        auto & sc = *(aw_sink_ctx *) ud;
+        sc.cur.n          += n;
+        sc.st->n_produced += n;
+        if (sc.cur.n == sc.cur.cap) {
+            sc.self->aw_push_chunk(sc);
+        }
+    }
+
+    void * aw_reserve(aw_sink_ctx & sc, size_t n, size_t * n_avail) {
+        if (sc.failed) {
+            return nullptr;
+        }
+        if (!sc.cur.buf || sc.cur.n == sc.cur.cap) {
+            const size_t left = sc.st->n_expected > sc.st->n_produced ? sc.st->n_expected - sc.st->n_produced : n;
+            if (sc.direct) {
+                // sync mode: one buffer, reused for every piece
+                if (!sc.cur.buf) {
+                    const size_t cap = std::clamp<size_t>(left, 1, AW_MAX_CHUNK);
+                    sc.cur.buf.reset(new (std::nothrow) uint8_t[cap]);
+                    if (!sc.cur.buf) {
+                        sc.failed = true;
+                        return nullptr;
+                    }
+                    sc.cur.cap = cap;
+                }
+                sc.cur.n = 0;
+                *n_avail = std::min(n, sc.cur.cap);
+                return sc.cur.buf.get();
+            }
+            const size_t cap = std::clamp<size_t>(left, 1, aw.chunk);
+            if (sc.job->mode == aw_mode::streamed) {
+                // the ring of two chunks: wait for the writer to drain it, never past the shutdown deadline
+                std::unique_lock<std::mutex> lk(aw.mtx);
+                const size_t ring = 2 * aw.chunk;
+                aw.cv.wait(lk, [&]() { return aw.staged + cap <= ring || sc.st->aborted || aw_past_deadline(); });
+                if (sc.st->aborted || aw_past_deadline()) {
+                    sc.failed = true;
+                    return nullptr;
+                }
+                aw.staged += cap;
+            }
+            sc.cur.buf.reset(new (std::nothrow) uint8_t[cap]);
+            if (!sc.cur.buf) {
+                sc.failed = true;
+                return nullptr;
+            }
+            sc.cur.cap = cap;
+            sc.cur.n   = 0;
+        }
+        *n_avail = std::min(n, sc.cur.cap - sc.cur.n);
+        return sc.cur.buf.get() + sc.cur.n;
+    }
+
+    // Copies [p0, p1) (whole when both are negative) of `ctx` into `st`, exactly as the file save would
+    // write it. Returns false if the engine failed, the sink refused, or the byte count is not the one the
+    // size query announced (n_engine) (the state must not change between the two; a difference means a defect, and
+    // the unit is dropped rather than published with a wrong length).
+    bool aw_capture_stream(aw_job & job, aw_stream & st, llama_context * ctx, llama_pos p0, llama_pos p1,
+                           FILE * direct, size_t n_engine) {
+        aw_sink_ctx sc;
+        sc.self   = this;
+        sc.job    = &job;
+        sc.st     = &st;
+        sc.direct = direct;
+        const llama_state_sink sink = { aw_sink_reserve, aw_sink_commit, &sc };
+        const size_t n = llama_state_seq_save_sink(ctx, job.slot_id, p0, p1, job.toks->data(), job.toks->size(), &sink);
+        if (sc.cur.n > 0 && !sc.failed) {
+            aw_push_chunk(sc);
+        }
+        return n > 0 && !sc.failed && n == n_engine;
+    }
+
+    // end of a stream: sealed (complete) or aborted (the consumer drops the file)
+    void aw_finish_stream(aw_stream & st, bool ok) {
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            if (ok) {
+                st.sealed = true;
+            } else {
+                st.aborted = true;
+            }
+        }
+        aw.cv.notify_all();
+    }
+
+    // Parses the first non-empty stream's cell count from the head of a state payload (the layout
+    // delta_bin_cell_count documents). Returns false when the head is too short or malformed.
+    static bool state_payload_cell_count(const uint8_t * p, size_t n, uint32_t & cells_out) {
+        size_t off = 0;
+        auto rd = [&](uint32_t & v) -> bool {
+            if (off + 4 > n) {
+                return false;
+            }
+            v = (uint32_t) p[off] | ((uint32_t) p[off + 1] << 8) | ((uint32_t) p[off + 2] << 16) | ((uint32_t) p[off + 3] << 24);
+            off += 4;
+            return true;
+        };
+        uint32_t n_stream = 0;
+        if (!rd(n_stream)) {
+            return false;
+        }
+        static constexpr uint32_t DSV4_STATE_MAGIC = 0x34565344; // "DSV4", src/llama-kv-cache-dsv4.cpp
+        if (n_stream == DSV4_STATE_MAGIC) {
+            uint32_t ver = 0, mode = 0;
+            if (!rd(ver) || !rd(mode) || !rd(n_stream)) {
+                return false;
+            }
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            uint32_t cell_count = 0;
+            if (!rd(cell_count)) {
+                return false;
+            }
+            if (cell_count != 0) {
+                cells_out = cell_count;
+                return true;
+            }
+        }
+        cells_out = 0;
+        return true;
+    }
+
+    // the writer has nothing to do (a finished job may still sit at the front for a moment)
+    bool aw_idle_locked() const {
+        return std::all_of(aw.jobs.begin(), aw.jobs.end(), [](const std::shared_ptr<aw_job> & j) { return j->done; });
+    }
+
+    // Admission (section "Staging"): decides staged / streamed / dropped for a job of `total` bytes and
+    // queues it. Returns false when the job is dropped (already counted and logged).
+    bool aw_admit(const std::shared_ptr<aw_job> & job, size_t total) {
+        std::unique_lock<std::mutex> lk(aw.mtx);
+        auto decide = [&]() -> bool {
+            if (aw.staged + total <= aw.budget) {
+                job->mode     = aw_mode::staged;
+                job->reserved = total;
+                aw.staged    += total;
+                return true;
+            }
+            if (aw_idle_locked()) {
+                job->mode = aw_mode::streamed;
+                return true;
+            }
+            return false;
+        };
+        bool ok = decide();
+        if (!ok && aw.shutdown) {
+            // the shutdown flush waits for room (bounded by the deadline) instead of dropping
+            ok = aw.cv.wait_until(lk, std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(std::max<int64_t>(0, aw.deadline_ms - ggml_time_ms())),
+                                  [&]() { return decide(); });
+        }
+        if (!ok) {
+            const size_t used = aw.staged;
+            const size_t qd   = aw.jobs.size();
+            lk.unlock();
+            aw_cnt.dropped_staging++;
+            SRV_WRN("slot %d: auto-save: dropped %s %zu tokens (%zu B), staging full (%zu/%zu MB, queue %zu)\n",
+                    job->slot_id, job->is_node ? "delta" : "root", job->toks->size(), total, used >> 20,
+                    aw.budget >> 20, qd);
+            return false;
+        }
+        job->t_enq = ggml_time_us();
+        aw.queued_bytes += job->bin.n_expected + job->dft.n_expected;
+        aw.jobs.push_back(job);
+        aw_cnt.queued++;
+        if (job->mode == aw_mode::streamed) {
+            aw_cnt.streamed++;
+        }
+        lk.unlock();
+        aw.cv.notify_all();
+        return true;
+    }
+
+    // ---- publish side (writer thread, or the server thread in sync mode) -------------------------------
+
+    void aw_loop() {
+        while (true) {
+            std::shared_ptr<aw_job> job;
+            {
+                std::unique_lock<std::mutex> lk(aw.mtx);
+                aw.cv.wait(lk, [&]() { return !aw.jobs.empty() || aw.closing; });
+                if (aw.jobs.empty()) {
+                    return; // closing, and nothing left
+                }
+                job = aw.jobs.front();
+            }
+            aw_publish(*job);
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                aw.jobs.pop_front();
+            }
+            aw.cv.notify_all();
+        }
+    }
+
+    // takes the next chunk of `st`, waiting for the producer; false when the stream is finished
+    bool aw_next_chunk(aw_job & job, aw_stream & st, aw_chunk & out, bool & aborted) {
+        std::unique_lock<std::mutex> lk(aw.mtx);
+        if (job.mode != aw_mode::sync) {
+            aw.cv.wait(lk, [&]() { return !st.chunks.empty() || st.sealed || st.aborted || aw_past_deadline(); });
+        }
+        // past the shutdown deadline a stream the producer never finished counts as aborted
+        aborted = st.aborted || (!st.sealed && st.chunks.empty() && job.mode != aw_mode::sync && aw_past_deadline());
+        if (st.chunks.empty()) {
+            return false;
+        }
+        out = std::move(st.chunks.front());
+        st.chunks.pop_front();
+        return true;
+    }
+
+    // a written chunk frees its staging: a staged job gives back its reservation, a streamed one the ring
+    void aw_release_chunk(aw_job & job, const aw_chunk & c) {
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            size_t dec = c.cap;
+            if (job.mode == aw_mode::staged) {
+                dec = std::min(dec, job.reserved);
+                job.reserved -= dec;
+            }
+            aw.staged -= std::min(aw.staged, dec);
+        }
+        aw.cv.notify_all();
+    }
+
+    // drops whatever the stream still holds (or will receive) without writing it
+    void aw_drain_stream(aw_job & job, aw_stream & st) {
+        if (&st == &job.dft && !job.has_dft) {
+            return; // never produced
+        }
+        aw_chunk c;
+        bool aborted = false;
+        while (aw_next_chunk(job, st, c, aborted)) {
+            aw_release_chunk(job, c);
+            c = {};
+        }
+    }
+
+    enum class aw_wr { ok, aborted, failed, abandoned };
+
+    // writes `st` into `path`, then fdatasyncs it. Timings accumulate into t_write / t_sync (us).
+    aw_wr aw_write_stream(aw_job & job, aw_stream & st, const std::string & path, int64_t & t_write, int64_t & t_sync) {
+        FILE * f = fopen(path.c_str(), "wb");
+        bool ok = f != nullptr;
+        aw_chunk c;
+        bool aborted = false;
+        const int64_t t0 = ggml_time_us();
+        while (aw_next_chunk(job, st, c, aborted)) {
+            if (ok && fwrite(c.buf.get(), 1, c.n, f) != c.n) {
+                ok = false;
+            }
+            aw_release_chunk(job, c);
+            c = {};
+            if (job.mode != aw_mode::sync && aw_past_deadline()) {
+                // shutdown deadline: stop between chunks, never publish a partial unit
+                if (f) {
+                    fclose(f);
+                }
+                aw_drain_stream(job, st);
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                return aw_wr::abandoned;
+            }
+        }
+        t_write += ggml_time_us() - t0;
+        if (aborted) {
+            if (f) {
+                fclose(f);
+            }
             std::error_code ec;
-            std::filesystem::remove(tmp, ec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_draft_sidecar_path(tmp), ec);
-            auto_save_note_failure(slot, ".meta sidecar write failed", snap_toks.size());
-            return; // invariant 4
+            std::filesystem::remove(path, ec);
+            return st.aborted ? aw_wr::aborted : aw_wr::abandoned;
         }
-        // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
-        //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
-        //    The whole sequence runs under the store lock, so no restore can pair this .bin with the
-        //    .meta of another writer that published under the same name (auto_store_lock).
-        auto_store_lock pub_lock(params_base.slot_save_path, /*exclusive=*/true, auto_store_lock::PUBLISH_TIMEOUT_MS);
-        if (!pub_lock.held()) {
-            std::error_code lec;
-            std::filesystem::remove(tmp, lec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), lec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), lec);
-            std::filesystem::remove(slot_draft_sidecar_path(tmp), lec);
-            auto_save_note_failure(slot, "timed out waiting for restores in progress to release the store lock",
-                                   snap_toks.size());
-            return; // invariant 4
+        if (f) {
+            const int64_t t1 = ggml_time_us();
+            ok = fflush(f) == 0 && ok;
+#ifndef _WIN32
+            ok = ::fdatasync(fileno(f)) == 0 && ok;
+#endif
+            ok = fclose(f) == 0 && ok;
+            t_sync += ggml_time_us() - t1;
         }
+        if (!ok) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            return aw_wr::failed;
+        }
+        return aw_wr::ok;
+    }
+
+    // fsync of a small file written by a helper (.logits, .meta), or of the store directory
+    static bool aw_sync_path(const std::string & path, bool dir) {
+#ifndef _WIN32
+        const int fd = ::open(path.c_str(), (dir ? (O_RDONLY | O_DIRECTORY) : O_RDONLY) | O_CLOEXEC);
+        if (fd < 0) {
+            return false;
+        }
+        const bool ok = (dir ? ::fsync(fd) : ::fdatasync(fd)) == 0;
+        ::close(fd);
+        return ok;
+#else
+        (void) path; (void) dir;
+        return true;
+#endif
+    }
+
+    void aw_mark_failed(uint64_t unit_id) {
+        std::lock_guard<std::mutex> lk(aw.mtx);
+        aw.failed_units.push_back(unit_id);
+        while (aw.failed_units.size() > 256) {
+            aw.failed_units.pop_front();
+        }
+    }
+
+    bool aw_parent_failed(uint64_t parent_id) {
+        std::lock_guard<std::mutex> lk(aw.mtx);
+        return std::find(aw.failed_units.begin(), aw.failed_units.end(), parent_id) != aw.failed_units.end();
+    }
+
+    enum class aw_drop { failed, orphan, abandoned, aborted };
+
+    // Removes every temp of this job, marks it failed (its queued children are dropped), counts and logs.
+    void aw_fail(aw_job & job, const char * reason, aw_drop kind = aw_drop::failed) {
         std::error_code ec;
-        std::filesystem::rename(tmp, fname, ec);
-        if (ec) {
-            std::filesystem::remove(tmp, ec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_draft_sidecar_path(tmp), ec);
-            auto_save_note_failure(slot, "rename of the state file into place failed", snap_toks.size());
-            return; // invariant 4
+        std::filesystem::remove(job.tmp, ec);
+        std::filesystem::remove(slot_logits_sidecar_path(job.tmp), ec);
+        std::filesystem::remove(slot_logits_sidecar_path(job.tmp) + ".tmp", ec);
+        std::filesystem::remove(slot_meta_sidecar_path(job.tmp), ec);
+        std::filesystem::remove(slot_meta_sidecar_path(job.tmp) + ".tmp", ec);
+        std::filesystem::remove(slot_draft_sidecar_path(job.tmp), ec);
+        aw_mark_failed(job.hash);
+        switch (kind) {
+            case aw_drop::failed:
+                auto_save_note_failure(job.slot_id, reason, job.toks->size());
+                break;
+            case aw_drop::orphan:
+                aw_cnt.orphan_dropped++;
+                SRV_WRN("slot %d: auto-save: dropped a %zu-token delta, %s\n", job.slot_id, job.toks->size(), reason);
+                break;
+            case aw_drop::abandoned:
+                aw_cnt.shutdown_abandoned++;
+                SRV_WRN("slot %d: auto-save: abandoned a %zu-token save, %s\n", job.slot_id, job.toks->size(), reason);
+                break;
+            case aw_drop::aborted:
+                break; // the capture counted and logged it
         }
-        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
+    }
+
+    void aw_publish(aw_job & job) {
+        const int64_t t_start = ggml_time_us();
+        int64_t t_write = 0, t_sync = 0, t_pub = 0, t_evict = 0;
+        const bool sync = job.mode == aw_mode::sync;
+        auto finish = [&]() {
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                aw.staged   -= std::min(aw.staged, job.reserved);
+                job.reserved = 0;
+                if (!sync) {
+                    aw.queued_bytes -= std::min(aw.queued_bytes, job.bin.n_expected + job.dft.n_expected);
+                }
+                job.done = true;
+            }
+            aw.cv.notify_all();
+        };
+        auto abandon = [&]() {
+            aw_drain_stream(job, job.bin);
+            aw_drain_stream(job, job.dft);
+            aw_fail(job, "the shutdown deadline passed before it was written", aw_drop::abandoned);
+            finish();
+        };
+        if (!sync && aw_past_deadline()) {
+            abandon();
+            return;
+        }
+        // a delta whose parent failed to publish can never be restored: its staged bytes are a suffix
+        if (job.is_node && aw_parent_failed(job.parent_id)) {
+            aw_drain_stream(job, job.bin);
+            aw_drain_stream(job, job.dft);
+            aw_fail(job, "its parent failed to publish", aw_drop::orphan);
+            finish();
+            return;
+        }
+        // 1) temps: .bin, .logits, .dft, .meta, each synced (in sync mode the capture already wrote the
+        //    .bin and .dft temps)
+        switch (sync ? aw_wr::ok : aw_write_stream(job, job.bin, job.tmp, t_write, t_sync)) {
+            case aw_wr::ok:        break;
+            case aw_wr::abandoned: abandon(); return;
+            case aw_wr::aborted:
+                aw_drain_stream(job, job.dft);
+                aw_fail(job, "", aw_drop::aborted);
+                finish();
+                return;
+            case aw_wr::failed:
+                aw_drain_stream(job, job.dft);
+                aw_fail(job, "state write failed (disk full or IO error)");
+                finish();
+                return;
+        }
+        if (!job.logits.empty()) {
+            const int64_t t0 = ggml_time_us();
+            if (slot_logits_write(job.tmp, job.logits, job.n_vocab, (uint32_t) job.toks->size()) > 0) {
+                aw_sync_path(slot_logits_sidecar_path(job.tmp), false);
+            }
+            t_write += ggml_time_us() - t0;
+        }
+        bool dft_ok = false;
+        if (job.has_dft) {
+            switch (sync ? aw_wr::ok : aw_write_stream(job, job.dft, slot_draft_sidecar_path(job.tmp), t_write, t_sync)) {
+                case aw_wr::ok:        dft_ok = true; break;
+                case aw_wr::abandoned: abandon(); return;
+                case aw_wr::aborted:   break; // counted at capture: the unit restores with a cold draft
+                case aw_wr::failed:    aw_cnt.draft_skipped++; break;
+            }
+        }
+        {
+            const int64_t t0 = ggml_time_us();
+            const bool meta_ok = job.is_node
+                ? slot_meta_write(job.tmp, job.fp, *job.toks, job.hash, job.media, /*is_node=*/true,
+                                  job.parent_id, job.parent_hi, (uint32_t) job.toks->size())
+                : slot_meta_write(job.tmp, job.fp, *job.toks, job.hash, job.media);
+            if (!meta_ok || !aw_sync_path(slot_meta_sidecar_path(job.tmp), false)) {
+                aw_fail(job, ".meta sidecar write failed");
+                finish();
+                return;
+            }
+            t_sync += ggml_time_us() - t0;
+        }
+        if (aw.test_delay_ms > 0 && !sync) {
+            // test hook: the unit's temps are complete and nothing is published yet
+            const int64_t until = ggml_time_ms() + aw.test_delay_ms;
+            while (ggml_time_ms() < until && !aw_past_deadline()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (aw_past_deadline()) {
+                abandon();
+                return;
+            }
+        }
+        // a parent evicted (by a peer, or by our own LRU) while this delta was queued: drop it
+        if (job.is_node) {
+            std::error_code pec;
+            if (!std::filesystem::exists(slot_meta_sidecar_path(job.parent_fname), pec)) {
+                aw_fail(job, "its parent is no longer in the store", aw_drop::orphan);
+                finish();
+                return;
+            }
+        }
+        // 2) atomic publish under the store lock: .bin, .logits, .dft (or remove a stale one), .meta last
+        const int64_t t_p0 = ggml_time_us();
+        int timeout_ms = auto_store_lock::PUBLISH_TIMEOUT_MS;
+        if (aw.deadline_ms >= 0) {
+            timeout_ms = (int) std::clamp<int64_t>(aw.deadline_ms - ggml_time_ms(), 0, timeout_ms);
+        }
+        auto_store_lock pub_lock(params_base.slot_save_path, /*exclusive=*/true, timeout_ms);
+        if (!pub_lock.held()) {
+            aw_fail(job, "timed out waiting for restores in progress to release the store lock");
+            finish();
+            return;
+        }
+        const std::string & fname = job.fname;
+        std::error_code ec;
+        std::filesystem::rename(job.tmp, fname, ec);
+        if (ec) {
+            aw_fail(job, "rename of the state file into place failed");
+            finish();
+            return;
+        }
+        std::filesystem::rename(slot_logits_sidecar_path(job.tmp), slot_logits_sidecar_path(fname), ec);
         ec.clear();
         {
-            // the draft sidecar lands before the .meta, so a scanned unit never points at a half-written
-            // one. A unit that has none (no draft context, or the write was skipped) must not inherit a
-            // .dft an earlier writer left at this name for a different draft chain shape.
+            // a unit without a .dft must not inherit one an earlier writer left at this name
             std::error_code dec;
-            if (std::filesystem::exists(slot_draft_sidecar_path(tmp), dec)) {
-                std::filesystem::rename(slot_draft_sidecar_path(tmp), slot_draft_sidecar_path(fname), dec);
+            if (dft_ok) {
+                std::filesystem::rename(slot_draft_sidecar_path(job.tmp), slot_draft_sidecar_path(fname), dec);
                 if (dec) {
-                    std::filesystem::remove(slot_draft_sidecar_path(tmp), dec);
+                    dft_ok = false;
+                    std::filesystem::remove(slot_draft_sidecar_path(job.tmp), dec);
                     std::filesystem::remove(slot_draft_sidecar_path(fname), dec);
                 }
             } else {
                 std::filesystem::remove(slot_draft_sidecar_path(fname), dec);
             }
         }
-        std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
-        // the .meta is the scan key — a unit whose .meta never landed must NOT be
-        // published. If the meta rename failed, the .bin is already in place but unindexable, so we
-        // unlink the orphan .bin (and any leftover temps) and DO NOT insert into the in-memory index.
-        // Leaving the .bin would waste disk and a restart scan would skip it anyway (no .meta).
-        if (ec) {
+        bool meta_fail = false;
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            meta_fail = aw.test_fail_meta > 0 && ++aw.n_publishes == aw.test_fail_meta;
+        }
+        if (!meta_fail) {
+            std::filesystem::rename(slot_meta_sidecar_path(job.tmp), slot_meta_sidecar_path(fname), ec);
+        }
+        if (meta_fail || ec) {
+            // the .meta is the scan key: a unit whose .meta never landed is not published
             std::error_code rec;
             std::filesystem::remove(fname, rec);
             std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
             std::filesystem::remove(slot_draft_sidecar_path(fname), rec);
-            auto_save_note_failure(slot, "rename of the .meta sidecar into place failed", snap_toks.size());
-            return; // invariant 4: don't index a unit whose .meta (the scan key) never published
+            aw_fail(job, "rename of the .meta sidecar into place failed");
+            finish();
+            return;
         }
-        pub_lock.release(); // the unit is whole on disk; LRU enforcement below takes no lock
-
-        if (media.empty()) {
-            SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", snap_toks.size(), fname.c_str());
-        } else {
-            SLT_INF(slot, "auto-save: persisted %zu cells incl. %zu media chunks to %s\n",
-                    snap_toks.size(), media.size(), fname.c_str());
+        pub_lock.release();
+        {
+            // published: a later child of this unit is no orphan, whatever an earlier attempt did
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            aw.failed_units.erase(std::remove(aw.failed_units.begin(), aw.failed_units.end(), job.hash), aw.failed_units.end());
         }
+        // power-loss durability of the renames
+        aw_sync_path(params_base.slot_save_path.empty() ? std::string(".") : params_base.slot_save_path, true);
+        t_pub = ggml_time_us() - t_p0;
 
+        // 3) index insert, then the LRU and the reconcile
         bool published = true;
-        // index insert (bhs[0..kb] -> this snapshot), then bounded-LRU + reconcile.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp, /*pinned=*/false, /*id=*/hash,
-                                /*deepest=*/ kb < bhs.size() ? bhs[kb] : 0 };
-            for (size_t i = 0; i <= kb && i < bhs.size(); ++i) {
-                auto_index_insert_locked(bhs[i], e);
+            auto_cache_entry e{ fname, (uint32_t) job.toks->size(), job.fp, /*pinned=*/false, /*id=*/job.hash,
+                                /*deepest=*/ job.kb < job.bhs.size() ? job.bhs[job.kb] : 0 };
+            for (size_t i = 0; i <= job.kb && i < job.bhs.size(); ++i) {
+                auto_index_insert_locked(job.bhs[i], e);
             }
-            auto_idx.indexed_files.insert(fname); // remember our own write so a refresh won't re-open it
+            auto_idx.indexed_files.insert(fname);
         }
-        // Eviction is opt-in and scoped to the auto cache. This hook already runs only under
-        // auto_cache_enabled(), but the gate is stated at the call site too so the invariant
-        // (a bounded, self-reaping store belongs to --slot-save-auto, never plain --slot-save-path)
-        // is local to every enforce_limits caller.
-        if (auto_cache_enabled() &&
-            (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
+        const int64_t t_e0 = ggml_time_us();
+        if (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0) {
             bool oversized = false;
+            uint64_t n_evicted = 0;
             slot_save_enforce_limits(params_base.slot_save_path,
                                      params_base.slot_save_max_count,
                                      params_base.slot_save_max_bytes,
-                                     fname, oversized, &metrics.n_auto_cache_evicted);
+                                     fname, oversized, &n_evicted);
+            aw_cnt.evicted += n_evicted;
             if (oversized) {
-                // enforce_limits deleted the unit just published; the reconcile below drops it
-                // from the index. Not a stored save, so it counts as dropped, not as a root/delta.
                 published = false;
-                auto_save_note_failure(slot, "snapshot is larger than --slot-save-max-mb", snap_toks.size());
+                aw_mark_failed(job.hash);
+                auto_save_note_failure(job.slot_id, "snapshot is larger than --slot-save-max-mb", job.toks->size());
             }
         }
-        if (published) {
-            (is_node ? metrics.n_auto_save_delta : metrics.n_auto_save_root)++;
-            metrics.n_auto_save_bytes += nwrite;
-        }
-        // Reconcile index with what the LRU kept (ours or a peer's) AND adopt the post-write dir
-        // mtime as our scan baseline — both under ONE lock. Re-baselining here means OUR OWN
-        // save+evict does not make the next lookup think a PEER changed the dir (which would force a
-        // redundant full re-scan); a real peer write afterwards bumps the mtime again -> still
-        // detected. CALLER holds no lock here.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto_index_drop_missing_locked();
@@ -3888,7 +4534,30 @@ private:
                 auto_idx.dir_mtime = dmt;
             }
         }
+        t_evict = ggml_time_us() - t_e0;
+        if (published) {
+            (job.is_node ? aw_cnt.delta : aw_cnt.root)++;
+            aw_cnt.bytes += job.bin.n_expected;
+            if (dft_ok) {
+                aw_cnt.draft++;
+            }
+        }
+        const char * mode = job.mode == aw_mode::staged ? "staged" : job.mode == aw_mode::streamed ? "streamed" : "sync";
+        char what[64];
+        if (job.media.empty()) {
+            snprintf(what, sizeof(what), "%zu tokens", job.toks->size());
+        } else {
+            snprintf(what, sizeof(what), "%zu cells incl. %zu media chunks", job.toks->size(), job.media.size());
+        }
+        SRV_INF("slot %d: auto-save: persisted %s to %s (%s, %zu B: capture d2h %.1f ms [tgt %.1f / dft %.1f / logits %.1f], "
+                "queue-wait %.1f ms, write %.1f ms, fdatasync %.1f ms, publish %.1f ms, evict %.1f ms, mode %s)\n",
+                job.slot_id, what, fname.c_str(), job.is_node ? "delta" : "root", job.bin.n_expected,
+                (job.t_d2h_tgt + job.t_d2h_dft + job.t_logits) / 1000.0, job.t_d2h_tgt / 1000.0, job.t_d2h_dft / 1000.0,
+                job.t_logits / 1000.0, sync ? 0.0 : (t_start - job.t_enq) / 1000.0,
+                t_write / 1000.0, t_sync / 1000.0, t_pub / 1000.0, t_evict / 1000.0, mode);
+        finish();
     }
+
 
     // MID-PREFILL SHARED-CONTEXT BASE (Option A): persist the leading shared preamble [0, B_ctx) ONCE
     // as a deduplicated WHOLE-state v1 ROOT, so N chats sharing that prefix each restore this base via
@@ -4082,7 +4751,6 @@ private:
                 }
             }
         }
-
         // INCREMENTAL SAVE: when --slot-save-incremental, write only the KV cells added since the
         // deepest already-saved snapshot on this branch (a v3 text / v4 media delta node) instead of
         // re-D2H'ing and re-writing the whole prefix. Find the deepest candidate whose persisted cells
@@ -4106,6 +4774,32 @@ private:
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
+        // per-record parent verify over the shared prefix [0, parent_hi): every candidate record starting
+        // inside the parent must equal THIS prompt's record at that exact start index (id, shape, type).
+        // Media cells are NULL==NULL so the byte compare is identity-blind; this restores the byte backstop a
+        // text delta gets for free. Without it a ~2^-64 filename-hash collision between same-text/different-
+        // image prefixes could compose the WRONG parent KV. A no-op for a text delta (decision 5).
+        const auto records_match = [&](const std::vector<server_media_record> & cand_media, size_t parent_hi_sz) {
+            for (const auto & rec : cand_media) {
+                if ((size_t) rec.start_idx >= parent_hi_sz) {
+                    break; // this and all later records start outside the shared prefix
+                }
+                const auto it = std::lower_bound(media.begin(), media.end(), rec.start_idx,
+                    [](const server_media_record & r, uint32_t s) { return r.start_idx < s; });
+                const bool match = it != media.end()             &&
+                                   it->start_idx == rec.start_idx &&
+                                   it->id        == rec.id        &&
+                                   it->n_tokens  == rec.n_tokens  &&
+                                   it->n_pos     == rec.n_pos     &&
+                                   it->nx        == rec.nx        &&
+                                   it->ny        == rec.ny        &&
+                                   it->is_audio  == rec.is_audio;
+                if (!match) {
+                    return false;
+                }
+            }
+            return true;
+        };
         if (params_base.slot_save_incremental) {
             // `toks`/`media` are this prompt's cell tokens + records; look up against the live prompt.
             for (const auto_cache_entry & cand : auto_index_lookup(slot.prompt.tokens, /*max_attempts=*/SIZE_MAX)) {
@@ -4137,34 +4831,7 @@ private:
                 if (!boundary_is_chunk_safe(toks, media, parent_hi_sz)) {
                     continue;
                 }
-                // per-record parent verify over the shared prefix [0, parent_hi): every candidate
-                // record starting inside the parent must equal THIS prompt's record at that exact start
-                // index (id, shape, type). Media cells are NULL==NULL so the byte compare above is
-                // identity-blind; this restores the byte backstop a text delta gets for free — without
-                // it a ~2^-64 filename-hash collision between same-text/different-image prefixes could
-                // compose the WRONG parent KV. Reuses the restore-path match block; a no-op for a text
-                // delta (disk_media empty) (decision 5).
-                bool records_ok = true;
-                for (const auto & rec : disk_media) {
-                    if ((size_t) rec.start_idx >= parent_hi_sz) {
-                        break; // this and all later records start outside the shared prefix
-                    }
-                    const auto it = std::lower_bound(media.begin(), media.end(), rec.start_idx,
-                        [](const server_media_record & r, uint32_t s) { return r.start_idx < s; });
-                    const bool match = it != media.end()             &&
-                                       it->start_idx == rec.start_idx &&
-                                       it->id        == rec.id        &&
-                                       it->n_tokens  == rec.n_tokens  &&
-                                       it->n_pos     == rec.n_pos     &&
-                                       it->nx        == rec.nx        &&
-                                       it->ny        == rec.ny        &&
-                                       it->is_audio  == rec.is_audio;
-                    if (!match) {
-                        records_ok = false;
-                        break;
-                    }
-                }
-                if (!records_ok) {
+                if (!records_match(disk_media, parent_hi_sz)) {
                     continue;
                 }
                 // parent_id = the parent's own file id, read from its filename: the restore walk resolves
@@ -4245,29 +4912,34 @@ private:
     // LRU bound the only residual (a recurrent mid-generation snapshot a shorter re-request can't
     // rewind into — a safe, evictable write).
     //
-    // Deadline-boxed: each slot's flush is a potentially multi-GB write, and the process is
-    // typically inside a supervisor's stop window (systemd SIGKILLs at TimeoutStopSec) — an
-    // unbounded flush loop trades a clean exit for evictable cache units. The deadline is
-    // checked BETWEEN slots (an in-flight write is never aborted), so the worst case is
-    // deadline + one write; README documents sizing TimeoutStopSec against
-    // slot_save_max_mb x n_slots.
-    static constexpr int64_t AUTO_SAVE_SHUTDOWN_DEADLINE_MS = 60 * 1000;
+    // Deadline-boxed: the process is typically inside a supervisor's stop window (systemd SIGKILLs at
+    // TimeoutStopSec, 120 s on the rig, the router waits 150 s). The captures here block (the shutdown
+    // admission waits for staging room instead of dropping), then the queue is closed and the writer
+    // drains what is left, jobs queued before the shutdown first, so parents precede the shutdown
+    // children. Whatever is still queued at AW_SHUTDOWN_DEADLINE_MS is abandoned between chunks, its temps
+    // unlinked and never renamed (llamacpp:auto_cache_save_shutdown_abandoned_total), which leaves time
+    // for llama_backend_free inside the stop window.
     void auto_save_slots_at_shutdown() {
         if (!auto_cache_enabled()) {
             return; // off by default
         }
-        if (sleeping) {
-            return; // sleep entry destroy()'d ctx_tgt; the warm KV is already gone
+        const int64_t t_deadline_ms = ggml_time_ms() + aw.shutdown_ms;
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            aw.shutdown    = true;
+            aw.deadline_ms = t_deadline_ms;
         }
-        const int64_t t_deadline_ms = ggml_time_ms() + AUTO_SAVE_SHUTDOWN_DEADLINE_MS;
-        for (size_t i = 0; i < slots.size(); i++) {
-            if (ggml_time_ms() >= t_deadline_ms) {
-                SRV_WRN("auto-save: shutdown flush deadline (%" PRId64 " ms) exceeded, skipping %zu remaining slots\n",
-                        AUTO_SAVE_SHUTDOWN_DEADLINE_MS, slots.size() - i);
-                break;
+        if (!sleeping) { // sleep entry destroy()'d ctx_tgt; the warm KV is already gone
+            for (size_t i = 0; i < slots.size(); i++) {
+                if (ggml_time_ms() >= t_deadline_ms) {
+                    SRV_WRN("auto-save: shutdown flush deadline (%" PRId64 " ms) exceeded, skipping %zu remaining slots\n",
+                            aw.shutdown_ms, slots.size() - i);
+                    break;
+                }
+                auto_save_slot_if_useful(slots[i]);
             }
-            auto_save_slot_if_useful(slots[i]);
         }
+        aw_stop(t_deadline_ms);
     }
 
     // AUTO-SAVE (idle-delay): the two other save sites (get_available_slot reclaim, shutdown) only
@@ -4819,6 +5491,7 @@ private:
             auto_index_scan();
             SRV_INF("auto disk prompt cache enabled: indexed %zu prefix boundaries from %s (block=%d)\n",
                     auto_idx.by_boundary.size(), params_base.slot_save_path.c_str(), params_base.slot_save_block);
+            aw_start();
         }
 
         if (!is_resume) {
@@ -6090,6 +6763,7 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    auto_metrics_fill(res->metrics);
                     if (const auto & pc = chat_params.preamble_cache) {
                         res->metrics.n_sysnode_probed        = pc->n_probed.load();
                         res->metrics.n_sysnode_probe_renders = pc->n_probe_renders.load();

@@ -734,6 +734,10 @@ struct common_params {
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).
     int32_t slot_save_idle_seconds = 60;
     bool    slot_save_idle_seconds_set = false; // true once --slot-save-idle-seconds is given explicitly
+    // background writer of the auto disk cache: host memory (MiB) a save may hold between its copy off the
+    // device and its write; a save that does not fit streams through two chunks when the writer is idle and
+    // is dropped (and counted) when it is busy. 0 writes every save on the server thread instead.
+    int32_t slot_save_staging_mb = 1024;
     // checkpoint triggers of the auto disk cache: which moments publish a node (docs/disk-cache.md).
     // The conversation itself is saved on idle (slot_save_idle_seconds), on reclaim and at shutdown.
     bool    slot_save_node_system   = true;  // node at the end of the leading system context (chat template preamble end

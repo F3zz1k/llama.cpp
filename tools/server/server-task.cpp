@@ -1684,6 +1684,31 @@ std::string server_task_result_metrics::to_metrics() {
             "Auto disk KV cache: chat prompts too short in bytes to reach the system node's floor, so not probed",
             (double) metrics.n_sysnode_probe_short
         },
+        {
+            "auto_cache_save_queued_total",
+            "Auto disk KV cache: saves handed to the background writer after their copy off the device",
+            (double) metrics.n_auto_save_queued
+        },
+        {
+            "auto_cache_save_streamed_total",
+            "Auto disk KV cache: of those, saves larger than the free staging, streamed through two chunks while the writer was idle",
+            (double) metrics.n_auto_save_streamed
+        },
+        {
+            "auto_cache_save_dropped_staging_total",
+            "Auto disk KV cache: saves dropped because the staging (--slot-save-staging-mb) was full and the writer busy; each logs a WRN",
+            (double) metrics.n_auto_save_dropped_staging
+        },
+        {
+            "auto_cache_save_orphan_dropped_total",
+            "Auto disk KV cache: queued deltas dropped because their parent failed to publish or left the store; each logs a WRN",
+            (double) metrics.n_auto_save_orphan_dropped
+        },
+        {
+            "auto_cache_save_shutdown_abandoned_total",
+            "Auto disk KV cache: queued saves abandoned at the shutdown deadline (temps removed, nothing published); each logs a WRN",
+            (double) metrics.n_auto_save_shutdown_abandoned
+        },
     };
 
     const std::vector<metric_item> gauges = {
@@ -1707,6 +1732,14 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "auto_cache_save_staging_bytes",
+            "Auto disk KV cache: host bytes held by saves copied off the device and not yet written",
+            (double) metrics.n_auto_save_staging_bytes
+        }, {
+            "auto_cache_save_queue_depth",
+            "Auto disk KV cache: saves queued for the background writer or being written",
+            (double) metrics.n_auto_save_queue_depth
         },
     };
 

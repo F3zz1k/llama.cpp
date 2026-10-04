@@ -3752,6 +3752,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-staging-mb"}, "N",
+        string_format("auto disk cache: host memory in MiB that saves may hold between their copy off the device "
+                      "and their write by the background writer, so the copy is all a request waits for. A save "
+                      "that does not fit streams through two chunks when the writer is idle and is dropped (counted "
+                      "in llamacpp:auto_cache_save_dropped_staging_total) when it is busy. Allocated per save and "
+                      "freed as it is written. 0 writes every save on the server thread (default: %d)",
+                      params.slot_save_staging_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-staging-mb must be >= 0");
+            }
+            params.slot_save_staging_mb = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_STAGING_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-save-node-system"},
         {"--no-slot-save-node-system"},
         "auto disk cache: publish a node at the end of the leading system context (system and developer "
