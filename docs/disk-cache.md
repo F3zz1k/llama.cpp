@@ -86,7 +86,7 @@ never restores into a smaller context, and sliding-window models only restore at
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
-| `--slot-save-on-reclaim` | on | the conversation, before a request from a different conversation takes its slot |
+| `--slot-save-on-reclaim` | on | the conversation, before a request that does not extend it takes its slot (it diverges at least one block before the slot's end, so a different conversation sharing only a system prompt counts) |
 | (shutdown) | always | every slot's conversation, on a graceful stop |
 
 The defaults save the conversation when that is useful (idle, reclaim, shutdown) and never on every
@@ -147,7 +147,20 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 - The system and prompt nodes are written for text prompts only; conversations with images or audio are
   saved on idle, reclaim, shutdown and after responses.
 - The system and prompt nodes depend on the chat template's message delimiters. A raw `/completion`
-  prompt has no messages, so its prompt node sits one block before the end and it gets no system node.
+  prompt has no messages, so its prompt node sits one block before the end and it gets no system node
+  (a client can pass `message_delimiters` itself, as the chat path does).
+- The system-prompt-only pre-cache needs a template whose parser marks the system role: the Qwen3-Coder
+  family (Qwen3.5 to 3.8), gpt-oss, Cohere2-MoE, Inkling, Kimi-K3, Ling3 and LLM-jp-harmony do. Gemma 4,
+  DeepSeek and templates handled by the generic autoparser mark only user and assistant turns, so on
+  those the system node is written only once a user message follows the system prompt.
+- Sliding-window models (Gemma, Laguna) no longer write a node near the end of a cold prompt by
+  default, as main-patched did before the checkpoint triggers: a resend of the same request after a
+  restart misses when the prompt is longer than one window. `--slot-save-node-prompt cold` restores
+  that behaviour (its floor is `max(--slot-save-block, --slot-save-min-tokens)`, where main-patched
+  used `max(--slot-save-block, --slot-save-context-min-tokens)`).
+- On a rollback to a release older than the `.dft` draft sidecars, purge `*.dft` from the store first;
+  an older binary counts them as units, evicts them and can delete a newer binary's `.tmp.dft` temps.
+  Never run the two on one store at the same time.
 - Every instance writing to one directory must agree on the model, `-c` (except for the rung rule above),
   `--cache-type-k/v`, `--slot-save-block`, the mmproj and the RoPE settings; a unit from a mismatched
   instance is refused, never restored into the wrong context.
