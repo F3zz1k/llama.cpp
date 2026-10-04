@@ -11,8 +11,11 @@
 //   G  (nctx_a)  composes F's chain                                 -> must equal F byte for byte
 //   N  (nctx_a)  composes A's chain while a second sequence decodes between the nodes (interleaved,
 //                fragmented cells; --noise, needs --seqmax 2)        -> must equal W byte for byte
+//   NC (nctx_a)  control for N: DECODES the prompt segments under the same interleaving and holes, so
+//                its logits carry the same cell-placement noise floor; N is judged against NC, not W
 // Then every context decodes the same forced continuation; logits and final state blobs are compared.
 // Controls: A2 repeats A exactly (determinism), A1 decodes the prompt in one call (order noise floor).
+// W must equal A (blob and logits) when both use one sequence id, and G's logits must equal F's.
 
 #include "llama.h"
 
@@ -309,7 +312,8 @@ int main(int argc, char ** argv) {
     load_chain(W, {fw}, n_prompt);
     const auto BW = blob(W, o.seq_b);
     if (o.seq_a == o.seq_b) {
-        cmp_blob(o, "W(whole restore) vs A", BA, BW, "A", "W");
+        // a defect shared by the whole restore and the deltas would otherwise be invisible
+        if (!cmp_blob(o, "W(whole restore) vs A", BA, BW, "A", "W")) g_fail++;
     }
 
     // ---- C: compose at the same n_ctx
@@ -375,10 +379,28 @@ int main(int argc, char ** argv) {
         // cells in another order: only the logits below are a valid criterion then
         if (!cmp_blob(o, "N(compose, interleaved) vs W", BW, blob(N, o.seq_b), "W", "N") && !o.holes) g_fail++;
     }
+    // ---- NC: N's control, the same interleaving and holes around DECODED prompt segments
+    llama_context * NC = nullptr;
+    if (o.noise > 0 && o.rollback == 0) {
+        NC = make_ctx(model, o, o.nctx_a);
+        decode(NC, noise_toks, 0, o.noise, seq_noise);
+        int nc_noise_pos = o.noise;
+        int prev = 0;
+        for (size_t s = 0; s < o.splits.size(); ++s) {
+            decode(NC, toks, prev, o.splits[s], o.seq_b);
+            prev = o.splits[s];
+            decode(NC, noise_toks, nc_noise_pos, nc_noise_pos + o.noise, seq_noise);
+            nc_noise_pos += o.noise;
+            if (o.holes && s + 1 < o.splits.size()) {
+                llama_memory_seq_rm(llama_get_memory(NC), seq_noise, 0, std::min(o.noise/2, 8));
+            }
+        }
+    }
 
     // ---- rung chain: an nctx_b instance restores the root, extends it and writes the deltas, then an
     //      nctx_a instance composes that chain
     std::vector<uint8_t> BF;
+    std::vector<std::vector<float>> LF;
     {
         llama_context * F = make_ctx(model, o, o.nctx_b);
         load_chain(F, {files_a[0]}, o.splits[0]);
@@ -397,6 +419,7 @@ int main(int argc, char ** argv) {
             prev = o.splits[s];
         }
         BF = blob(F, o.seq_b);
+        LF = gen_forced(F, cont, n_prompt, o.seq_b);
         llama_free(F);
     }
     llama_context * G = make_ctx(model, o, o.nctx_a);
@@ -429,7 +452,13 @@ int main(int argc, char ** argv) {
         printf("  logits A1 vs A (one-shot prompt):  max %.3g  per token:%s\n", max_abs_diff(LA, LA1), per_token(LA, LA1).c_str());
     }
     printf("  logits W vs A (whole restore):     max %.3g  per token:%s\n", max_abs_diff(LA, LW), per_token(LA, LW).c_str());
-    struct { const char * name; llama_context * ctx; bool must; } others[] = { {"C", C, true}, {"D", D, true}, {"G", G, false}, {"N", N, true} };
+    if (o.seq_a == o.seq_b) {
+        CHECK(max_abs_diff(LA, LW) == 0, "a whole restore's logits differ from the live context by %.3g", max_abs_diff(LA, LW));
+    }
+    // N under --noise is judged against NC (same interleaving, decoded): the placement of its cells
+    // changes the reduction order, so bitwise equality with the unfragmented W is not expected
+    struct { const char * name; llama_context * ctx; bool must; } others[] = { {"C", C, true}, {"D", D, true}, {"G", G, false}, {"N", N, NC == nullptr} };
+    std::vector<std::vector<float>> LN;
     for (auto & x : others) {
         if (!x.ctx) continue;
         const auto L = gen_forced(x.ctx, cont, n_prompt, o.seq_b);
@@ -438,16 +467,34 @@ int main(int argc, char ** argv) {
         if (x.must) {
             CHECK(d == 0, "%s logits differ from a whole restore by %.3g", x.name, d);
         }
+        if (x.ctx == G) {
+            // G composes the chain F wrote: it must continue exactly as F does
+            const double dg = max_abs_diff(LF, L);
+            printf("  logits G vs F (its writer):         max %.3g%s\n", dg, dg == 0 ? " (bitwise)" : "");
+            CHECK(dg == 0, "G logits differ from F, the context that wrote its chain, by %.3g", dg);
+        }
+        if (x.ctx == N) {
+            LN = L;
+        }
+    }
+    if (NC) {
+        const auto LNC = gen_forced(NC, cont, n_prompt, o.seq_b);
+        const double floor = max_abs_diff(LW, LNC);
+        const double dn    = max_abs_diff(LNC, LN);
+        printf("  logits NC vs W (interleaving floor): max %.3g\n", floor);
+        printf("  logits N vs NC (compose vs decode):  max %.3g%s\n", dn, dn == 0 ? " (bitwise)" : "");
+        CHECK(dn == 0 || (dn <= 2*floor && max_abs_diff(LW, LN) <= 2*floor),
+              "N logits differ from the decoded control NC by %.3g (floor %.3g)", dn, floor);
     }
     const auto BW2 = blob(W, o.seq_b);
     if (o.seq_a == o.seq_b) {
-        cmp_blob(o, "after-gen W vs A", blob(A, o.seq_a), BW2, "A2", "W2");
+        if (!cmp_blob(o, "after-gen W vs A", blob(A, o.seq_a), BW2, "A2", "W2")) g_fail++;
     }
     if (!cmp_blob(o, "after-gen C vs W", BW2, blob(C, o.seq_b), "W2", "C2")) g_fail++;
     if (!cmp_blob(o, "after-gen D vs W", BW2, blob(D, o.seq_b), "W2", "D2")) g_fail++;
     if (N && !cmp_blob(o, "after-gen N vs W", BW2, blob(N, o.seq_b), "W2", "N2") && !o.holes) g_fail++;
 
-    for (auto * c : {A, A2, A1, W, C, D, G, N}) if (c) llama_free(c);
+    for (auto * c : {A, A2, A1, W, C, D, G, N, NC}) if (c) llama_free(c);
     llama_model_free(model);
 
     printf("RESULT %s: %s (%d failures)\n", o.model.c_str(), g_fail ? "FAIL" : "PASS", g_fail);

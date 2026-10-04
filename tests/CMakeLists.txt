@@ -264,6 +264,31 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf" --tmp "${DELTA_BYTES_TMP}/deepseek4-${case_name}" ${case_args})
         set_tests_properties(test-delta-bytes-deepseek4-${case_name} PROPERTIES FIXTURES_REQUIRED generate-models)
     endforeach()
+    # Fragmented and rollback compose paths: a chain composed while another sequence decodes between the
+    # nodes (and frees cells so nodes land in holes) is judged against a decode under the same
+    # interleaving; RS classes also compose a chain whose last node follows an MTP-style rollback.
+    set(DELTA_BYTES_FRAG
+        "llama-dense|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "llama-dense|holes|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37|--holes"
+        "gemma3-dense|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "qwen35-dense|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "qwen35-dense|holes|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37|--holes"
+        "glm-dsa-moe|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "glm5-next-moe|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "qwen35-dense|rs|--rs|3|--rollback|2"
+        "glm5-next-moe|rs|--rs|3|--rollback|2"
+        "qwen4exp-moe|rs|--rs|3|--rollback|2")
+    foreach(case ${DELTA_BYTES_FRAG})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 case_name)
+        list(REMOVE_AT case_args 0 1)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/${model}-${case_name}")
+        llama_test(test-delta-bytes NAME test-delta-bytes-${model}-${case_name} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/${model}-${case_name}"
+                 --splits 130,200,300,401 --nctx-a 1024 --nctx-b 2048 ${case_args})
+        set_tests_properties(test-delta-bytes-${model}-${case_name} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
 
     llama_build(test-fusion.cpp)
 endif()
