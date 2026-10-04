@@ -184,11 +184,13 @@ curl http://localhost:8080/slots/0?action=save  -d '{"filename":"snap1.bin"}'
 curl http://localhost:8080/slots/0?action=restore -d '{"filename":"snap1.bin"}'
 ```
 
-On an `--mmproj` server these endpoints used to return 501 across the board; they now gate
-**per slot**. A text-only slot saves/restores exactly as before. A slot whose prompt
-contains media writes an extra `.meta` identity sidecar next to the state file, and a
-restore rebuilds the prompt's media chunks from it — see
-`docs/kv-cache/03-multimodal-cache.md` for the details and limits.
+They use upstream's implementation and file format, media slots included (upstream packs each
+image's id and geometry into the state file). The fork adds a `.logits` sidecar on recurrent and
+hybrid models, so resending exactly the saved prompt after a restore does not re-process it,
+refuses saves to `auto-*` names (reserved for the automatic cache), and restores any file that has a
+`.meta` sidecar (an automatic cache unit, or a media save from a fork build before 2026-10-03) the
+fork's way. Upstream's format has no projector fingerprint, so restoring a media snapshot after
+swapping `--mmproj` is not refused. Details: `docs/kv-cache/03-multimodal-cache.md`.
 
 ### Pinning a snapshot (permanent, never-evicted cache)
 

@@ -2720,13 +2720,23 @@ private:
         tokens.resize(token_count);
         slot.prompt.tokens.clear();
         slot.prompt.tokens.insert(tokens);
-        slot.just_restored = true;
 
         // the target is in place: bring the draft back warm from the chain's .dft sidecars when every
         // node has one, before any checkpoint below snapshots the draft state
         if (ctx_dft) {
             auto_restore_draft_chain(slot, node_paths);
         }
+
+        restore_finish(slot, &node_paths.back(), token_count);
+        return true;
+    }
+
+    // Bookkeeping after a KV state has been loaded into `slot` (prompt tokens already set), shared by
+    // the auto-cache restore and both manual /slots formats: marks the slot just-restored, drops the
+    // previous task's checkpoints, synthesises the FULL-class checkpoint and re-arms the regenerate
+    // logits from `sidecar_path` when one is given.
+    void restore_finish(server_slot & slot, const std::string * sidecar_path, size_t token_count) {
+        slot.just_restored = true;
 
         // Drop the previous task's checkpoints UNCONDITIONALLY, for every class, before any synth
         // below. They snapshot a DIFFERENT prompt's ctx_tgt state and the sequence they described no
@@ -2771,13 +2781,28 @@ private:
         // Load the regenerate logits sidecar (FULL and RS) so an exact-prompt regenerate can emit the
         // first token without re-decoding into the restored recurrent state.
         slot.restored_logits.clear();
-        if (logits_sidecar_class()) {
+        if (sidecar_path != nullptr && logits_sidecar_class()) {
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-            if (slot_logits_read(node_paths.back(), nv, (uint32_t) token_count, slot.restored_logits)) {
+            if (slot_logits_read(*sidecar_path, nv, (uint32_t) token_count, slot.restored_logits)) {
                 SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
             }
         }
-        return true;
+    }
+
+    // SWA models (PART seq_rm, n_swa > 0) after a manual /slots restore: reconstruct a checkpoint at
+    // the restored position, mirroring auto_restore_into_slot. The downstream checkpoint search finds
+    // none in a fresh process and would force a full re-process on the next request, silently
+    // discarding the restore. (FULL models get theirs in restore_finish; non-SWA attention models skip
+    // the checkpoint machinery.)
+    void restore_swa_checkpoint(server_slot & slot) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa_mem > 0) {
+            const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+            const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (ckpt_pos_min >= 0) {
+                slot.prompt.checkpoints.clear();
+                create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
+            }
+        }
     }
 
     // Drop a just-restored snapshot entirely: empty the slot's KV seq and prompt/restore state so
@@ -5849,71 +5874,57 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    // per-slot media gate (a server-wide check_no_mtmd used to 501 every manual
-                    // save under --mmproj, even for text-only slots): a text slot persists its
-                    // plain token-id list, byte-identical to the pre-media format; a media slot
-                    // persists its cell-aligned list (media cells LLAMA_TOKEN_NULL) plus a v2
-                    // .meta sidecar carrying the per-chunk identity records — the same identity
-                    // layer the auto disk cache uses.
-                    const bool slot_has_media = slot->prompt.tokens.has_media();
-                    std::vector<server_media_record> media;
-                    if (slot_has_media) {
-                        try {
-                            media = slot->prompt.tokens.extract_media_records();
-                        } catch (const std::exception & e) {
-                            // identity-less chunk (e.g. a placeholder bitmap): it could never be
-                            // re-verified or rehydrated, so the snapshot must not be persisted
-                            send_error(task, std::string("cannot save slot: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
-                            break;
-                        }
+                    // fork: auto-* names belong to the disk cache. Its units are immutable once published
+                    // and other instances sharing the directory may be reading one; overwriting it in place
+                    // (and dropping its .meta) would also orphan its delta children. Restoring one by name
+                    // stays allowed.
+                    if (filename.rfind("auto-", 0) == 0) {
+                        send_error(task, "filenames starting with 'auto-' are reserved for the disk cache", ERROR_TYPE_INVALID_REQUEST);
+                        break;
                     }
-                    const llama_tokens tokens = slot_has_media ? slot->prompt.tokens.get_cell_tokens()
-                                                               : slot->prompt.tokens.get_text_tokens();
-                    const size_t token_count = tokens.size();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
-                    // persist this slot's last-token logits as a sidecar (FULL/recurrent
-                    // only). Best-effort — a missing/failed sidecar simply disables the regenerate
-                    // fast-path for this snapshot. NOT folded into res->n_bytes (that contract stays
-                    // "state-file bytes only").
-                    //
-                    // CRITICAL consistency guard: only write the sidecar when the captured logits
-                    // provably belong to the EXACT state being saved, i.e. logits_last_n_tokens ==
-                    // token_count. This blocks every stale-logits path (restore-then-save with no
-                    // intervening decode; a spec-decode step that skipped the capture; a distribution
-                    // left over from a prior task on this slot object) from persisting a sidecar that
-                    // does not match the saved state — which would otherwise emit a wrong first token
-                    // on a later regenerate with nothing to catch it.
-                    if (nwrite > 0 && logits_sidecar_class()) {
-                        if (slot->logits_last_n_tokens == (int32_t) token_count && !slot->logits_last.empty()) {
+                    std::vector<char> packed;
+                    try {
+                        packed = slot->prompt.tokens.serialize();
+                    } catch (const std::exception & err) {
+                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    // fork: a fork-format save under the same name may have left sidecars behind; the
+                    // restore dispatches on .meta, so they must not outlive the file they described.
+                    // Removed only once the new snapshot can be written, so a refused save keeps the old one.
+                    {
+                        std::error_code ec;
+                        std::filesystem::remove(slot_meta_sidecar_path(filepath), ec);
+                        std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
+                        std::filesystem::remove(slot_draft_sidecar_path(filepath), ec);
+                    }
+
+                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    const size_t nwrite = llama_state_seq_save_file(
+                        ctx_tgt, filepath.c_str(), slot->id,
+                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    if (nwrite == 0) {
+                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    // fork: the regenerate logits sidecar (FULL and RS classes), next to upstream's file and
+                    // outside it, so the .bin stays upstream's format. Written only when the captured logits
+                    // belong to exactly the state just saved (stamped with its token count), so a stale
+                    // distribution can never be paired with this snapshot. Best effort: without it an exact
+                    // resend after the restore re-prefills instead of emitting its first token at once.
+                    if (logits_sidecar_class()) {
+                        const size_t n_tok = slot->prompt.tokens.size();
+                        if (slot->logits_last_n_tokens == (int32_t) n_tok && !slot->logits_last.empty()) {
                             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-                            const size_t nwrite_logits =
-                                slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) token_count);
-                            if (nwrite_logits == 0) {
+                            if (slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) n_tok) == 0) {
                                 SLT_WRN(*slot, "%s", "failed to write logits sidecar; regenerate fast-path disabled for this snapshot\n");
                             }
                         } else {
-                            SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, token_count=%zu); sidecar omitted\n",
-                                    slot->logits_last_n_tokens, token_count);
-                        }
-                    }
-
-                    // media snapshots publish their identity sidecar (v2 .meta) next to the state
-                    // file: a manual restore rebuilds the prompt's media chunks from it, since —
-                    // unlike the auto-restore path — there is no request to rebuild from. Text
-                    // snapshots keep the base on-disk shape (state file + optional .logits, no
-                    // .meta). A media state file without its sidecar is unrestorable, so a failed
-                    // sidecar write withdraws the whole unit and errors the save (never publish a
-                    // unit that can only be half-loaded). chain_hash is 0: manual units carry
-                    // user-chosen filenames and are never indexed by the auto cache — restore
-                    // authority is the byte-compared tokens.
-                    if (nwrite > 0 && slot_has_media) {
-                        if (!slot_meta_write(filepath, cur_fp, tokens, 0, media)) {
-                            std::error_code ec;
-                            std::filesystem::remove(filepath, ec);
-                            std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
-                            send_error(task, "failed to write the .meta sidecar for a media slot snapshot", ERROR_TYPE_SERVER);
-                            break;
+                            SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, n_tokens=%zu); sidecar omitted\n",
+                                    slot->logits_last_n_tokens, n_tok);
                         }
                     }
 
@@ -5969,73 +5980,125 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    // Compose the restore chain (U9 / decision 2). Manual SAVE only ever writes a
-                    // self-contained WHOLE unit (a v1/v2 snapshot, parent 0) — the guaranteed floor —
-                    // so a unit this endpoint produced restores as a single clearing load exactly as
-                    // before. But the same directory may hold an auto-cache v3/v4 DELTA tip whose .bin
-                    // carries only cells [parent_hi, N); pointing a manual restore at one MUST NOT be
-                    // refused (decision 2). Read its node tail and, when it is a delta, walk parent
-                    // links via the SHARED auto_build_restore_chain so base + deltas compose to the
-                    // full cell set before loading — the identical path the auto restore uses, so a v4
-                    // media delta tip restores correctly here too. A missing .meta / whole snapshot
-                    // (parent 0) keeps the single-file chain; only a genuinely broken delta chain
-                    // (a parent file gone or corrupt) errors, the same way a corrupt whole unit would.
-                    std::vector<std::string> restore_chain = { filepath };
-                    {
-                        model_fp     tip_fp;
-                        llama_tokens tip_toks;
-                        std::vector<server_media_record> tip_media;
-                        uint64_t tip_parent_id = 0;
-                        uint32_t tip_range_lo  = 0;
-                        uint32_t tip_range_hi  = 0;
-                        if (slot_meta_read(filepath, cur_fp.fp_mmproj, tip_fp, tip_toks, tip_media,
-                                           &tip_parent_id, &tip_range_lo, &tip_range_hi) &&
-                            (tip_parent_id != 0 || tip_range_lo != 0)) {
-                            if (!auto_build_restore_chain(filepath, tip_toks, tip_parent_id, tip_range_lo,
-                                                          restore_chain)) {
-                                send_error(task, "Unable to restore slot: the delta snapshot's parent "
-                                                 "chain is missing or inconsistent", ERROR_TYPE_INVALID_REQUEST);
+                    // fork: a file with a .meta sidecar is an auto-cache unit, or a manual media save
+                    // written before this endpoint adopted upstream's format. Neither is upstream's
+                    // format, so it keeps the fork path, which composes delta chains and rebuilds media
+                    // from the sidecar. Every other file takes upstream's body below, unchanged.
+                    std::error_code meta_ec;
+                    if (std::filesystem::exists(slot_meta_sidecar_path(filepath), meta_ec) && !meta_ec) {
+                        // Compose the restore chain (U9 / decision 2). A whole unit (v1/v2 snapshot, parent 0)
+                        // restores as a single clearing load. But the same directory may hold an auto-cache
+                        // v3/v4 DELTA tip whose .bin
+                        // carries only cells [parent_hi, N); pointing a manual restore at one MUST NOT be
+                        // refused (decision 2). Read its node tail and, when it is a delta, walk parent
+                        // links via the SHARED auto_build_restore_chain so base + deltas compose to the
+                        // full cell set before loading: the identical path the auto restore uses, so a v4
+                        // media delta tip restores correctly here too. A missing .meta / whole snapshot
+                        // (parent 0) keeps the single-file chain; only a genuinely broken delta chain
+                        // (a parent file gone or corrupt) errors, the same way a corrupt whole unit would.
+                        std::vector<std::string> restore_chain = { filepath };
+                        {
+                            model_fp     tip_fp;
+                            llama_tokens tip_toks;
+                            std::vector<server_media_record> tip_media;
+                            uint64_t tip_parent_id = 0;
+                            uint32_t tip_range_lo  = 0;
+                            uint32_t tip_range_hi  = 0;
+                            if (slot_meta_read(filepath, cur_fp.fp_mmproj, tip_fp, tip_toks, tip_media,
+                                               &tip_parent_id, &tip_range_lo, &tip_range_hi) &&
+                                (tip_parent_id != 0 || tip_range_lo != 0)) {
+                                if (!auto_build_restore_chain(filepath, tip_toks, tip_parent_id, tip_range_lo,
+                                                              restore_chain)) {
+                                    send_error(task, "Unable to restore slot: the delta snapshot's parent "
+                                                     "chain is missing or inconsistent", ERROR_TYPE_INVALID_REQUEST);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Shared restore body (also used by the transparent auto-restore path): loads the
+                        // composed chain into seq slot->id, sets just_restored + restored_logits, rebuilds
+                        // the FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
+                        size_t token_count = 0;
+                        size_t nread = 0;
+                        if (!do_slot_restore(*slot, restore_chain, &token_count, &nread)) {
+                            send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+
+                        // media snapshots: rebuild the prompt's media chunks as stubs from the v2
+                        // .meta sidecar: without them the restored NULL cells are untraversable.
+                        // Any rehydration failure drops the loaded state entirely (a half-rehydrated
+                        // slot must never survive to serve requests) and errors with the reason.
+                        {
+                            std::string err;
+                            if (!manual_restore_rehydrate_media(*slot, filepath, err)) {
+                                auto_restore_drop(*slot);
+                                send_error(task, "cannot restore media snapshot: " + err, ERROR_TYPE_INVALID_REQUEST);
                                 break;
                             }
                         }
-                    }
 
-                    // Shared restore body (also used by the transparent auto-restore path): loads the
-                    // composed chain into seq slot->id, sets just_restored + restored_logits, rebuilds
-                    // the FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
-                    size_t token_count = 0;
-                    size_t nread = 0;
-                    if (!do_slot_restore(*slot, restore_chain, &token_count, &nread)) {
-                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                        restore_swa_checkpoint(*slot);
+
+                        const int64_t t_end = ggml_time_us();
+                        const double t_restore_ms = (t_end - t_start) / 1000.0;
+
+                        auto res = std::make_unique<server_task_result_slot_save_load>();
+                        res->id       = task.id;
+                        res->id_slot  = id_slot;
+                        res->filename = filename;
+                        res->is_save  = false;
+                        res->n_tokens = slot->prompt.tokens.size();
+                        res->n_bytes  = nread;
+                        res->t_ms     = t_restore_ms;
+                        queue_results.send(std::move(res));
                         break;
                     }
 
-                    // media snapshots: rebuild the prompt's media chunks as stubs from the v2
-                    // .meta sidecar — without them the restored NULL cells are untraversable.
-                    // Any rehydration failure drops the loaded state entirely (a half-rehydrated
-                    // slot must never survive to serve requests) and errors with the reason.
-                    {
-                        std::string err;
-                        if (!manual_restore_rehydrate_media(*slot, filepath, err)) {
-                            auto_restore_drop(*slot);
-                            send_error(task, "cannot restore media snapshot: " + err, ERROR_TYPE_INVALID_REQUEST);
-                            break;
+                    // fork: nothing in ctx_dft belongs to the state about to be loaded, and a failed load
+                    // below must not leave the previous restore's flag and logits armed
+                    if (ctx_dft) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                    }
+                    slot->just_restored = false;
+                    slot->restored_logits.clear();
+
+                    size_t nread = 0;
+                    try {
+                        size_t n_packed = 0;
+                        llama_tokens packed;
+                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                        if (nread != 0) {
+                            packed.resize(std::max<size_t>(1, n_packed));
+                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
                         }
+                        if (nread == 0) {
+                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
+                        }
+                        packed.resize(n_packed);
+
+                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+                        if (restored.size() > (size_t) slot->n_ctx) {
+                            throw std::runtime_error("Restored prompt does not fit in the slot context");
+                        }
+
+                        if (!restored.validate(ctx_tgt)) {
+                            throw std::runtime_error("Invalid tokens in slot save file");
+                        }
+
+                        slot->prompt.clear();
+                        slot->prompt.tokens = std::move(restored);
+                    } catch (const std::exception & err) {
+                        slot->prompt_clear();
+                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                        break;
                     }
 
-                    // SWA models (PART seq_rm, n_swa > 0): reconstruct a checkpoint at the restored
-                    // position, mirroring auto_restore_into_slot — the downstream checkpoint search
-                    // finds none in a fresh process and would force a full re-process on the next
-                    // request, silently discarding the restore. (FULL models get theirs inside
-                    // do_slot_restore; non-SWA attention models skip the checkpoint machinery.)
-                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa_mem > 0) {
-                        const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
-                        const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
-                        if (ckpt_pos_min >= 0) {
-                            slot->prompt.checkpoints.clear();
-                            create_checkpoint(*slot, 0, ckpt_pos_min, ckpt_pos_max);
-                        }
-                    }
+                    // fork: restore flags, FULL/SWA checkpoints and the logits sidecar (see restore_finish)
+                    restore_finish(*slot, &filepath, slot->prompt.tokens.size());
+                    restore_swa_checkpoint(*slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -6835,8 +6898,8 @@ private:
                             //   - otherwise: fall back to a SAFE clear-then-reprefill (never crash).
                             // Gated so it is unreachable for non-recurrent models, with-suffix requests
                             // and non-generative slots. Media prompts DO reach it: the auto path never
-                            // had a server-wide mtmd gate (and the manual /slots endpoints now gate
-                            // per-slot), so a byte-identical media resend on a FULL-seq_rm model
+                            // had a server-wide mtmd gate (and the manual /slots endpoints save media
+                            // slots in upstream's format), so a byte-identical media resend on a FULL-seq_rm model
                             // restores its whole snapshot and lands exactly here.
                             // The body is media-safe by construction:
                             // init_sampler skips LLAMA_TOKEN_NULL cells, and the speculative begin feeds

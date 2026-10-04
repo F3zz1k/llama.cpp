@@ -453,7 +453,7 @@ The restored KV state round-trips faithfully, but a *fully* restored prompt — 
 
 ### Manual `/slots` save/restore with multimodal
 
-The manual `/slots/{id}?action=save|restore` endpoints gate per slot, not per server: a text-only slot on an `--mmproj` server saves and restores exactly as on a text-only server. A slot whose prompt contains media saves its state plus a version-2 `.meta` sidecar; restoring it rebuilds the prompt's media chunks as *stubs* from those identity records (the embeddings come from the state file, so no pixels are needed). A stub is never re-encoded: any follow-up that would require re-processing a stubbed image (e.g. a divergence before it) drops the stub and re-processes from the request's own data. Restoring a media state file without its `.meta` sidecar fails with an explicit error.
+The manual `/slots/{id}?action=save|restore` endpoints use upstream's implementation and file format: the state file carries the slot's tokens and, for a media slot, each media chunk's id and geometry (no pixels; the embeddings come from the state file). A restored media chunk is a placeholder that is never re-encoded: any follow-up that would require re-processing it (e.g. a divergence before it) drops it and re-processes from the request's own data. Upstream's format records no model or `--mmproj` fingerprint, so restoring a media snapshot after swapping the projector is not refused. A fork-format file that has a `.meta` sidecar (an auto-cache unit, or a media save made by an older fork build) is restored the fork's way: a delta unit with its parent chain, media rebuilt from the sidecar.
 
 ### Operational notes
 
@@ -1213,7 +1213,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
-On a server started with `--mmproj`, this gates per slot: a text-only slot saves exactly as on a text-only server, while a slot whose prompt contains media additionally writes a `.meta` identity sidecar (see [Manual `/slots` save/restore with multimodal](#manual-slots-saverestore-with-multimodal)).
+The file is in upstream's format. On recurrent and hybrid models (and any model whose memory cannot be trimmed back by one token) a `.logits` sidecar is also written next to it, so that resending exactly the saved prompt after a restore emits its first token without re-processing the prompt. Filenames starting with `auto-` are reserved for the automatic disk cache and are refused.
 
 **Response format**
 
@@ -1235,7 +1235,7 @@ On a server started with `--mmproj`, this gates per slot: a text-only slot saves
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
 
-Restoring a media snapshot rebuilds its media chunks from the `.meta` sidecar saved next to the state file; a media state file without a valid sidecar is refused with an explicit error (see [Manual `/slots` save/restore with multimodal](#manual-slots-saverestore-with-multimodal)).
+Reads upstream's format, and its older plain token lists. A file with a `.meta` sidecar (an automatic disk cache unit, including a delta whose parents are composed, or a media save from an older fork build) is restored through the disk cache's path (see [Manual `/slots` save/restore with multimodal](#manual-slots-saverestore-with-multimodal)).
 
 **Response format**
 

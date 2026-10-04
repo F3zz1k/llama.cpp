@@ -1305,12 +1305,13 @@ def _file_bytes(name: str) -> bytes:
 
 
 def test_manual_media_save_restore_continues():
-    """Manual SAVE of a media slot writes a v2 .meta sidecar; a fresh process manually
-    RESTORES it (stub rehydration) to exactly the saved state, and the identical request
-    reuses the restored cells INCLUDING the image's (the image is never re-encoded).
+    """Manual SAVE of a media slot writes upstream's packed server_tokens payload (no
+    sidecar); a fresh process manually RESTORES it to exactly the saved state, and the
+    identical request reuses the restored cells INCLUDING the image's (the image is never
+    re-encoded).
 
     Fidelity is checked on the state itself: saving the restored slot again must give a
-    byte-identical .bin and .meta. The answer is compared only against a run that decodes
+    byte-identical .bin. The answer is compared only against a run that decodes
     the same suffix in the same batch split (an in-process erase + restore): on the tiny CI
     model the greedy answer depends on the split alone, e.g. the in-memory continuation
     re-decodes 5 tokens from a prefill checkpoint where a restore re-decodes 1, and those two
@@ -1333,14 +1334,11 @@ def test_manual_media_save_restore_continues():
     prompt_n_ref, _, content_ref = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
     vs.stop()
 
-    # the sidecar is a v2 meta whose single record tiles the image's NULL cells
-    version, toks, media = parse_meta(os.path.join(CACHE_DIR, "media.bin.meta"))
-    assert version == 2
-    assert len(toks) == n_saved
-    assert len(media) == 1 and media[0]["is_audio"] == 0
-    n_img = media[0]["n_tokens"]
-    assert n_img > 0
-    assert sum(1 for t in toks if t == LLAMA_TOKEN_NULL) == n_img
+    # upstream's format: no sidecar, and the token payload opens with the packed marker
+    assert not os.path.exists(os.path.join(CACHE_DIR, "media.bin.meta"))
+    data = _file_bytes("media.bin")
+    assert struct.unpack_from("<i", data, 12)[0] == LLAMA_TOKEN_NULL
+    assert struct.unpack_from("<I", data, 20)[0] == n_saved  # packed: marker, version, n_tokens
 
     # fresh process: a cold run first (the slot then holds other state), then erase + restore
     vs = make_manual_vision_server()
@@ -1358,11 +1356,11 @@ def test_manual_media_save_restore_continues():
     assert res.status_code == 200
     assert res.body["n_saved"] == n_saved
     assert _file_bytes("media-rt.bin") == _file_bytes("media.bin")
-    assert _file_bytes("media-rt.bin.meta") == _file_bytes("media.bin.meta")
+    assert not os.path.exists(os.path.join(CACHE_DIR, "media-rt.bin.meta"))
 
     warm = raw_media_request_body(vs, MEDIA_PROMPT, [IMG_B64], n_probs=8)
     prompt_n_warm, cache_n_warm, content_warm = warm["timings"]["prompt_n"], warm["timings"]["cache_n"], warm["content"]
-    assert cache_n_warm >= media[0]["start_idx"] + n_img  # every image cell came from the restore
+    assert cache_n_warm == n_saved - prompt_n_warm        # every saved cell came from the restore
     assert prompt_n_warm <= 8                             # the image was NOT re-processed
     assert prompt_n_warm == prompt_n_ref                  # same split as the reference ...
     assert content_warm == content_ref                    # ... so the same answer
@@ -1431,9 +1429,10 @@ def test_manual_media_restore_stub_never_encoded():
     vs.stop()
 
 
-def test_manual_media_restore_refuses_without_meta():
-    """A media state file without its .meta sidecar cannot be rehydrated: the manual
-    restore refuses with an explicit error AND leaves the slot cleared-but-usable."""
+def test_manual_media_restore_refuses_cells_without_meta():
+    """A plain cell list with media cells and no .meta sidecar (a pre-2026-10 manual media
+    save that lost its sidecar) has nothing to rebuild the media from: the manual restore
+    refuses with an explicit error AND leaves the slot cleared-but-usable."""
     vs = make_manual_vision_server()
     vs.start()
     prompt_n_full, _, _ = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64], n_predict=0)
@@ -1441,13 +1440,23 @@ def test_manual_media_restore_refuses_without_meta():
     assert res.status_code == 200
     vs.stop()
 
-    os.remove(os.path.join(CACHE_DIR, "media.bin.meta"))
+    # rewrite upstream's packed payload into the old plain cell list (NULL media cells, no records)
+    path = os.path.join(CACHE_DIR, "media.bin")
+    data = bytearray(_file_bytes("media.bin"))
+    payload_end = 12 + struct.unpack_from("<I", data, 8)[0] * 4
+    n_tokens = struct.unpack_from("<I", data, 20)[0]
+    cells = data[24:24 + n_tokens * 4]
+    assert LLAMA_TOKEN_NULL in struct.unpack_from(f"<{n_tokens}i", cells, 0)
+    data = data[:12] + cells + data[payload_end:]
+    struct.pack_into("<I", data, 8, n_tokens)
+    with open(path, "wb") as f:
+        f.write(data)
 
     vs = make_manual_vision_server()
     vs.start()
     res = vs.make_request("POST", "/slots/0?action=restore", data={"filename": "media.bin"})
-    assert res.status_code != 200
-    assert "sidecar" in str(res.body)
+    assert res.status_code == 400
+    assert "Invalid tokens in slot save file" in str(res.body)
 
     # the refused restore dropped the loaded state entirely: the slot cold-serves
     prompt_n, cache_n, content = raw_media_request(vs, MEDIA_PROMPT, [IMG_B64])
