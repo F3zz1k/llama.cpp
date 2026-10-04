@@ -73,7 +73,7 @@ def parse_meta(path: str):
 
 
 def _metas():
-    return sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta")))
+    return sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")))
 
 
 def _bin_for(meta_path: str) -> str:

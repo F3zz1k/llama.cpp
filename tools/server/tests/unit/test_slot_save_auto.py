@@ -608,7 +608,7 @@ def test_vision_save_writes_v2_unit():
     # graceful stop -> auto_save_slots_at_shutdown flushes both slots to the store
     vserver.stop()
 
-    metas = {p: parse_meta(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))}
+    metas = {p: parse_meta(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta"))}
     v1 = [m for m in metas.values() if m[0] == 1]
     v2 = [m for m in metas.values() if m[0] == 2]
     # the text-only turn on the vision server must NOT have become a v2 unit
@@ -741,7 +741,7 @@ def vision_request(vs: ServerProcess, contents: list, id_slot: int | None = None
 def read_v2_metas():
     """Parse all v2 .meta units in CACHE_DIR; returns [(path, toks, media), ...]."""
     out = []
-    for p in sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))):
+    for p in sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta"))):
         version, toks, media = parse_meta(p)
         if version == 2:
             out.append((p, toks, media))
@@ -814,7 +814,7 @@ def test_vision_incremental_writes_v4_delta_node():
     reply = r1.body["choices"][0]["message"]["content"]
     s1.stop()  # shutdown flush publishes the v2 root
 
-    roots = [parse_meta_node(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))]
+    roots = [parse_meta_node(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta"))]
     assert len(roots) == 1 and roots[0]["version"] == 2, "session 1 must persist exactly one v2 media root"
     root = roots[0]
     assert len(root["media"]) >= 1  # the image chunk is recorded
@@ -843,7 +843,7 @@ def test_vision_incremental_writes_v4_delta_node():
         f"session 2 must restore the media base from disk; cache_n={r2.body['timings']['cache_n']}"
     s2.stop()  # shutdown flush publishes the v4 delta
 
-    metas = {p: parse_meta_node(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))}
+    metas = {p: parse_meta_node(p) for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta"))}
     v2s = [m for m in metas.values() if m["version"] == 2]
     v4s = [m for m in metas.values() if m["version"] == 4]
     assert len(v2s) == 1 and len(v4s) == 1, \
@@ -897,7 +897,7 @@ def test_text_only_on_vision_server():
     vs.stop()  # shutdown flush publishes the unit
 
     # the persisted unit keeps the base v1 on-disk shape (no media section)
-    metas = glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))
+    metas = glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta"))
     assert len(metas) == 1
     assert read_v2_metas() == []
 
@@ -1155,7 +1155,7 @@ def test_parallel_slots_media():
     vs.stop()  # shutdown flush persists BOTH slots
 
     # the media slot published a v2 unit, the text slot a v1 unit, in the same dir
-    assert len(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta"))) == 2
+    assert len(glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta"))) == 2
     assert len(read_v2_metas()) == 1
 
     vs = make_parallel_vision_server()
@@ -1593,7 +1593,7 @@ IDLE_SECONDS = 3
 
 
 def _units_on_disk():
-    return sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.meta")))
+    return sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")))
 
 
 def _wait_for_unit(timeout_s: float):

@@ -84,6 +84,7 @@ class ServerProcess:
     slot_save_idle_seconds: int | None = None
     slot_save_max_count: int | None = None
     slot_save_max_mb: int | None = None
+    slot_save_staging_mb: int | None = None      # None = server default (1024)
     slot_save_node_system: bool | None = None    # None = server default (on)
     slot_save_node_prompt: str | None = None     # off / cold / on; None = server default (cold)
     slot_save_node_response: bool | None = None  # None = server default (off)
@@ -261,6 +262,8 @@ class ServerProcess:
             server_args.extend(["--slot-save-max-count", self.slot_save_max_count])
         if self.slot_save_max_mb is not None:
             server_args.extend(["--slot-save-max-mb", self.slot_save_max_mb])
+        if self.slot_save_staging_mb is not None:
+            server_args.extend(["--slot-save-staging-mb", self.slot_save_staging_mb])
         for flag, value in (("slot-save-node-system", self.slot_save_node_system),
                             ("slot-save-node-response", self.slot_save_node_response),
                             ("slot-save-node-tool", self.slot_save_node_tool),
