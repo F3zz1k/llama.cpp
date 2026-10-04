@@ -137,25 +137,44 @@ takes its slot, costs that request the copy only, not the write.
 - **Staging budget.** A save whose bytes fit in the free part of `--slot-save-staging-mb` is copied whole
   and the request continues at once. One that does not fit is streamed through two chunks of at most
   64 MiB when the writer is idle, so the request pays about the larger of the copy and the write; no
-  save is narrowed by the budget. When the writer is busy and the save does not fit, it is **dropped**
-  with a `WRN` (`auto-save: dropped ... staging full`) and counted; a request never waits on the writer.
-  A dropped prompt node is covered by the conversation's later idle, reclaim or shutdown save. Staging
-  is allocated per save and freed as the writer drains it, so an idle instance holds none; budget the
-  worst case (`N` instances times the value) against host RAM.
+  save is narrowed by the budget. When the writer is busy and the save does not fit, the capture
+  **waits** for the writer (logged as `auto-save: waited ... for the writer to take a ...`, counted in
+  `auto_cache_save_admission_waits_total` and `_wait_seconds_total`) and then stages or streams it, so
+  no save is dropped for want of staging. That wait holds the server loop, as the synchronous save it
+  replaces did, and is never longer than that save would have taken: it waits only for writes the
+  synchronous code would already have made on the same thread. Two exceptions. The **idle flush** is
+  deferred instead (`auto-save: idle flush deferred`): nothing is queued and it is retried once the
+  writer is idle, so a request that arrives meanwhile is not held. A writer that shows no progress for
+  60 s (a hung disk) has the waiting save dropped with a `WRN` (`made no progress`) and
+  `auto_cache_save_dropped_staging_total`, rather than the server loop hung for good. Staging is plain
+  pageable host memory, allocated per save and freed as the writer drains it, so an idle instance
+  holds none; at most the budget plus one 128 MiB ring is held at once, on top of `--cache-ram` and the
+  GPU's GTT. Budget the worst case (`N` instances times that) against host RAM, and read
+  `auto_cache_save_staging_bytes` when recording a bench's host-RAM peak.
 - **Visibility.** A unit is visible to restores only once its `.meta` is in place; restores never read
-  the queue. A request whose prefix is still queued in the same instance waits for that publish
-  (at most 30 s, logged as `auto-restore: waited ... for N queued unit(s)`) rather than prefilling it
-  again; a peer instance cannot see the queue and prefills.
+  the queue. A new request whose prefix is still queued in the same instance waits for that publish
+  (at most 30 s, logged as `auto-restore: waited ... for the queued unit(s) that prefix this request`)
+  rather than prefilling it again. Only that request waits: it stays queued in its slot while the
+  other slots keep prefilling and decoding. A peer instance cannot see the queue and prefills.
 - **Deltas on queued parents.** The save-side dedup and parent choice see the queue, so a delta can be
   written against a parent that is still queued (a prompt node, then a reclaim save seconds later in a
   tool loop). The writer is FIFO, so the parent is published first. If the parent fails (disk full, a
   failed rename, a lock timeout), its queued children are dropped, because their bytes are a suffix
   only, and counted in `auto_cache_save_orphan_dropped_total`; a child whose parent left the store
-  while it was queued is dropped the same way.
+  while it was queued is dropped the same way. Neither loses the conversation while a slot still holds
+  it: an orphan's slot gets another idle flush (logged as `re-arming the idle flush`), which writes a
+  root or a delta on a published parent, and so does every slot whose save was skipped because the
+  failed unit already covered it. A reclaim (the slot is about to be overwritten) that finds its
+  conversation covered by a queued delta waits for that delta's outcome and writes the conversation
+  itself if it did not publish. A reclaim covered by a queued root does not wait (what fails a root
+  fails a second write the same way); if that root fails, the reclaim save is logged as lost and
+  shows as `requested` without `published` (below).
 - **Shutdown.** A graceful stop captures every slot (waiting for staging room instead of dropping),
-  then the writer drains the queue, oldest first. Whatever is still queued 100 s after the stop began is
-  abandoned between chunks, its temps removed and nothing renamed, which leaves room for the rest of the
-  shutdown inside a 120 s `TimeoutStopSec`.
+  then the writer drains the queue, oldest first. Whatever is still queued 90 s after the stop began is
+  abandoned between chunks, its temps removed and nothing renamed, which leaves 30 s for the rest of the
+  shutdown inside a 120 s `TimeoutStopSec`. The writer starts each chunk's writeback as it writes it and
+  waits for the previous chunk's, so at most two chunks of a file are dirty and the final `fdatasync`
+  stays short; a file whose write ends past the deadline is abandoned before that sync.
 - **Crashes.** A unit whose writer died before its `.meta` rename is never published. Its temps
   (`<name>.<pid>.<n>.tmp*`) are removed by the next instance that starts on the store, or by any writer
   after a publish (at most once a minute), once that pid is gone and the files are 10 minutes old.
@@ -211,11 +230,13 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_node_media_skipped_total` | system or prompt nodes not written because media left no cut above the floor (see Known limits) |
 | `auto_cache_save_queued_total` | saves handed to the background writer |
 | `auto_cache_save_streamed_total` | of those, saves larger than the free staging, streamed while the writer was idle |
-| `auto_cache_save_dropped_staging_total` | saves dropped because the staging was full and the writer busy (each logs a WRN) |
+| `auto_cache_save_admission_waits_total` / `auto_cache_save_admission_wait_seconds_total` | captures that waited for a busy writer because the staging was full / total time waited |
+| `auto_cache_save_dropped_staging_total` | saves dropped because the writer made no progress for 60 s while the capture waited (each logs a WRN); 0 in normal operation |
 | `auto_cache_save_orphan_dropped_total` | queued deltas dropped because their parent failed to publish or left the store |
 | `auto_cache_save_shutdown_abandoned_total` | queued saves abandoned at the shutdown deadline |
 | `auto_cache_save_staging_bytes` (gauge) | host bytes held by saves copied and not yet written |
 | `auto_cache_save_queue_depth` (gauge) | saves queued or being written |
+| `auto_cache_save_site_requested_total{site=...}` / `auto_cache_save_site_published_total{site=...}` | units each save site decided to write / of those, published. `site` is `reclaim`, `idle`, `shutdown`, `cache_idle`, `system_node`, `prompt_node` or `response_node`. Requested minus published is what that site lost (failed, orphaned, abandoned or dropped); a deferred idle flush is counted once, when it is taken |
 
 A miss includes conversations no cache could have held, so read it next to `auto_cache_evicted_total`:
 misses that climb with evictions mean the store is too small.
@@ -238,7 +259,8 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 - Both nodes are captured while a cold prompt prefills, on the server-loop thread: each delays that
   request's first token by the copy of its state off the device (a whole snapshot, or a delta under
   `--slot-save-incremental`) and holds up other slots meanwhile; the write itself runs on the background
-  writer. The default `cold` prompt node adds at most one capture per conversation start, plus one
+  writer, unless the staging is full and the writer busy, when the capture also waits for the writer
+  (see "Staging budget"). The default `cold` prompt node adds at most one capture per conversation start, plus one
   per turn on a model that cannot rewind when the client does not re-render the previous response token
   for token (each such turn's after-response unit cannot serve the next turn, so the node is the only
   restore point that survives a reclaim or a restart).
