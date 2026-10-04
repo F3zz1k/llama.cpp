@@ -13,14 +13,16 @@ from utils import *
 # inside the previous response (and the dummies' random tokens do not re-tokenise identically either).
 # The unit saved after a response (prompt + every generated token but the last) is then never a prefix of
 # the next turn. What a turn can restore after a restart:
-#   - before the fix: only the cold prompt node of turn 1 (the conversation re-prefills from there, so the
-#     re-prefill grows every turn), and from turn 5 on not even that, because the four longer, shorter-than-
-#     the-request units of the earlier turns fill AUTO_MAX_RESTORE_ATTEMPTS first (a cold prefill);
-#   - after it: the previous turn's prompt node, armed because that turn's reuse ended inside the previous
-#     conversation, so the re-prefill is one response plus one user message, flat over the turns.
-# Plain attention (llama-dense) is the control: it restores the longer unit and trims it, and must not get
-# a prompt node on every turn. A client that EXTENDS the conversation (token ids, the previous response
-# included) must not get one either.
+#   - default (--slot-save-node-prompt cold, a node only for a prompt that got no reuse): the turn-1 prompt
+#     node, so the re-prefill grows with the conversation. That is by design; such clients should run with
+#     'on'. Before the lookup fix not even that survived: from turn 5 the four earlier turns' units, which
+#     are shorter than the request but diverge inside it, filled AUTO_MAX_RESTORE_ATTEMPTS first and the turn
+#     prefilled cold. The lookup now skips a unit met below its deepest boundary before it takes a place;
+#   - 'on': the previous turn's prompt node, so the re-prefill is one response plus one user message, flat
+#     over the turns.
+# Plain attention (llama-dense) is the control: it restores the longer unit and trims it, and gets no
+# prompt node on any turn after the first. A client that EXTENDS the conversation (token ids, the previous
+# response included) gets none either.
 
 def _default_models_dir() -> str:
     env = os.environ.get("LLAMA_TEST_MODELS_DIR", "")
@@ -138,8 +140,27 @@ def _conversation(name: str, **kw):
 
 
 @pytest.mark.parametrize("name", ["qwen35-dense", "qwen4exp-moe"])
-def test_each_turn_restores_the_previous_prompt_node(name):
+def test_default_restores_the_deepest_usable_node_every_turn(name):
+    """Default (cold): only turn 1 writes a prompt node, and every later turn restores it from disk. From the
+    fifth turn the earlier turns' divergent units used to exhaust AUTO_MAX_RESTORE_ATTEMPTS and the turn
+    prefilled cold."""
     rows, stores, _ = _conversation(name)
+    node = min(stores[0])  # turn 1: the cold prompt node and the conversation saved at shutdown
+    assert len(stores[0]) == 2, stores
+    for turn in range(1, TURNS):
+        n_prompt, cache_n, disk_n, prompt_n = rows[turn]
+        assert disk_n == cache_n == node, f"turn {turn + 1}: {rows[turn]} (turn-1 node {node}), {rows}"
+        assert prompt_n == n_prompt - node, f"turn {turn + 1}: {rows}"
+    # 'cold' writes no node on a turn that restored one: one unit per turn (the shutdown save), nothing more
+    growth = [len(stores[i + 1]) - len(stores[i]) for i in range(len(stores) - 1)]
+    assert all(g == 1 for g in growth), (growth, stores)
+
+
+@pytest.mark.parametrize("name", ["qwen35-dense", "qwen4exp-moe"])
+def test_node_prompt_on_restores_the_previous_prompt_node(name):
+    """--slot-save-node-prompt on: every turn writes a node at the end of its user message, and the next
+    turn restores it, so the re-prefill stays flat over the turns."""
+    rows, stores, _ = _conversation(name, node_prompt="on")
     for turn in range(1, TURNS):
         n_prompt, cache_n, disk_n, prompt_n = rows[turn]
         prev_prompt = rows[turn - 1][0]
@@ -181,9 +202,9 @@ def test_extending_client_writes_no_prompt_node():
     assert [n_units[i + 1] - n_units[i] for i in range(len(n_units) - 1)] == [1, 1, 1], n_units
 
 
-def test_plain_attention_gets_no_divergence_node():
-    """Control: plain attention restores the longer unit and trims it, so the divergence trigger, which
-    is for the classes that cannot rewind, must not add a prompt node per turn."""
+def test_plain_attention_restores_and_trims():
+    """Control: plain attention restores the longer unit and trims it, and the default writes no prompt
+    node on a turn that got reuse."""
     rows, stores, _ = _conversation("llama-dense")
     for turn in range(1, TURNS):
         assert rows[turn][1] >= rows[turn - 1][0] - B, rows
