@@ -96,7 +96,7 @@ different content (a whole unit and a delta) under one name.
 | Flag | Default | Node |
 |---|---|---|
 | `--slot-save-node-system` | on | at the end of the system prompt, while a cold prompt prefills; a request with only a system prompt caches all of it. The end is found by rendering the request's system messages and tools through the chat template again, followed by placeholder conversations, so it works for every template, including a default system prompt the template inserts itself |
-| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never. When the system node is written in the same prefill, the prompt node must lie at least one block past it, or it is skipped |
+| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: for prompts that got essentially no reuse, and, on a model that cannot rewind, for prompts whose reuse ended inside the previous conversation (the client did not re-render the previous response token for token, for example it dropped the reasoning) once at least one block of new prompt precedes the node. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never. When the system node is written in the same prefill, the prompt node must lie at least one block past it, or it is skipped |
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
@@ -178,7 +178,10 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 - Both nodes are written synchronously while a cold prompt prefills, on the server-loop thread: each
   delays that request's first token by its write (a whole snapshot, or a delta under
   `--slot-save-incremental`) and holds up other slots meanwhile. The cost per model class is measured at
-  the GPU gate; the default `cold` prompt node adds at most one write per conversation start.
+  the GPU gate; the default `cold` prompt node adds at most one write per conversation start, plus one
+  per turn on a model that cannot rewind when the client does not re-render the previous response token
+  for token (each such turn's after-response unit cannot serve the next turn, so the node is the only
+  restore point that survives a reclaim or a restart).
 - The system node is placed from the chat template for every template (the boundary is checked over
   all of `models/templates` by `test-chat-preamble`). The first chat request with a new system prompt
   or tool set pays for the template renders that find it: about four times one render of the request,

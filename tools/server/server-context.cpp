@@ -1213,6 +1213,10 @@ struct auto_cache_entry {
     // cell, so it also commits the trailing partial block that no boundary key covers. Two units of
     // equal length at one boundary are the same unit only when this matches too.
     uint64_t    id     = 0;
+    // the unit's DEEPEST boundary key (the last entry of its block-hash chain). A request reaches a
+    // unit at that key only when it agrees with the unit through its last indexed boundary, so a unit
+    // met at a shallower key is left before its end. 0 = unknown (treated as possibly whole).
+    uint64_t    deepest = 0;
 };
 
 // boundary-hash -> best (longest) entry covering that prefix length. Touched only
@@ -1352,8 +1356,8 @@ struct server_slot {
     // prefills [B_ctx, N) normally. -1 = not armed (no boundary / warm restore / small preamble).
     int32_t ctx_save_pos = -1;
     // --- mid-prefill prompt node (--slot-save-node-prompt) ---
-    // Same mechanism at a second position: the end of the last user message, block-aligned down (or
-    // n_tokens - 1 without a user span). Saved through auto_save_slot_if_useful, so it is a delta on
+    // Same mechanism at a second position: the end of the last user message, exactly (without a user
+    // span, n_tokens - 1 block-aligned down). Saved through auto_save_slot_if_useful, so it is a delta on
     // the deepest saved node under --slot-save-incremental. -1 = not armed.
     int32_t prompt_save_pos = -1;
 
@@ -2556,6 +2560,7 @@ private:
                 c.state_path = e.state_path; // the same unit: keep the newest file for it
                 c.fp         = e.fp;
                 c.pinned     = e.pinned;
+                c.deepest    = e.deepest;
                 return;
             }
         }
@@ -2688,7 +2693,7 @@ private:
             // never drops it (protects a pinned base that shares a bucket with >32 divergent siblings).
             std::error_code pec;
             const bool pinned = std::filesystem::exists(p + ".pin", pec) && !pec;
-            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned, id };
+            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned, id, bhs.empty() ? 0 : bhs.back() };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
             }
@@ -2806,6 +2811,20 @@ private:
                         // (which sorts last).
                         // Counted, not silent: the restore site reports a miss that had such a
                         // candidate as a must-extend miss (WRN + auto_cache_restore_not_prefix_total).
+                        if (seen_not_prefix.insert(c.state_path).second) {
+                            auto_not_prefix_skips++;
+                        }
+                        continue;
+                    }
+                    if (restore_needs_whole_prefix(c.n_tokens) && c.deepest != 0 && c.deepest != bhs[k] &&
+                        !seen.count(c.state_path)) {
+                        // Met at a boundary below its own deepest one: the request leaves this unit before
+                        // its last whole block, so it is not a whole prefix and these classes cannot rewind
+                        // into it. Skip it here, before it takes one of the max_attempts places: in a
+                        // multi-turn chat whose client does not re-render the previous response token for
+                        // token, every earlier turn's unit sits at these shared boundaries, deeper than the
+                        // prompt node that can restore, and after four turns they used to exhaust
+                        // AUTO_MAX_RESTORE_ATTEMPTS and turn a hit into a cold prefill.
                         if (seen_not_prefix.insert(c.state_path).second) {
                             auto_not_prefix_skips++;
                         }
@@ -3826,7 +3845,8 @@ private:
         // index insert (bhs[0..kb] -> this snapshot), then bounded-LRU + reconcile.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp, /*pinned=*/false, /*id=*/hash };
+            auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp, /*pinned=*/false, /*id=*/hash,
+                                /*deepest=*/ kb < bhs.size() ? bhs[kb] : 0 };
             for (size_t i = 0; i <= kb && i < bhs.size(); ++i) {
                 auto_index_insert_locked(bhs[i], e);
             }
@@ -6941,6 +6961,11 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        // the request leaves the conversation this slot (or a saved unit sharing its prefix)
+                        // held before that conversation's end: a response the client did not re-render token
+                        // for token, a regenerate, an edit, or another conversation. Arms the prompt node on
+                        // the classes that cannot rewind (see the PROMPT node below).
+                        bool left_prev_tip = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -7010,6 +7035,7 @@ private:
                             if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                left_prev_tip = n_past < (int) slot.prompt.tokens.size();
 
                                 // ===== AUTO-RESTORE: cold/cross-process KV reuse from disk (opt-in) ==========
                                 // If the in-memory match (n_past) is POOR and the disk index holds a snapshot
@@ -7058,6 +7084,8 @@ private:
                                             break; // restored; stop trying shorter candidates
                                         }
                                     }
+                                    // a saved unit shared this prefix and the request diverges inside it
+                                    left_prev_tip = left_prev_tip || auto_not_prefix_skips > 0;
                                     // hit / miss accounting (llamacpp:auto_cache_restore_*_total and the
                                     // per-request timings.cache_disk_n). A MISS is a request that still had
                                     // at least one whole block beyond its in-memory match and got nothing
@@ -7566,16 +7594,26 @@ private:
                             }
 
                             // --- PROMPT node (--slot-save-node-prompt, default cold) ---
-                            // Position: the end of the last user message (n_prompt - 1 without a user span),
-                            // block-aligned down. A unit saved after the response (idle, reclaim, shutdown,
-                            // --slot-save-node-response) is prompt + generation, and a memory class that
-                            // cannot rewind (recurrent, hybrid, FULL, sliding-window past one window) can
-                            // restore it only for a request that extends it. A resend, a regenerate, an edit
-                            // of the response or a follow-up whose history is not re-rendered token for token
-                            // diverges inside it; this node sits before that divergence. 'cold' arms it only
-                            // for a prompt that got essentially no reuse (n_past < the save floor), 'on'
-                            // whenever at least one block of new prompt precedes it. The mid-prefill save is
-                            // the true whole state at that position, so it is sound for every memory class.
+                            // Position: the end of the last user message, exactly, like the system node
+                            // (n_prompt - 1 block-aligned down without a user span). A unit saved after the
+                            // response (idle, reclaim, shutdown, --slot-save-node-response) is prompt +
+                            // generation, and a memory class that cannot rewind (recurrent, hybrid, FULL,
+                            // sliding-window past one window) can restore it only for a request that extends
+                            // it. A resend, a regenerate, an edit of the response or a follow-up whose
+                            // history is not re-rendered token for token diverges inside it; this node sits
+                            // before that divergence. 'cold' arms it for a prompt that got essentially no
+                            // reuse (n_past < the save floor), and, on a class that cannot rewind to this
+                            // position, for a prompt whose reuse ended inside the previous conversation
+                            // (left_prev_tip: the slot's tokens or a saved unit go on past n_past) once at
+                            // least one block of new prompt precedes the node: a client that re-renders the
+                            // previous response differently (reasoning dropped or trimmed, tool calls
+                            // re-serialised, the generation prompt rendered differently in history, a
+                            // re-tokenised seam) will do so on every turn, so each turn's after-response unit
+                            // is unusable to the next one and only this node survives a reclaim or a restart.
+                            // A client whose requests extend the conversation never sets it and pays no extra
+                            // write. 'on' arms it whenever at least one block of new prompt precedes it. The
+                            // mid-prefill save is the true whole state at that position, so it is sound for
+                            // every memory class.
                             // Floor: max(--slot-save-block, --slot-save-min-tokens), as for any other save.
                             // When the system node is armed, the prompt node must lie at least one block past
                             // it: anything closer is a prefix that the system node already covers for every
@@ -7585,12 +7623,17 @@ private:
                                 const int     floor    = std::max(B, params_base.slot_save_min_tokens);
                                 const int32_t user_end = spans.last_user_message_end();
                                 const int32_t e        = std::min(user_end > 0 ? user_end : n_prompt - 1, n_prompt - 1);
-                                const int32_t B_al     = e > 0 ? e - (e % B) : -1;
+                                // exact at the end of the user message (the history re-renders everything after it,
+                                // the generation prompt included, so nothing past it is safe); without a user span,
+                                // block-aligned down from n_prompt - 1 so that it still lies before most generation
+                                // prompts
+                                const int32_t B_al     = e <= 0 ? -1 : (user_end > 0 ? e : e - (e % B));
                                 const int32_t B_p      = B_al > 0 ? cut_down(B_al) : -1;
                                 const auto    ok       = [&](int32_t x) {
                                     const bool want = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
                                                       ? n_past + B <= x
-                                                      : n_past < floor;
+                                                      : n_past < floor ||
+                                                        (left_prev_tip && restore_needs_whole_prefix((size_t) x) && n_past + B <= x);
                                     const bool past_sys = slot.ctx_save_pos <= 0 || x >= slot.ctx_save_pos + B;
                                     return want && past_sys && x >= floor && x < n_prompt && n_past < x;
                                 };

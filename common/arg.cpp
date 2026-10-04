@@ -3766,8 +3766,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--slot-save-node-prompt"}, "{off,cold,on}",
         "auto disk cache: publish a node at the end of the last user message while the prompt prefills, so "
         "a resend, regenerate or edit of the response restores it even on models that cannot rewind a "
-        "longer snapshot (recurrent, hybrid, sliding-window past one window); 'cold' only for prompts that "
-        "got essentially no reuse, 'on' whenever a block of new prompt precedes it, 'off' never. Takes effect "
+        "longer snapshot (recurrent, hybrid, sliding-window past one window); 'cold' for prompts that got "
+        "essentially no reuse and, on those models, for prompts whose reuse ended inside the previous "
+        "conversation (a client that does not re-render the previous response token for token), 'on' "
+        "whenever a block of new prompt precedes it, 'off' never. Takes effect "
         "with --slot-save-auto (default: cold)",
         [](common_params & params, const std::string & value) {
             if (value == "off") {
