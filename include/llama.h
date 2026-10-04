@@ -606,6 +606,12 @@ extern "C" {
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
+    // fork: the context length above which a LongRoPE model switches from its short to its long RoPE
+    // factors (hparams.n_ctx_orig_yarn, the threshold llama_model::get_rope_factors compares
+    // n_ctx_seq against; --override-kv applies, --yarn-orig-ctx does not). 0 when no layer's RoPE
+    // factors depend on the context size, i.e. every layer has rope_freqs or rope_long == rope_short.
+    LLAMA_API uint32_t llama_model_n_ctx_orig_longrope(const struct llama_model * model);
+
     // Returns the number of classifier outputs (only valid for classifier models)
     // Undefined behavior for non-classifier models
     LLAMA_API uint32_t llama_model_n_cls_out(const struct llama_model * model);

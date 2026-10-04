@@ -439,19 +439,24 @@ struct model_fp {
                fp_mmproj == o.fp_mmproj;
     }
 
-    // Effective n_ctx_orig_yarn of the LIVE context (--yarn-orig-ctx, else the GGUF
-    // rope.scaling.original_context_length honouring --override-kv, else n_ctx_train), the threshold
-    // llama_model::get_rope_factors compares n_ctx_seq against. Set only on the live fingerprint by
-    // auto_compute_fingerprint and never persisted: a disk fingerprint that passes every other field
-    // has the same model file and the same fp_yarn_orig_ctx, hence the same threshold, so the live
-    // value decides the regime of both sides (--override-kv itself is not fingerprinted, as before).
+    // The LIVE model's LongRoPE threshold, llama_model_n_ctx_orig_longrope: hparams.n_ctx_orig_yarn
+    // (the GGUF rope.scaling.original_context_length with --override-kv applied, else the load-time
+    // n_ctx_train) on a model whose RoPE factors depend on the context size, 0 on every other model.
+    // It is the exact value llama_model::get_rope_factors compares n_ctx_seq against, read from the
+    // model rather than rebuilt from CLI params: --yarn-orig-ctx sets only cparams.n_ctx_orig_yarn,
+    // which get_rope_factors never reads, and llama_model_n_ctx_train is rewritten under custom YaRN
+    // after the context is created. Set only on the live fingerprint by auto_compute_fingerprint and
+    // never persisted: a disk fingerprint that passes every other field has the same model file,
+    // hence the same threshold, so the live value decides the regime of both sides. (--override-kv is
+    // not fingerprinted, as before: peers overriding that key differently must not share a store.)
     uint32_t fp_n_ctx_orig      = 0;
 
     // Whether a context of fp_n_ctx cells runs LongRoPE's long factors, given the live threshold.
     // Two contexts on opposite sides of it bake different K rotations into the same tokens, so the
-    // regime is identity even though n_ctx itself is not. On a model without rope_long the bit is
-    // inert except that rungs straddling the original context (only reachable with rope scaling,
-    // which splits identity anyway) do not share.
+    // regime is identity even though n_ctx itself is not. On every model without context-dependent
+    // RoPE factors the threshold is 0 and the bit is constantly false, so rungs share whatever
+    // rope.scaling.original_context_length the GGUF carries (YaRN baked into the GGUF, as on the
+    // DeepSeek and Laguna conversions, splits nothing here; its parameters are identity already).
     bool ctx_long_regime(const model_fp & live) const {
         return live.fp_n_ctx_orig > 0 && fp_n_ctx > live.fp_n_ctx_orig;
     }

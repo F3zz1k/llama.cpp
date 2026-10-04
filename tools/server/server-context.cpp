@@ -2340,34 +2340,6 @@ private:
         return any ? h : 0;
     }
 
-    // The n_ctx_orig_yarn the live context runs with, derived the way llama_context and the model
-    // loader derive it: --yarn-orig-ctx when set, else the GGUF rope.scaling.original_context_length
-    // (an --override-kv of it wins, as in the loader), else n_ctx_train. Only its comparison with
-    // n_ctx_seq matters (model_fp::ctx_long_regime). 0 if nothing can be read, which turns the
-    // regime bit off rather than guessing.
-    uint32_t auto_rope_orig_ctx() const {
-        if (params_base.yarn_orig_ctx != 0) {
-            return (uint32_t) params_base.yarn_orig_ctx;
-        }
-        char arch[64] = {0};
-        if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) > 0) {
-            const std::string key = std::string(arch) + ".rope.scaling.original_context_length";
-            for (const auto & ov : params_base.kv_overrides) {
-                if (ov.key[0] != 0 && key == ov.key && ov.tag == LLAMA_KV_OVERRIDE_TYPE_INT && ov.val_i64 > 0) {
-                    return (uint32_t) ov.val_i64;
-                }
-            }
-            char val[32] = {0};
-            if (llama_model_meta_val_str(model_tgt, key.c_str(), val, sizeof(val)) > 0) {
-                const unsigned long v = std::strtoul(val, nullptr, 10);
-                if (v > 0) {
-                    return (uint32_t) v;
-                }
-            }
-        }
-        return (uint32_t) std::max<int32_t>(0, llama_model_n_ctx_train(model_tgt));
-    }
-
     // Compute the live model fingerprint once at load (invariant 3). Pure-CPU; only called from
     // an auto_cache_enabled() branch so it costs nothing when OFF.
     // See README "Automatic disk prompt cache" for which flags invalidate the cache.
@@ -2396,7 +2368,11 @@ private:
         fp.fp_cache_k     = (uint32_t) params_base.cache_type_k;
         fp.fp_cache_v     = (uint32_t) params_base.cache_type_v;
         fp.fp_n_ctx       = (uint32_t) llama_n_ctx_seq(ctx_tgt);
-        fp.fp_n_ctx_orig  = auto_rope_orig_ctx();
+        // the model's own LongRoPE threshold (hparams.n_ctx_orig_yarn, what get_rope_factors compares
+        // n_ctx_seq against), 0 on a model whose RoPE factors do not depend on the context size. Never
+        // rebuilt from CLI params: --yarn-orig-ctx reaches cparams only, not that threshold, and
+        // llama_model_n_ctx_train can be rewritten under custom YaRN after the context is created.
+        fp.fp_n_ctx_orig  = llama_model_n_ctx_orig_longrope(model_tgt);
         // FULL and RS share a value: on a recurrent/hybrid model the class is RS only because MTP (or
         // any draft) asked for n_rs_seq > 0 rollback rows, which are never serialised (state_write
         // writes the current row, state_read resets rs_idx to 0), so the blob is the same and turning
