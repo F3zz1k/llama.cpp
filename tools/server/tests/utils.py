@@ -109,6 +109,7 @@ class ServerProcess:
     models_preset: str | None = None
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
+    override_kv: List[str] | None = None  # KEY=TYPE:VALUE entries for --override-kv
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
@@ -273,6 +274,8 @@ class ServerProcess:
             server_args.extend(["--grp-attn-w", self.n_ga_w])
         if self.debug:
             server_args.append("--verbose")
+        if self.override_kv:
+            server_args.extend(["--override-kv", ",".join(self.override_kv)])
         if self.lora_files:
             for lora_file in self.lora_files:
                 server_args.extend(["--lora", lora_file])

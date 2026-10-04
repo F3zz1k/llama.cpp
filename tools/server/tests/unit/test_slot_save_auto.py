@@ -50,10 +50,14 @@ FIXTURE_SHA256 = {
 # same value in its chain-hash field (a delta's parent_id is the parent's file id), so that one 8-byte
 # field changes; every other byte of the .meta, the v1 layout, and the .bin are unchanged, and no
 # reader uses the field (an older build reads this unit as before). Asserted field by field below.
+#
+# The same branch then took n_ctx out of the identity (it is a capacity record, not a restore gate), so
+# identity_hash folds the LongRoPE regime bit where it folded fp_n_ctx and the prefix moved again
+# (de633b3190d4d950 -> 4c354f5acbfd2d60). The .meta still records fp_n_ctx, so its bytes do not change.
 EMITTED_SHA256 = {
-    "auto-de633b3190d4d950-a028e20ed7d8f6b7-377.bin":
+    "auto-4c354f5acbfd2d60-a028e20ed7d8f6b7-377.bin":
         FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin"],
-    "auto-de633b3190d4d950-a028e20ed7d8f6b7-377.bin.meta":
+    "auto-4c354f5acbfd2d60-a028e20ed7d8f6b7-377.bin.meta":
         FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin.meta"],
 }
 EMITTED_CHAIN_HASH = 0xa028e20ed7d8f6b7
@@ -108,8 +112,8 @@ CACHE_DIR = "./tmp/slot_save_auto"
 def create_server():
     global server
     server = ServerPreset.tinyllama2()
-    # geometry must equal the fixture capture's (-c 512 -np 1): fp_n_ctx is part of the
-    # snapshot fingerprint and a mismatch refuses the restore.
+    # geometry equals the fixture capture's (-c 512 -np 1). fp_n_ctx is no longer identity (it is a
+    # capacity record), but the golden test checks the emitted bytes, which carry it.
     server.n_ctx = 512
     server.n_batch = 512
     server.n_slots = 1
@@ -292,12 +296,10 @@ def test_mixed_geometry_peers_get_disjoint_filenames():
     disjoint names so both units coexist and each restores its OWN; a same-config peer
     still reuses one deterministic name (no file proliferation).
 
-    Discriminator is --cache-type-k (f16 vs f32). It must be a field that
-    restore_compatible() refuses in BOTH directions: with fp_n_ctx the larger peer may
-    legally reuse the smaller peer's unit (cross-ctx reuse), finds it already covering
-    the prefix and writes nothing, so a ctx-only pair never produces a second file and
-    cannot exercise the naming at all. f32 is not a quantised type, so the tiny CI model
-    initialises it."""
+    Discriminator is --cache-type-k (f16 vs f32). It must be an identity field: n_ctx is
+    not one (peers differing only in it share one name and one unit, see
+    test_cross_ctx_peers_share_one_unit), so a ctx-only pair cannot exercise the naming.
+    f32 is not a quantised type, so the tiny CI model initialises it."""
     a = _text_cache_server(512)
     a.start()
     a_prompt_cold, a_content_cold, a_disk_cold = _golden_completion(a)
@@ -346,42 +348,28 @@ def test_mixed_geometry_peers_get_disjoint_filenames():
     assert len(_bins()) == 2
 
 
-def test_cross_ctx_peers_share_the_smaller_unit():
-    """fp_n_ctx is an identity field (disjoint filenames) but NOT a symmetric restore gate:
-    a larger-ctx peer may restore a smaller-ctx unit (non-SWA), never the reverse.
-    Smaller first: the larger peer restores it and, finding that unit already covering the
-    prefix, writes no duplicate. Larger first: the smaller peer must cold-prefill and then
-    publish its own unit under a disjoint prefix."""
-    a = _text_cache_server(512)
-    a.start()
-    a_prompt_cold, a_content_cold, _ = _golden_completion(a)
-    a.stop()
-    b = _text_cache_server(1024)
-    b.start()
-    b_prompt, b_content, b_disk = _golden_completion(b)
-    b.stop()
-    assert b_disk >= 256                          # cross-ctx reuse of A's unit
-    assert b_prompt <= a_prompt_cold - 256
-    assert b_content == a_content_cold
-    assert len(_bins()) == 1, _bins()             # no redundant 1024-ctx copy
-
-    shutil.rmtree(CACHE_DIR)
-    os.makedirs(CACHE_DIR)
-    b = _text_cache_server(1024)
-    b.start()
-    _golden_completion(b)
-    b.stop()
-    a = _text_cache_server(512)
-    a.start()
-    a_prompt, a_content, a_disk = _golden_completion(a)
-    a.stop()
-    assert a_disk == 0                            # a 1024-ctx unit never restores into 512
-    assert a_prompt == a_prompt_cold
-    assert a_content == a_content_cold
-    bins = _bins()
-    assert len(bins) == 2, bins
-    assert len({f.split("-")[1] for f in bins}) == 2, bins
-
+def test_cross_ctx_peers_share_one_unit():
+    """fp_n_ctx is neither an identity field nor a restore gate: a unit restores into any peer
+    whose n_ctx holds its cells, in either direction, and peers differing only in n_ctx name it
+    alike. Each way round the second peer restores the first peer's unit and, finding it already
+    covering the prefix, writes no copy of its own."""
+    for first, second in ((512, 1024), (1024, 512)):
+        shutil.rmtree(CACHE_DIR)
+        os.makedirs(CACHE_DIR)
+        a = _text_cache_server(first)
+        a.start()
+        a_prompt_cold, a_content_cold, a_disk_cold = _golden_completion(a)
+        a.stop()
+        assert a_disk_cold == 0
+        assert len(_bins()) == 1
+        b = _text_cache_server(second)
+        b.start()
+        b_prompt, b_content, b_disk = _golden_completion(b)
+        b.stop()
+        assert b_disk >= 256, (first, second)         # cross-ctx reuse of A's unit
+        assert b_prompt <= a_prompt_cold - 256
+        assert b_content == a_content_cold
+        assert len(_bins()) == 1, _bins()             # one unit, one name, both rungs
 
 def test_missing_meta_is_transient_not_rejected():
     """A final-named .bin with no .meta sidecar yet is a peer mid-publish (the publish
