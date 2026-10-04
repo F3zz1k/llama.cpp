@@ -1309,6 +1309,13 @@ struct server_slot {
     // once its warm KV has been flushed to the auto disk cache, so the timed idle wake attempts the
     // flush at most once per idle period (auto_save_slot_if_useful's dedup covers any re-attempt).
     bool auto_idle_flushed = false;
+    // the idle flush found the staging full and the writer busy: it is retried (at auto_idle_retry_ms, once
+    // the writer is idle) instead of being given up for the idle period. Cleared when the slot is released.
+    bool    auto_idle_deferred = false;
+    int64_t auto_idle_retry_ms = -1;
+    // a new task whose prefix the background writer still holds waits for its publish without blocking the
+    // other slots: the task stays STARTED, and this is when its wait began (us), -1 when not waiting
+    int64_t aw_pending_t0_us = -1;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -1672,8 +1679,11 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
-            state             = SLOT_STATE_IDLE;
-            auto_idle_flushed = false; // fresh idle period: eligible for a timed idle flush again
+            state              = SLOT_STATE_IDLE;
+            auto_idle_flushed  = false; // fresh idle period: eligible for a timed idle flush again
+            auto_idle_deferred = false;
+            auto_idle_retry_ms = -1;
+            aw_pending_t0_us   = -1;
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -2104,6 +2114,9 @@ private:
     struct auto_save_counters {
         std::atomic<uint64_t> failed{0}, root{0}, delta{0}, bytes{0}, evicted{0}, draft{0}, draft_skipped{0};
         std::atomic<uint64_t> queued{0}, streamed{0}, dropped_staging{0}, orphan_dropped{0}, shutdown_abandoned{0};
+        std::atomic<uint64_t> admission_waits{0}, admission_wait_us{0};
+        std::atomic<uint64_t> site_requested[AUTO_SAVE_SITE_COUNT] = {};
+        std::atomic<uint64_t> site_published[AUTO_SAVE_SITE_COUNT] = {};
     } aw_cnt;
 
     // A save that is DROPPED (nothing published) is never silent either: a WRN naming the reason,
@@ -2139,6 +2152,12 @@ private:
         m.n_auto_save_dropped_staging    = aw_cnt.dropped_staging.load();
         m.n_auto_save_orphan_dropped     = aw_cnt.orphan_dropped.load();
         m.n_auto_save_shutdown_abandoned = aw_cnt.shutdown_abandoned.load();
+        m.n_auto_save_admission_waits    = aw_cnt.admission_waits.load();
+        m.n_auto_save_admission_wait_us  = aw_cnt.admission_wait_us.load();
+        for (int i = 0; i < AUTO_SAVE_SITE_COUNT; i++) {
+            m.n_auto_save_site_requested[i] = aw_cnt.site_requested[i].load();
+            m.n_auto_save_site_published[i] = aw_cnt.site_published[i].load();
+        }
         std::lock_guard<std::mutex> lk(aw.mtx);
         m.n_auto_save_staging_bytes      = aw.staged;
         m.n_auto_save_queue_depth        = aw.jobs.size();
@@ -3531,7 +3550,10 @@ private:
     // `hash` is the unit's identity over every cell (auto_block_hashes' `full`), which names the file
     // and is the entry id the exact-unit dedup compares; the index is populated at boundaries
     // bhs[0..kb] inclusive.
-    void auto_publish_snapshot(server_slot & slot,
+    // `site` is the save site that asked (counted per site, requested vs published). Returns true only when
+    // the idle flush was DEFERRED (staging full, writer busy): nothing was queued and the caller retries.
+    bool auto_publish_snapshot(server_slot & slot,
+                               auto_save_site site,
                                llama_context * ctx,
                                const llama_tokens & toks,
                                int32_t lo,
@@ -3542,6 +3564,7 @@ private:
                                const model_fp & fp,
                                const std::vector<server_media_record> & media = {},
                                uint64_t parent_id = 0) {
+        aw_cnt.site_requested[site]++;
         bool     is_node   = lo > 0;      // lo > 0 <=> a delta parented at parent_hi == lo
         uint32_t parent_hi = (uint32_t) lo; // both cleared below if the U6 delta cell-count check fails
         // Only whole-prefix units exist: hi must equal toks.size(). A PARTIAL [0, hi < N) root would
@@ -3552,7 +3575,7 @@ private:
         // No caller asks for one (both pass hi == toks.size()), so refuse it outright, loudly.
         if ((size_t) hi != toks.size()) {
             auto_save_note_failure(slot, "partial [0, hi < N) roots are not supported", (size_t) hi);
-            return;
+            return false;
         }
         const llama_tokens & snap_toks = toks;
         const size_t hdr = 3 * sizeof(uint32_t) + snap_toks.size() * sizeof(llama_token);
@@ -3581,7 +3604,7 @@ private:
                 SLT_DBG(slot, "auto-save: skipped, insufficient free space (need %zu bytes + 10%% slack, available %zu)\n",
                         sz_need, sec ? 0 : (size_t) sinfo.available);
                 auto_save_note_failure(slot, sec ? "free-space query failed" : "insufficient free space", snap_toks.size());
-                return;
+                return false;
             }
         }
 
@@ -3630,7 +3653,7 @@ private:
                 const size_t n_whole = llama_state_seq_get_size_range(ctx, slot.id, -1, -1, nullptr, 0);
                 if (n_whole == 0) {
                     auto_save_note_failure(slot, "state size query failed", snap_toks.size());
-                    return;
+                    return false;
                 }
                 delta_capable = n_payload < n_whole ? delta_cap::yes : delta_cap::no;
                 SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
@@ -3666,10 +3689,10 @@ private:
         }
         if (n_payload == 0) {
             auto_save_note_failure(slot, "state size query failed", snap_toks.size());
-            return;
+            return false;
         }
         // P0.4: refuse to publish a snapshot with NO memory payload. llama_kv_cache::state_write and
-        // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return;`,
+        // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return false;`,
         // src/llama-kv-cache.cpp), as on LLM_ARCH_GEMMA4_ASSISTANT, whose sub-caches both carry mem_other.
         // The .meta would claim N tokens and a later restore would load NOTHING while reporting success.
         // Class-agnostic guard: a real snapshot must be substantially larger than its own header + token
@@ -3680,7 +3703,7 @@ private:
                     "(%zu B for %zu tokens) - the memory type serialised nothing\n",
                     hdr + n_payload, snap_toks.size());
             aw_cnt.failed++;
-            return;
+            return false;
         }
         job->is_node        = is_node;
         job->parent_id      = is_node ? parent_id : 0;
@@ -3716,14 +3739,24 @@ private:
         FILE * f_bin = nullptr;
         FILE * f_dft = nullptr;
         if (!aw.running) {
+            job->site = site;
             job->mode = aw_mode::sync;
             f_bin = fopen(job->tmp.c_str(), "wb");
             if (!f_bin) {
                 auto_save_note_failure(slot, "state write failed (disk full or IO error)", snap_toks.size());
-                return;
+                return false;
             }
-        } else if (!aw_admit(job, n_total)) {
-            return;
+        } else {
+            job->site = site;
+            switch (aw_admit(job, n_total, site == AUTO_SAVE_SITE_IDLE ? aw_policy::defer : aw_policy::wait)) {
+                case aw_admit_res::queued:
+                    break;
+                case aw_admit_res::deferred:
+                    aw_cnt.site_requested[site]--; // not an outcome: the idle flush asks again
+                    return true;
+                case aw_admit_res::dropped:
+                    return false;
+            }
         }
         const int64_t t_t0 = ggml_time_us();
         const bool ok_bin = aw_capture_stream(*job, job->bin, ctx, is_node ? lo_pos : -1, -1, f_bin, job->bin.n_expected);
@@ -3739,14 +3772,14 @@ private:
                 std::error_code ec;
                 std::filesystem::remove(job->tmp, ec);
                 auto_save_note_failure(slot, "state write failed (disk full or IO error)", snap_toks.size());
-                return;
+                return false;
             }
         } else {
             aw_finish_stream(job->bin, ok_bin);
             if (!ok_bin) {
                 aw_finish_stream(job->dft, false);
                 auto_save_note_failure(slot, "the state copy failed or changed size during the copy", snap_toks.size());
-                return; // the writer drops the job and its queued children
+                return false; // the writer drops the job and its queued children
             }
         }
         if (job->has_dft) {
@@ -3794,6 +3827,7 @@ private:
         if (job->mode == aw_mode::sync) {
             aw_publish(*job);
         }
+        return false;
     }
 
     // ===== BACKGROUND WRITER (auto disk cache) ==========================================================
@@ -3805,17 +3839,28 @@ private:
     //
     // Staging (--slot-save-staging-mb, default 1024): a job whose bytes fit in the free budget is staged
     // whole and the server pays only the copy. One that does not fit streams through a two-chunk ring
-    // when the writer is idle (the server then pays about max(copy, write)), and is DROPPED, with a WRN
-    // and llamacpp:auto_cache_save_dropped_staging_total, when the writer is busy: the server never waits
-    // on the writer during prefill or decode. The shutdown flush is the exception: it waits. Staging is
-    // allocated per job and freed as the writer drains it, so an idle instance holds none. A budget of 0
-    // publishes on the server thread instead (the synchronous mode, streaming straight into the temp).
+    // when the writer is idle (the server then pays about max(copy, write)). When the writer is busy the
+    // capture WAITS for it (llamacpp:auto_cache_save_admission_waits_total and _wait_seconds_total), so a
+    // save is never dropped for want of staging: no save site is covered by a later one on every class (a
+    // prompt node on a class that cannot rewind is the only unit the next turn can restore). The wait is no
+    // longer than the synchronous save it replaces would have taken, since it waits only for writes the
+    // synchronous code would already have done on this thread. Two exceptions: the idle flush DEFERS
+    // instead (nothing is queued, and it retries once the writer is idle, so a request arriving meanwhile
+    // is not held), and a writer that makes no progress for AW_STALL_MS (a hung disk) has the waiting save
+    // dropped, with a WRN and llamacpp:auto_cache_save_dropped_staging_total, rather than the server loop
+    // hung for good. The shutdown flush waits up to its deadline. Staging is allocated per job and freed as
+    // the writer drains it, so an idle instance holds none; it is plain pageable host memory, at most the
+    // budget plus one ring per instance, on top of --cache-ram and GTT. A budget of 0 publishes on the
+    // server thread instead (the synchronous mode, streaming straight into the temp).
     //
     // A unit is visible to restores only once its .meta is renamed into place (restores read the index,
     // never the queue). The queue itself (the PENDING set) is consulted by the save-side dedup and parent
     // choice, so a child can be a delta on a parent that is still queued; a parent that fails takes its
     // queued children with it (llamacpp:auto_cache_save_orphan_dropped_total), because staged delta bytes
-    // cannot become a root.
+    // cannot become a root. Neither loss is final while the slot still holds the conversation: an orphaned
+    // child's slot, and every slot whose save was skipped because a queued unit already covered it, are
+    // re-armed for the idle flush when that unit fails (aw.resave_slots), and the re-save then picks a
+    // published parent or writes a root.
 
     struct aw_chunk {
         std::unique_ptr<uint8_t[]> buf;
@@ -3854,8 +3899,11 @@ private:
         aw_stream   bin;
         aw_stream   dft;
         aw_mode     mode      = aw_mode::sync;
+        auto_save_site site   = AUTO_SAVE_SITE_RECLAIM;
+        std::vector<std::pair<int, auto_save_site>> shadowed; // saves skipped because this job covers them
         size_t      reserved  = 0;                 // staged budget still held by this job
         bool        done      = false;
+        bool        published = false;             // set with done: the unit is in the store
         // timings, microseconds
         int64_t     t_d2h_tgt = 0;
         int64_t     t_d2h_dft = 0;
@@ -4159,9 +4207,14 @@ private:
         return std::all_of(aw.jobs.begin(), aw.jobs.end(), [](const std::shared_ptr<aw_job> & j) { return j->done; });
     }
 
-    // Admission (section "Staging"): decides staged / streamed / dropped for a job of `total` bytes and
-    // queues it. Returns false when the job is dropped (already counted and logged).
-    bool aw_admit(const std::shared_ptr<aw_job> & job, size_t total) {
+    // Admission (section "Staging"): decides staged / streamed for a job of `total` bytes and queues it.
+    // When neither fits (staging full, writer busy) a `wait` capture waits for the writer, a `defer` one
+    // (the idle flush) returns at once so its caller retries, and the shutdown flush waits up to its
+    // deadline. Only a writer that stalls (or the shutdown deadline) drops a job.
+    enum class aw_policy : uint8_t { wait, defer };
+    enum class aw_admit_res : uint8_t { queued, deferred, dropped };
+
+    aw_admit_res aw_admit(const std::shared_ptr<aw_job> & job, size_t total, aw_policy policy) {
         std::unique_lock<std::mutex> lk(aw.mtx);
         auto decide = [&]() -> bool {
             if (aw.staged + total <= aw.budget) {
@@ -4177,24 +4230,48 @@ private:
             return false;
         };
         bool ok = decide();
-        if (!ok && aw.shutdown) {
-            // the shutdown flush waits for room (bounded by the deadline) instead of dropping
-            ok = aw.cv.wait_until(lk, std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(std::max<int64_t>(0, aw.deadline_ms - ggml_time_ms())),
-                                  [&]() { return decide(); });
+        const char * why = "the shutdown deadline passed";
+        if (!ok && !aw.shutdown && policy == aw_policy::defer) {
+            return aw_admit_res::deferred;
+        }
+        if (!ok) {
+            const int64_t t0 = ggml_time_us();
+            if (aw.shutdown) {
+                ok = aw.cv.wait_until(lk, std::chrono::steady_clock::now() +
+                                          std::chrono::milliseconds(std::max<int64_t>(0, aw.deadline_ms.load() - ggml_time_ms())),
+                                      [&]() { return decide(); });
+            } else {
+                why = "the background writer made no progress";
+                while (!(ok = aw.cv.wait_for(lk, std::chrono::milliseconds(500), [&]() { return decide(); }))) {
+                    if (aw_stalled_locked()) {
+                        break;
+                    }
+                }
+            }
+            const int64_t t_wait = ggml_time_us() - t0;
+            aw_cnt.admission_waits++;
+            aw_cnt.admission_wait_us += (uint64_t) t_wait;
+            if (ok) {
+                SRV_INF("slot %d: auto-save: waited %.1f ms for the writer to take a %zu-token %s (%zu B; staging %zu/%zu MB)\n",
+                        job->slot_id, t_wait / 1000.0, job->toks->size(), job->is_node ? "delta" : "root", total,
+                        aw.staged >> 20, aw.budget >> 20);
+            }
         }
         if (!ok) {
             const size_t used = aw.staged;
             const size_t qd   = aw.jobs.size();
             lk.unlock();
             aw_cnt.dropped_staging++;
-            SRV_WRN("slot %d: auto-save: dropped %s %zu tokens (%zu B), staging full (%zu/%zu MB, queue %zu)\n",
-                    job->slot_id, job->is_node ? "delta" : "root", job->toks->size(), total, used >> 20,
+            SRV_WRN("slot %d: auto-save: dropped %s %zu tokens (%zu B), %s (staging %zu/%zu MB, queue %zu)\n",
+                    job->slot_id, job->is_node ? "delta" : "root", job->toks->size(), total, why, used >> 20,
                     aw.budget >> 20, qd);
-            return false;
+            return aw_admit_res::dropped;
         }
         job->t_enq = ggml_time_us();
         aw.queued_bytes += job->bin.n_expected + job->dft.n_expected;
+        if (aw_idle_locked()) {
+            aw.last_progress_ms = ggml_time_ms(); // the writer's silence is measured from its first job
+        }
         aw.jobs.push_back(job);
         aw_cnt.queued++;
         if (job->mode == aw_mode::streamed) {
@@ -4202,7 +4279,7 @@ private:
         }
         lk.unlock();
         aw.cv.notify_all();
-        return true;
+        return aw_admit_res::queued;
     }
 
     // A restore is about to look up the disk index: if the writer still holds a unit that is a usable
@@ -4434,6 +4511,29 @@ private:
         std::filesystem::remove(slot_meta_sidecar_path(job.tmp) + ".tmp", ec);
         std::filesystem::remove(slot_draft_sidecar_path(job.tmp), ec);
         aw_mark_failed(job.hash);
+        if (kind != aw_drop::abandoned) {
+            // The saves this unit covered are lost with it. Where the slot still holds the conversation (a
+            // node or an idle flush) its idle flush is re-armed, and so is an orphan's own slot: the re-save
+            // finds a published parent or writes a root. Where it does not (a reclaim, a cache-idle clear, the
+            // shutdown) the save counts as requested and never published, so it is not silent. A unit's own
+            // failure (IO, space) is not retried, as before.
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            for (const auto & [sid, ssite] : job.shadowed) {
+                if (auto_save_site_keeps_slot(ssite)) {
+                    aw.resave_slots.push_back(sid);
+                } else {
+                    aw_cnt.site_requested[ssite]++;
+                    SRV_WRN("slot %d: auto-save: a %s save deduplicated against this %zu-token unit is lost with it\n",
+                            sid, auto_save_site_name(ssite), job.toks->size());
+                }
+            }
+            if (kind == aw_drop::orphan) {
+                aw.resave_slots.push_back(job.slot_id);
+            }
+            if (aw.resave_slots.size() > 4096) { // nothing takes them while the idle flush is off
+                aw.resave_slots.erase(aw.resave_slots.begin(), aw.resave_slots.end() - 4096);
+            }
+        }
         switch (kind) {
             case aw_drop::failed:
                 auto_save_note_failure(job.slot_id, reason, job.toks->size());
@@ -4455,6 +4555,7 @@ private:
         const int64_t t_start = ggml_time_us();
         int64_t t_write = 0, t_sync = 0, t_pub = 0, t_evict = 0;
         const bool sync = job.mode == aw_mode::sync;
+        bool published_ok = false;
         auto finish = [&]() {
             {
                 std::lock_guard<std::mutex> lk(aw.mtx);
@@ -4464,6 +4565,7 @@ private:
                     aw.queued_bytes -= std::min(aw.queued_bytes, job.bin.n_expected + job.dft.n_expected);
                 }
                 job.done = true;
+                job.published = published_ok;
             }
             aw.cv.notify_all();
         };
@@ -4656,7 +4758,9 @@ private:
             }
         }
         t_evict = ggml_time_us() - t_e0;
+        published_ok = published;
         if (published) {
+            aw_cnt.site_published[job.site]++;
             (job.is_node ? aw_cnt.delta : aw_cnt.root)++;
             aw_cnt.bytes += job.bin.n_expected;
             if (dft_ok) {
@@ -4813,6 +4917,7 @@ private:
             std::lock_guard<std::mutex> lk(aw.mtx);
             for (const auto & j : aw.jobs) {
                 if (!j->done && j->hash == id && j->toks->size() == (size_t) B_ctx) {
+                    j->shadowed.emplace_back(slot.id, AUTO_SAVE_SITE_SYSTEM_NODE); // re-armed if that unit fails
                     return; // queued already
                 }
             }
@@ -4821,26 +4926,32 @@ private:
         // toks.size() so auto_publish_snapshot takes the llama_state_seq_save_file (whole-root) branch,
         // which serialises the true whole recurrent/attention state at B_ctx. Same capacity pre-flight,
         // pid+nonce temp, temp->rename (meta last) publish and index insert as every other save.
-        auto_publish_snapshot(slot, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
+        auto_publish_snapshot(slot, AUTO_SAVE_SITE_SYSTEM_NODE, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
                               /*hash=*/id, bhs, kb, cur_fp, media);
     }
 
-    void auto_save_slot_if_useful(server_slot & slot) {
+    // the sites after which the slot still holds the conversation (another site can save it again later)
+    static bool auto_save_site_keeps_slot(auto_save_site site) {
+        return site != AUTO_SAVE_SITE_RECLAIM && site != AUTO_SAVE_SITE_CACHE_IDLE && site != AUTO_SAVE_SITE_SHUTDOWN;
+    }
+
+    // Returns true only when an idle flush was deferred (staging full, writer busy): see auto_idle_flush.
+    bool auto_save_slot_if_useful(server_slot & slot, auto_save_site site) {
         if (!auto_cache_enabled()) {
-            return; // off by default
+            return false; // off by default
         }
         // exclusions reuse the existing guards. NOTE: an idle slot has already been reset(), so
         // `slot.task` is null here — the just-finished task survives as `slot.task_prev`. Use it for
         // the generative check (COMPLETION/INFILL only).
         const auto & wtask = slot.task ? slot.task : slot.task_prev;
         if (!wtask || !wtask->need_sampling()) {
-            return;
+            return false;
         }
         // The fingerprint captures the GLOBAL LoRA set; refuse to persist a snapshot taken under a
         // per-request adapter override that differs from it (invariant 3). (Conservative: a future version
         // could fold the slot's adapters into the snapshot fingerprint instead.)
         if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
-            return;
+            return false;
         }
         // media branch, gated on the PER-REQUEST has_media() (not the server-wide has_mtmd/mctx)
         // so an --mmproj server still persists its text-only turns as byte-identical v1 units.
@@ -4860,7 +4971,7 @@ private:
                 // identity-less chunk (e.g. a placeholder bitmap): it can never be re-verified
                 // against a future request, so the snapshot must not be persisted (invariant 4)
                 SLT_WRN(slot, "auto-save: skipped, %s\n", e.what());
-                return;
+                return false;
             }
         }
         // Text prompts: get_text_tokens() (not get_tokens()) — media-safe accessor that never
@@ -4884,7 +4995,7 @@ private:
         // the state-file write + later restore, so it is skipped. Applies to text and media alike.
         const int save_floor = std::max(params_base.slot_save_block, params_base.slot_save_min_tokens);
         if ((int) toks.size() < save_floor) {
-            return; // below the floor: not worth a multi-GB write
+            return false; // below the floor: not worth a multi-GB write
         }
         // media-aware chain: text cells contribute their token ids (bit-identical to the
         // pre-media chain for a text-only prompt), media cells their record identity; only
@@ -4894,7 +5005,7 @@ private:
         const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj, &unit_id);
         if (bhs.empty()) {
-            return;
+            return false;
         }
         // NOTE: the shared-context preamble base is NO LONGER written here at idle-flush. It is now
         // whole-saved MID-PREFILL (Option A: auto_save_context_base, fired from update_slots when a cold
@@ -4934,7 +5045,7 @@ private:
                     // trailing partial block when the two differ there.)
                     const bool same = c.n_tokens == toks.size() && c.id == unit_id;
                     if (restore_is_whole_prefix_only() ? same : (same || c.n_tokens > toks.size())) {
-                        return; // a usable snapshot for this exact prefix already exists
+                        return false; // a usable snapshot for this exact prefix already exists
                     }
                 }
             }
@@ -4942,7 +5053,8 @@ private:
         // the same rule against the units the writer still holds (the PENDING set): a reclaim save right
         // after the node that covers it must not queue the unit twice
         {
-            std::lock_guard<std::mutex> lk(aw.mtx);
+            std::unique_lock<std::mutex> lk(aw.mtx);
+            std::shared_ptr<aw_job> cover;
             for (const auto & j : aw.jobs) {
                 if (j->done) {
                     continue;
@@ -4954,8 +5066,35 @@ private:
                 }
                 const bool same = j->toks->size() == toks.size() && j->hash == unit_id;
                 if (restore_is_whole_prefix_only() ? same : (same || j->toks->size() > toks.size())) {
-                    return; // queued already
+                    cover = j;
+                    break;
                 }
+            }
+            if (cover && cover->is_node && !auto_save_site_keeps_slot(site)) {
+                // The slot's conversation is about to be overwritten or cleared and the queued unit covering it
+                // is a DELTA: the one failure a second write can recover from is that delta being orphaned (its
+                // parent failed or was evicted), and only this slot's state can then write it as a root. So
+                // wait for the delta's outcome and write the conversation here if it did not publish. A root
+                // cover is not waited for: what fails a root (IO, space, size) fails a second write the same
+                // way, so a lost root shows up as requested != published for this site instead.
+                const int64_t t0 = ggml_time_us();
+                while (!aw.cv.wait_for(lk, std::chrono::milliseconds(500), [&]() { return cover->done || aw_past_deadline(); })) {
+                    if (aw_stalled_locked()) {
+                        break;
+                    }
+                }
+                const bool pub = cover->done && cover->published;
+                SLT_INF(slot, "auto-save: waited %.1f ms for the queued %zu-token unit that covers this slot (%s)\n",
+                        (ggml_time_us() - t0) / 1000.0, cover->toks->size(),
+                        pub ? "published" : cover->done ? "not published, saving it again" : "still queued");
+                if (pub || !cover->done) {
+                    return false; // published; or the writer is stalled / past the shutdown deadline
+                }
+                cover.reset();
+            }
+            if (cover) {
+                cover->shadowed.emplace_back(slot.id, site); // accounted for (and re-armed) if that unit fails
+                return false; // queued already
             }
         }
 
@@ -5085,7 +5224,7 @@ private:
         // three-file temp->rename (meta last) with orphan cleanup, per-boundary index insert + LRU.
         // Whole root: lo=0, hi=N => byte-identical save_file path. Delta (have_parent): lo=parent_hi>0
         // => v3 node cells [parent_hi, N). Both index every boundary (kb = bhs.size()-1).
-        auto_publish_snapshot(slot, ctx_tgt, toks,
+        return auto_publish_snapshot(slot, site, ctx_tgt, toks,
                               /*lo=*/ have_parent ? (int32_t) parent_hi : 0,
                               /*hi=*/ (int32_t) toks.size(),
                               /*hash=*/ unit_id, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
@@ -5159,7 +5298,7 @@ private:
                             aw.shutdown_ms, slots.size() - i);
                     break;
                 }
-                auto_save_slot_if_useful(slots[i]);
+                auto_save_slot_if_useful(slots[i], AUTO_SAVE_SITE_SHUTDOWN);
             }
         }
         aw_stop(t_deadline_ms);
@@ -5184,12 +5323,14 @@ private:
             return -1;
         }
         const int64_t idle_ms = (int64_t) params_base.slot_save_idle_seconds * 1000;
+        auto_idle_take_resaves();
         int64_t earliest = -1;
         for (const auto & slot : slots) {
             if (slot.is_processing() || slot.auto_idle_flushed || !slot.task_prev || slot.t_last_used < 0) {
                 continue;
             }
-            const int64_t deadline = slot.t_last_used / 1000 + idle_ms; // t_last_used is microseconds
+            // t_last_used is microseconds; a deferred flush is due again at its retry time
+            const int64_t deadline = std::max(slot.t_last_used / 1000 + idle_ms, slot.auto_idle_retry_ms);
             if (earliest < 0 || deadline < earliest) {
                 earliest = deadline;
             }
@@ -5210,16 +5351,59 @@ private:
         }
         const int64_t now_ms  = ggml_time_ms();
         const int64_t idle_ms = (int64_t) params_base.slot_save_idle_seconds * 1000;
+        auto_idle_take_resaves();
         for (auto & slot : slots) {
             if (slot.is_processing() || slot.auto_idle_flushed || !slot.task_prev || slot.t_last_used < 0) {
                 continue;
             }
-            if (now_ms - slot.t_last_used / 1000 < idle_ms) {
-                continue; // not idle long enough yet
+            if (now_ms - slot.t_last_used / 1000 < idle_ms || now_ms < slot.auto_idle_retry_ms) {
+                continue; // not idle long enough yet, or a deferred flush not due again yet
             }
-            auto_save_slot_if_useful(slot);
-            slot.auto_idle_flushed = true; // one attempt per idle period; a reclaim/next task re-arms it
-            return;                        // at most one flush per wakeup, then back to service tasks
+            if (slot.auto_idle_deferred) {
+                bool idle = true;
+                {
+                    std::lock_guard<std::mutex> lk(aw.mtx);
+                    idle = aw_idle_locked();
+                }
+                if (!idle) {
+                    slot.auto_idle_retry_ms = now_ms + AW_IDLE_RETRY_MS; // cheap: no save planned until it is
+                    continue;
+                }
+            }
+            // A flush that finds the staging full and the writer busy is DEFERRED, not dropped: nothing was
+            // queued, and it is retried once the writer is idle (then it streams). No request is in flight,
+            // but one may arrive at any moment, so the idle flush never waits for the writer itself.
+            if (auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_IDLE)) {
+                if (!slot.auto_idle_deferred) {
+                    SLT_INF(slot, "%s", "auto-save: idle flush deferred, the staging is full and the writer busy; "
+                                        "retrying once the writer is idle\n");
+                }
+                slot.auto_idle_deferred = true;
+                slot.auto_idle_retry_ms = now_ms + AW_IDLE_RETRY_MS;
+                continue;
+            }
+            slot.auto_idle_flushed  = true; // one attempt per idle period; a reclaim/next task re-arms it
+            slot.auto_idle_deferred = false;
+            slot.auto_idle_retry_ms = -1;
+            return;                         // at most one flush per wakeup, then back to service tasks
+        }
+    }
+
+    // The writer lost a unit that covered these slots (a failed queued unit their save was deduplicated
+    // against, or an orphaned delta): give each idle one another idle flush. Server thread only.
+    void auto_idle_take_resaves() {
+        std::vector<int> ids;
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            ids.swap(aw.resave_slots);
+        }
+        for (const int id : ids) {
+            for (auto & slot : slots) {
+                if (slot.id == id && !slot.is_processing() && slot.auto_idle_flushed) {
+                    SLT_INF(slot, "%s", "auto-save: a queued unit covering this slot was lost, re-arming the idle flush\n");
+                    slot.auto_idle_flushed = false;
+                }
+            }
         }
     }
 
@@ -5993,7 +6177,7 @@ private:
             if (auto_cache_enabled() && params_base.slot_save_on_reclaim && !ret->prompt.tokens.empty()) {
                 const size_t n_lcp_reclaim = ret->prompt.tokens.get_common_prefix(task.tokens);
                 if (n_lcp_reclaim + (size_t) params_base.slot_save_block <= (size_t) ret->prompt.n_tokens()) {
-                    auto_save_slot_if_useful(*ret);
+                    auto_save_slot_if_useful(*ret, AUTO_SAVE_SITE_RECLAIM);
                 }
             }
 
@@ -6906,7 +7090,7 @@ private:
                                 // when the feature is OFF; the callee re-checks all correctness guards
                                 // (fingerprint, need_sampling, LoRA, media identity, >=1 block).
                                 if (auto_cache_enabled()) {
-                                    auto_save_slot_if_useful(slot);
+                                    auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_CACHE_IDLE);
                                 }
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
@@ -7587,7 +7771,7 @@ private:
             if (slot.prompt_save_pos > 0 && slot.prompt.n_tokens() == slot.prompt_save_pos) {
                 // the slot is resident at exactly [0, prompt_save_pos): the regular save persists that
                 // prefix (a delta on the deepest saved node under --slot-save-incremental)
-                auto_save_slot_if_useful(slot);
+                auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_PROMPT_NODE);
                 slot.prompt_save_pos = -1;
             }
         }
@@ -9100,7 +9284,7 @@ private:
                 const bool save = auto_save_after_response_wanted(slot);
                 slot.release();
                 if (save) {
-                    auto_save_slot_if_useful(slot);
+                    auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_RESPONSE_NODE);
                 }
 
                 return;
@@ -9260,7 +9444,7 @@ private:
                     const bool save = auto_save_after_response_wanted(slot);
                     slot.release();
                     if (save) {
-                        auto_save_slot_if_useful(slot);
+                        auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_RESPONSE_NODE);
                     }
 
                     return;

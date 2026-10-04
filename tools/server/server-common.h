@@ -899,6 +899,25 @@ struct server_slot_stats {
     json to_json() const;
 };
 
+// auto disk cache: the site that asked for a save (llamacpp:auto_cache_save_site_*_total{site=...})
+enum auto_save_site : uint8_t {
+    AUTO_SAVE_SITE_RECLAIM,       // a new task takes the slot over
+    AUTO_SAVE_SITE_IDLE,          // --slot-save-idle-seconds
+    AUTO_SAVE_SITE_SHUTDOWN,      // graceful terminate
+    AUTO_SAVE_SITE_CACHE_IDLE,    // --cache-idle-slots, at a task launch
+    AUTO_SAVE_SITE_SYSTEM_NODE,   // mid-prefill, at the end of the system prompt
+    AUTO_SAVE_SITE_PROMPT_NODE,   // mid-prefill, at the end of the user message
+    AUTO_SAVE_SITE_RESPONSE_NODE, // --slot-save-node-response / --slot-save-node-tool
+    AUTO_SAVE_SITE_COUNT,
+};
+
+inline const char * auto_save_site_name(int site) {
+    static const char * const names[AUTO_SAVE_SITE_COUNT] = {
+        "reclaim", "idle", "shutdown", "cache_idle", "system_node", "prompt_node", "response_node",
+    };
+    return site >= 0 && site < AUTO_SAVE_SITE_COUNT ? names[site] : "unknown";
+}
+
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
 struct server_metrics {
@@ -966,6 +985,10 @@ struct server_metrics {
     uint64_t n_auto_save_shutdown_abandoned = 0; // queued saves abandoned at the shutdown deadline
     uint64_t n_auto_save_staging_bytes      = 0; // gauge: host bytes held by saves not yet written
     uint64_t n_auto_save_queue_depth        = 0; // gauge: saves queued or being written
+    uint64_t n_auto_save_admission_waits    = 0; // saves whose capture waited for the writer (staging full, writer busy)
+    uint64_t n_auto_save_admission_wait_us  = 0; // total time those captures waited
+    uint64_t n_auto_save_site_requested[AUTO_SAVE_SITE_COUNT] = {}; // units a save site decided to write
+    uint64_t n_auto_save_site_published[AUTO_SAVE_SITE_COUNT] = {}; // of those, published (requested - published = lost)
     uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars
     uint64_t n_auto_restore_draft_cold     = 0; // disk restores with a draft context left cold (a node lacked a sidecar)
     uint64_t n_auto_node_media_skipped     = 0; // mid-prefill nodes not armed: no text-after-text cut above the floor before a media chunk

@@ -1696,8 +1696,18 @@ std::string server_task_result_metrics::to_metrics() {
         },
         {
             "auto_cache_save_dropped_staging_total",
-            "Auto disk KV cache: saves dropped because the staging (--slot-save-staging-mb) was full and the writer busy; each logs a WRN",
+            "Auto disk KV cache: saves dropped because the background writer made no progress for 60 s while the capture waited for staging; each logs a WRN",
             (double) metrics.n_auto_save_dropped_staging
+        },
+        {
+            "auto_cache_save_admission_waits_total",
+            "Auto disk KV cache: captures that waited for the background writer because the staging (--slot-save-staging-mb) was full and the writer busy",
+            (double) metrics.n_auto_save_admission_waits
+        },
+        {
+            "auto_cache_save_admission_wait_seconds_total",
+            "Auto disk KV cache: total time those captures waited",
+            (double) metrics.n_auto_save_admission_wait_us / 1e6
         },
         {
             "auto_cache_save_orphan_dropped_total",
@@ -1755,6 +1765,28 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
+
+    // labeled counters: units each save site asked for, and how many of them were published. A unit that
+    // was requested and never published was lost (failed, orphaned, abandoned or dropped).
+    {
+        const struct {
+            const char * name;
+            const char * help;
+            const uint64_t * v;
+        } site_items[] = {
+            { "auto_cache_save_site_requested_total", "Auto disk KV cache: units a save site decided to write",
+              metrics.n_auto_save_site_requested },
+            { "auto_cache_save_site_published_total", "Auto disk KV cache: of those, units published",
+              metrics.n_auto_save_site_published },
+        };
+        for (const auto & it : site_items) {
+            prometheus << "# HELP llamacpp:" << it.name << " " << it.help << "\n"
+                       << "# TYPE llamacpp:" << it.name << " counter\n";
+            for (int i = 0; i < AUTO_SAVE_SITE_COUNT; i++) {
+                prometheus << "llamacpp:" << it.name << "{site=\"" << auto_save_site_name(i) << "\"} " << it.v[i] << "\n";
+            }
+        }
+    }
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
