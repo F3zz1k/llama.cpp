@@ -1592,6 +1592,16 @@ def test_manual_media_restore_refuses_cells_without_meta():
 IDLE_SECONDS = 3
 
 
+def _queued(s) -> float:
+    # saves handed to the background writer: a unit captured but not yet published is not on disk
+    res = s.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    for line in res.body.splitlines():
+        if line.startswith("llamacpp:auto_cache_save_queued_total "):
+            return float(line.split()[1])
+    raise AssertionError("auto_cache_save_queued_total not found")
+
+
 def _units_on_disk():
     return sorted(glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")))
 
@@ -1616,6 +1626,7 @@ def test_idle_flush_text():
     server.slot_save_auto = True
     server.slot_save_block = 16
     server.slot_save_idle_seconds = IDLE_SECONDS
+    server.server_metrics = True
     server.start()
 
     res = server.make_request("POST", "/completion", data={
@@ -1624,8 +1635,9 @@ def test_idle_flush_text():
         "temperature": 0,
     })
     assert res.status_code == 200
-    # the request itself (processing + completion) writes nothing
+    # the request itself (processing + completion) writes nothing, and captures nothing either
     assert _units_on_disk() == []
+    assert _queued(server) == 0
 
     metas = _wait_for_unit(IDLE_SECONDS + 10)
     assert len(metas) == 1, "the idle slot must have been flushed to disk after the delay"
@@ -1645,12 +1657,14 @@ def test_idle_flush_media():
     cells), after the delay, with no follow-up request and no shutdown."""
     vs = make_vision_server(auto=True)
     vs.slot_save_idle_seconds = IDLE_SECONDS
+    vs.server_metrics = True
     vs.start()
 
     prompt_n, _, _ = vision_request(vs, [VISION_TEXT_PRE, IMG_DATA_URI], id_slot=0)
     assert prompt_n > 0
-    # nothing on disk yet: no second request, no shutdown
+    # nothing on disk yet, and nothing captured: no second request, no shutdown
     assert _units_on_disk() == []
+    assert _queued(vs) == 0
 
     metas = _wait_for_unit(IDLE_SECONDS + 10)
     v2 = [parse_meta(p) for p in metas]

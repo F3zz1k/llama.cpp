@@ -1,6 +1,7 @@
 import glob
 import os
 import shutil
+import time
 
 import pytest
 from utils import *
@@ -131,6 +132,14 @@ def _metric(s, name: str) -> float:
     raise AssertionError(f"metric {name} not found")
 
 
+def _settled(s):
+    # saves are published by a background writer: read the store once its queue is empty
+    deadline = time.time() + 30
+    while _metric(s, "auto_cache_save_queue_depth") > 0 and time.time() < deadline:
+        time.sleep(0.05)
+    assert _metric(s, "auto_cache_save_queue_depth") == 0
+
+
 def _units():
     return sorted(int(os.path.basename(p)[:-len(".bin.meta")].split("-")[-1])
                   for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")))
@@ -240,8 +249,10 @@ def test_reclaim_saves_preempted_conversation():
     s = _server(model)
     s.start()
     _, _, gen_a = _complete(s, PROMPT)
+    _settled(s)
     assert _units() == []
     _complete(s, other)
+    _settled(s)
     units_after_b = _units()
     s.stop()
     assert len(PROMPT) + len(gen_a) - 1 in units_after_b
@@ -271,8 +282,10 @@ def test_reclaim_with_shared_leading_prefix(name, shared):
     _, _, ga = _complete(s, a)
     a2 = a + ga + TAIL[:8]
     _, _, ga2 = _complete(s, a2)   # extends the slot: nothing is lost, nothing is written
+    _settled(s)
     assert _units() == []
     _complete(s, b)
+    _settled(s)
     units = _units()
     s.stop()
     assert len(a2) + len(ga2) - 1 in units, f"units after B: {units}"
@@ -346,6 +359,7 @@ def test_divergent_followup_needs_the_prompt_node(name, incr):
     s.start()
     prompt_n, cache_n, _ = _complete(s, follow)
     body = _complete.last
+    _settled(s)
     delta = _metric(s, "auto_cache_save_delta_total")
     s.stop()
     node = (len(PROMPT) - 1) // B * B
@@ -398,6 +412,7 @@ def test_response_node_saves_without_idle_or_reclaim():
     s = _server(model)
     s.start()
     _complete(s, PROMPT)
+    _settled(s)
     assert _units() == []
     s.stop()
 
@@ -407,6 +422,7 @@ def test_response_node_saves_without_idle_or_reclaim():
     s.slot_save_node_response = True
     s.start()
     _, _, gen = _complete(s, PROMPT)
+    _settled(s)
     units = _units()
     s.stop()
     assert units == [len(PROMPT) + len(gen) - 1]
@@ -422,6 +438,7 @@ def test_reclaim_save_can_be_disabled():
     s.start()
     _complete(s, PROMPT)
     _complete(s, other)
+    _settled(s)
     assert _units() == []
     s.stop()
     assert len(_units()) == 1
