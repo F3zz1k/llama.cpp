@@ -32,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string>
@@ -109,6 +110,52 @@ static void decode(llama_context * ctx, const std::vector<llama_token> & toks, i
     if (rc != 0) {
         fprintf(stderr, "decode [%d, %d) seq %d failed rc=%d\n", p_begin, p_end, seq, rc);
         exit(3);
+    }
+}
+
+// The background writer's capture path: llama_state_seq_save_sink must hand out exactly the bytes the
+// file save wrote (the sink here offers odd-sized pieces, so plain writes and tensor slices are split at
+// arbitrary offsets), and llama_state_seq_get_size_range must give the payload size behind the 12-byte
+// header and token array, with the leading plain fields (stream and cell counts) in its head.
+static int g_sink_checks = 0;
+
+struct piece_sink {
+    std::vector<uint8_t> out;
+    size_t               cap   = 0;
+    size_t               piece = 0;
+    uint32_t             rng   = 7;
+};
+
+static void * piece_reserve(void * ud, size_t n, size_t * n_avail) {
+    auto * ps = (piece_sink *) ud;
+    ps->rng   = ps->rng * 1103515245u + 12345u;
+    ps->piece = std::min(n, (size_t) 1 + (ps->rng >> 8) % 4099);
+    ps->cap   = ps->out.size();
+    ps->out.resize(ps->cap + ps->piece);
+    *n_avail  = ps->piece;
+    return ps->out.data() + ps->cap;
+}
+
+static void piece_commit(void * ud, size_t n) {
+    auto * ps = (piece_sink *) ud;
+    ps->out.resize(ps->cap + n);
+}
+
+static void check_sink(llama_context * X, int seq, int p0, int p1, const std::vector<llama_token> & toks, size_t n_tok,
+                       const std::string & file, const char * what) {
+    std::ifstream f(file, std::ios::binary);
+    const std::vector<uint8_t> ref((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    piece_sink ps;
+    const llama_state_sink sink = { piece_reserve, piece_commit, &ps };
+    const size_t n = llama_state_seq_save_sink(X, seq, p0, p1, toks.data(), n_tok, &sink);
+    g_sink_checks++;
+    CHECK(n == ref.size() && ps.out == ref, "%s: sink output (%zu B) differs from the file save (%zu B)", what, n, ref.size());
+    uint8_t head[16];
+    const size_t hdr = 12 + n_tok * sizeof(llama_token);
+    const size_t np  = llama_state_seq_get_size_range(X, seq, p0, p1, head, sizeof(head));
+    CHECK(np + hdr == ref.size(), "%s: size_range %zu + header %zu != file %zu", what, np, hdr, ref.size());
+    if (ref.size() >= hdr + sizeof(head)) {
+        CHECK(memcmp(head, ref.data() + hdr, sizeof(head)) == 0, "%s: size_range head differs from the file payload", what);
     }
 }
 
@@ -311,11 +358,21 @@ int main(int argc, char ** argv) {
                 size_t n;
                 if (s == 0) {
                     n = llama_state_seq_save_file(X, f.c_str(), o.seq_a, toks.data(), o.splits[s]);
+                    check_sink(X, o.seq_a, -1, -1, toks, o.splits[s], f, "root");
                 } else {
                     n = llama_state_seq_save_file_range(X, f.c_str(), o.seq_a, prev, -1, toks.data(), o.splits[s]);
                     const size_t n_whole = llama_state_seq_get_size(X, o.seq_a);
                     printf("  node %zu [%d,%d): delta file %zu B vs whole state %zu B (%.0f%%)%s\n", s, prev, o.splits[s], n, n_whole,
                             100.0*n/n_whole, n + 64 >= n_whole ? "   <-- NOT INCREMENTAL" : "");
+                    check_sink(X, o.seq_a, prev, -1, toks, o.splits[s], f, "delta");
+                    // the server's size-based delta probe must answer as the file probe it replaced
+                    // (range file vs whole file of the same prefix)
+                    const std::string fp = f + ".probe";
+                    const size_t n_file_whole = llama_state_seq_save_file(X, fp.c_str(), o.seq_a, toks.data(), o.splits[s]);
+                    const size_t r = llama_state_seq_get_size_range(X, o.seq_a, prev, -1, nullptr, 0);
+                    const size_t w = llama_state_seq_get_size_range(X, o.seq_a, -1, -1, nullptr, 0);
+                    CHECK((n < n_file_whole) == (r < w), "delta probe: files %zu vs %zu, sizes %zu vs %zu", n, n_file_whole, r, w);
+                    std::remove(fp.c_str());
                 }
                 CHECK(n > 0, "save node %zu", s);
                 files_a.push_back(f);
@@ -329,6 +386,7 @@ int main(int argc, char ** argv) {
     run_prompt(A, true);
     const std::string fw = pfx + ".whole.bin";
     CHECK(llama_state_seq_save_file(A, fw.c_str(), o.seq_a, toks.data(), n_prompt) > 0, "save whole");
+    check_sink(A, o.seq_a, -1, -1, toks, n_prompt, fw, "whole");
     const auto BA = blob(A, o.seq_a);
 
     // ---- W: whole-file control
@@ -439,6 +497,7 @@ int main(int argc, char ** argv) {
             }
             const std::string f = pfx + ".f" + std::to_string(s) + ".bin";
             CHECK(llama_state_seq_save_file_range(F, f.c_str(), o.seq_b, prev, -1, toks.data(), o.splits[s]) > 0, "F save %zu", s);
+            check_sink(F, o.seq_b, prev, -1, toks, o.splits[s], f, "F delta");
             files_g.push_back(f);
             prev = o.splits[s];
         }
@@ -525,6 +584,9 @@ int main(int argc, char ** argv) {
     for (auto * c : {A, A2, A1, W, C, D, G, N, NC}) if (c) llama_free(c);
     llama_model_free(model);
 
+    // a sink check that never ran would pass vacuously: every save point above runs one
+    CHECK(g_sink_checks >= (int) o.splits.size() + 1, "only %d sink checks ran", g_sink_checks);
+    printf("sink checks: %d\n", g_sink_checks);
     printf("RESULT %s: %s (%d failures)\n", o.model.c_str(), g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

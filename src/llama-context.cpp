@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2834,6 +2835,87 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// Streams into a caller-provided sink: every byte, plain or tensor, goes into memory the sink hands
+// out, in pieces no larger than it offers, so a tensor slice is copied from the backend straight into
+// its final staging place with no intermediate buffer.
+class llama_io_write_sink : public llama_io_write_i {
+public:
+    llama_io_write_sink(const llama_state_sink & sink) : sink(sink) {}
+
+    void write(const void * src, size_t size) override {
+        const uint8_t * p = (const uint8_t *) src;
+        while (size > 0) {
+            size_t avail = 0;
+            void * dst = reserve(size, avail);
+            memcpy(dst, p, avail);
+            sink.commit(sink.user_data, avail);
+            p            += avail;
+            size         -= avail;
+            size_written += avail;
+        }
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        while (size > 0) {
+            size_t avail = 0;
+            void * dst = reserve(size, avail);
+            ggml_backend_tensor_get(tensor, dst, offset, avail);
+            sink.commit(sink.user_data, avail);
+            offset       += avail;
+            size         -= avail;
+            size_written += avail;
+        }
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    void * reserve(size_t n, size_t & avail) {
+        avail = 0;
+        void * dst = sink.reserve(sink.user_data, n, &avail);
+        if (dst == nullptr || avail == 0) {
+            throw std::runtime_error("the state sink refused the write");
+        }
+        avail = std::min(avail, n);
+        return dst;
+    }
+
+    const llama_state_sink & sink;
+    size_t size_written = 0;
+};
+
+// Counts like llama_io_write_dummy and keeps the first n_head bytes of the stream, tensor data as zeros.
+class llama_io_write_head : public llama_io_write_i {
+public:
+    llama_io_write_head(uint8_t * head, size_t n_head) : head(head), n_head(n_head) {
+        if (head != nullptr && n_head > 0) {
+            memset(head, 0, n_head);
+        }
+    }
+
+    void write(const void * src, size_t size) override {
+        if (head != nullptr && size_written < n_head) {
+            memcpy(head + size_written, src, std::min(size, n_head - size_written));
+        }
+        size_written += size;
+    }
+
+    void write_tensor(ggml_tensor * /* tensor */, size_t /* offset */, size_t size) override {
+        size_written += size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    uint8_t * head;
+    size_t    n_head;
+    size_t    size_written = 0;
+};
+
 class llama_io_read_file : public llama_io_read_i {
 public:
     llama_io_read_file(llama_file * f) : file(f), size_left(f->size() - f->tell()) {}
@@ -3432,6 +3514,35 @@ size_t llama_context::state_seq_save_file_range(llama_seq_id seq_id, const char 
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
 
     return res;
+}
+
+size_t llama_context::state_seq_save_sink(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count, const llama_state_sink & sink) {
+    llama_io_write_sink io(sink);
+
+    // the same bytes, in the same order, as state_seq_save_file / state_seq_save_file_range
+    const uint32_t hdr[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) n_token_count };
+    io.write(hdr, sizeof(hdr));
+    io.write(tokens, sizeof(llama_token) * n_token_count);
+
+    if (p0 < 0 && p1 < 0) {
+        state_seq_write_data(io, seq_id, 0);
+    } else if (memory) {
+        memory->state_write_range(io, seq_id, p0, p1, 0);
+    }
+
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_get_size_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * head, size_t n_head) {
+    llama_io_write_head io(head, n_head);
+
+    if (p0 < 0 && p1 < 0) {
+        state_seq_write_data(io, seq_id, 0);
+    } else if (memory) {
+        memory->state_write_range(io, seq_id, p0, p1, 0);
+    }
+
+    return io.n_bytes();
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -4435,6 +4546,32 @@ size_t llama_state_seq_save_file_range(llama_context * ctx, const char * filepat
         return ctx->state_seq_save_file_range(seq_id, filepath, p0, p1, tokens, n_token_count);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_sink(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count, const llama_state_sink * sink) {
+    if (sink == nullptr || sink->reserve == nullptr || sink->commit == nullptr) {
+        return 0;
+    }
+
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_sink(seq_id, p0, p1, tokens, n_token_count, *sink);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * head, size_t n_head) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_get_size_range(seq_id, p0, p1, head, n_head);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting sequence state size: %s\n", __func__, err.what());
         return 0;
     }
 }

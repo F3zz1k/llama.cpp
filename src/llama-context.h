@@ -198,6 +198,21 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    size_t state_seq_save_sink(
+          llama_seq_id   seq_id,
+             llama_pos   p0,
+             llama_pos   p1,
+     const llama_token * tokens,
+                size_t   n_token_count,
+const llama_state_sink & sink);
+
+    size_t state_seq_get_size_range(
+          llama_seq_id   seq_id,
+             llama_pos   p0,
+             llama_pos   p1,
+               uint8_t * head,
+                size_t   n_head);
+
     //
     // perf
     //

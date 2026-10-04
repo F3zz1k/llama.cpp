@@ -980,6 +980,43 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    // Destination for llama_state_seq_save_sink. reserve() returns writable memory for at least 1 and at
+    // most n bytes and stores its size in *n_avail, or returns NULL to abort the save; commit() reports
+    // that the first n bytes of the last reservation hold data. Tensor data is copied from the backend
+    // straight into the reserved memory, so the sink decides where the bytes land (a staging buffer, a
+    // pinned ring, a file) and in what chunk sizes.
+    typedef struct llama_state_sink {
+        void * (*reserve)(void * user_data, size_t n, size_t * n_avail);
+        void   (*commit) (void * user_data, size_t n);
+        void * user_data;
+    } llama_state_sink;
+
+    // Produces exactly the bytes that llama_state_seq_save_file (p0 < 0 and p1 < 0) or
+    // llama_state_seq_save_file_range ([p0, p1), either end open when negative) would write to a file,
+    // header and token array included, but hands them to `sink` instead. Returns the number of bytes
+    // produced, or 0 on failure (an exception, or a sink that returned NULL).
+    LLAMA_API size_t llama_state_seq_save_sink(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+          const llama_state_sink * sink);
+
+    // Size in bytes of the memory payload llama_state_seq_save_sink produces for the same arguments
+    // after its 12-byte header and token array, computed without copying any tensor data. When `head`
+    // is not NULL, the first n_head bytes of that payload are copied into it, with tensor data reported
+    // as zero bytes: only the leading plain fields (stream and cell counts) are meaningful there.
+    // Returns 0 on failure.
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                         uint8_t * head,
+                          size_t   n_head);
+
     // Like llama_state_seq_load_file but takes state-seq flags (e.g. NO_CLEAR to append a delta).
     LLAMA_API size_t llama_state_seq_load_file_ext(
             struct llama_context * ctx,
