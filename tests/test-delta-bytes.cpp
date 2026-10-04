@@ -15,7 +15,13 @@
 //                its logits carry the same cell-placement noise floor; N is judged against NC, not W
 // Then every context decodes the same forced continuation; logits and final state blobs are compared.
 // Controls: A2 repeats A exactly (determinism), A1 decodes the prompt in one call (order noise floor).
-// W must equal A (blob and logits) when both use one sequence id, and G's logits must equal F's.
+// W must equal A (blob and logits) when both use one sequence id, and G's logits must equal F's. A live
+// context of a sliding-window model also holds cells the window already masks, which a save does not
+// persist ([L - n_swa, L) only): there a restored context attends over fewer cells than the live one, the
+// reduction order differs, and live-vs-restored logits agree to LIVE_SWA_TOL instead of bitwise (measured
+// 2026-10-03: 0 for every class while the prompt fits the window, 1e-5..5e-4 past it, gemma3, dots3note,
+// deepseek4; deepseek4's own decode order moves its logits by as much with no restore at all, A1 vs A up
+// to 1.7e-4). Restored-vs-restored comparisons (C, D, N against W or NC) stay bitwise.
 
 #include "llama.h"
 
@@ -32,6 +38,7 @@
 #include <vector>
 
 static int g_fail = 0;
+static constexpr double LIVE_SWA_TOL = 2e-3;
 
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); printf("FAIL: " __VA_ARGS__); printf("\n"); g_fail++; } } while (0)
 
@@ -251,6 +258,22 @@ int main(int argc, char ** argv) {
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     const int n_prompt = o.splits.back();
+    // the engine's window; llama_model_n_swa() reports 0 for deepseek4 on purpose (its SWA cannot serve
+    // as a rollback), but its raw cache still masks and prunes, so read the hparam itself there
+    int n_swa = llama_model_n_swa(model);
+    if (n_swa == 0) {
+        char arch[64] = {0};
+        char key[128];
+        char val[64] = {0};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        snprintf(key, sizeof(key), "%s.attention.sliding_window", arch);
+        if (llama_model_meta_val_str(model, key, val, sizeof(val)) > 0) {
+            n_swa = std::atoi(val);
+        }
+    }
+    // live and restored contexts hold the same cells only when the window masked nothing
+    const bool   swa_masked = n_swa > 0 && n_prompt > n_swa;
+    const double tol_live   = swa_masked ? LIVE_SWA_TOL : 0.0;
     std::mt19937 rng(o.seed);
     std::uniform_int_distribution<int> dis(0, n_vocab - 1);
     std::vector<llama_token> toks(n_prompt + o.n_gen);
@@ -261,8 +284,9 @@ int main(int argc, char ** argv) {
 
     printf("model %s  splits", o.model.c_str());
     for (int s : o.splits) printf(" %d", s);
-    printf("  nctx_a %u nctx_b %u seqmax %u unified %d ubatch %u seq_a %d seq_b %d rs %u rollback %d noise %d holes %d\n",
-            o.nctx_a, o.nctx_b, o.n_seq_max, o.unified, o.n_ubatch, o.seq_a, o.seq_b, o.n_rs, o.rollback, o.noise, (int) o.holes);
+    printf("  nctx_a %u nctx_b %u seqmax %u unified %d ubatch %u seq_a %d seq_b %d rs %u rollback %d noise %d holes %d n_swa %d%s\n",
+            o.nctx_a, o.nctx_b, o.n_seq_max, o.unified, o.n_ubatch, o.seq_a, o.seq_b, o.n_rs, o.rollback, o.noise, (int) o.holes,
+            n_swa, swa_masked ? " (prompt past the window: live vs restored within LIVE_SWA_TOL)" : "");
 
     const std::string pfx = o.tmpdir + "/chain";
     std::vector<std::string> files_a, files_g;
@@ -453,7 +477,8 @@ int main(int argc, char ** argv) {
     }
     printf("  logits W vs A (whole restore):     max %.3g  per token:%s\n", max_abs_diff(LA, LW), per_token(LA, LW).c_str());
     if (o.seq_a == o.seq_b) {
-        CHECK(max_abs_diff(LA, LW) == 0, "a whole restore's logits differ from the live context by %.3g", max_abs_diff(LA, LW));
+        CHECK(max_abs_diff(LA, LW) <= tol_live, "a whole restore's logits differ from the live context by %.3g (tolerance %.3g)",
+              max_abs_diff(LA, LW), tol_live);
     }
     // N under --noise is judged against NC (same interleaving, decoded): the placement of its cells
     // changes the reduction order, so bitwise equality with the unfragmented W is not expected
@@ -471,7 +496,7 @@ int main(int argc, char ** argv) {
             // G composes the chain F wrote: it must continue exactly as F does
             const double dg = max_abs_diff(LF, L);
             printf("  logits G vs F (its writer):         max %.3g%s\n", dg, dg == 0 ? " (bitwise)" : "");
-            CHECK(dg == 0, "G logits differ from F, the context that wrote its chain, by %.3g", dg);
+            CHECK(dg <= tol_live, "G logits differ from F, the live context that wrote its chain, by %.3g (tolerance %.3g)", dg, tol_live);
         }
         if (x.ctx == N) {
             LN = L;
@@ -488,11 +513,14 @@ int main(int argc, char ** argv) {
     }
     const auto BW2 = blob(W, o.seq_b);
     if (o.seq_a == o.seq_b) {
-        if (!cmp_blob(o, "after-gen W vs A", blob(A, o.seq_a), BW2, "A2", "W2")) g_fail++;
+        // after generation the masked-cell difference reaches the new cells' K/V too
+        if (!cmp_blob(o, "after-gen W vs A", blob(A, o.seq_a), BW2, "A2", "W2") && !swa_masked) g_fail++;
     }
     if (!cmp_blob(o, "after-gen C vs W", BW2, blob(C, o.seq_b), "W2", "C2")) g_fail++;
     if (!cmp_blob(o, "after-gen D vs W", BW2, blob(D, o.seq_b), "W2", "D2")) g_fail++;
-    if (N && !cmp_blob(o, "after-gen N vs W", BW2, blob(N, o.seq_b), "W2", "N2") && !o.holes) g_fail++;
+    // N generated over interleaved cells: its new K/V carry the interleaving's reduction order, so after
+    // generation it is judged by the logits against NC above; without NC it must still equal W
+    if (N && !cmp_blob(o, "after-gen N vs W", BW2, blob(N, o.seq_b), "W2", "N2") && !o.holes && !NC) g_fail++;
 
     for (auto * c : {A, A2, A1, W, C, D, G, N, NC}) if (c) llama_free(c);
     llama_model_free(model);
