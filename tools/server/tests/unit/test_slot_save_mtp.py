@@ -299,6 +299,11 @@ def test_exact_resend_counts(tmp_path, spec):
     s.stop()
     saved = BASE + b["tokens"][:-1]
     for name, prompt in (("exact", saved), ("plus1", saved + [42])):
+        # the oracle: the same prompt prefilled cold, with no cache directory at all
+        s = _server(os.path.join(ROOT, "none"), str(tmp_path / f"{name}-cold.log"), spec=spec, auto=False)
+        s.start()
+        cold = _complete(s, prompt, 8)
+        s.stop()
         d = os.path.join(ROOT, name)
         shutil.copytree(cache, d)
         s = _server(d, str(tmp_path / f"{name}.log"), spec=spec)
@@ -318,6 +323,11 @@ def test_exact_resend_counts(tmp_path, spec):
         assert hit == 1 and miss == 0
         assert t.get("cache_disk_n", 0) == len(saved)
         assert t["prompt_n"] == (0 if name == "exact" else 1)
+        # and the hit is a CORRECT hit: the first token of an exact resend comes from the logits sidecar
+        # and must be the token the seed run sampled there; every token must equal the cold oracle
+        if name == "exact":
+            assert r["tokens"][0] == b["tokens"][-1]
+        assert r["tokens"] == cold["tokens"], f"{name}: restored {r['tokens']} vs cold {cold['tokens']}"
 
 
 def test_ram_disk_warm_classification(tmp_path):
