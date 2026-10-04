@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -660,6 +661,43 @@ server_tokens tokenize_input_subprompt(
 // OAI utils
 //
 
+// Where the disk cache's system-prompt node goes (the preamble end), template-generic. Two memoised
+// steps, safe to call from any HTTP thread:
+//  - chars():  the preamble end in characters of a rendered chat prompt (common_chat_preamble_end),
+//              cached on everything that decides the preamble, so a conversation's later turns and
+//              other conversations with the same system prompt and tools skip the probe renders;
+//  - tokens(): the token position for that preamble. A pure function of the preamble text, so every
+//              request sharing it gets the same node: the preamble's own tokens, minus any trailing
+//              tokens that some continuation could merge with (BPE seams at plain-text role headers).
+//              It must also be a token prefix of the request; when it is not, there is no node.
+// A wrong boundary can only cost hit rate, never correctness: every restore checks the saved tokens
+// against the request.
+class server_preamble_cache {
+public:
+    int32_t chars (const common_chat_templates * tmpls, const common_chat_templates_inputs & inputs, const std::string & prompt);
+    int32_t tokens(const llama_vocab * vocab, const std::string & prompt, int32_t n_chars, const llama_tokens & prompt_tokens);
+
+    std::atomic<uint64_t> n_probed       {0}; // chat requests whose preamble was looked up
+    std::atomic<uint64_t> n_probe_renders{0}; // requests that had to render the probes (cache miss)
+    std::atomic<uint64_t> n_probe_failed {0}; // requests where no probe rendered (falls back to the message delimiters)
+    std::atomic<uint64_t> n_seam_mismatch{0}; // preambles whose tokens were not a prefix of the request (no node)
+
+private:
+    struct chars_entry {
+        size_t      key;
+        int32_t     n_chars;
+        std::string preamble; // prompt[0, n_chars) the entry was computed from
+    };
+    struct tokens_entry {
+        std::string  preamble;
+        llama_tokens toks;     // the node's tokens, [0, X)
+    };
+    static constexpr size_t N_ENTRIES = 64;
+    std::mutex               mtx;
+    std::vector<chars_entry> by_inputs;   // most recent last
+    std::vector<tokens_entry> by_text;    // most recent last
+};
+
 // global server parameters for chat formatting / parsing
 struct server_chat_params {
     bool use_jinja;
@@ -675,6 +713,9 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    // set when the auto disk cache places a system-prompt node: chat requests then carry
+    // "preamble_end_chars" for it (see server_preamble_cache)
+    std::shared_ptr<server_preamble_cache> preamble_cache;
 };
 
 // used by /completions endpoint
@@ -866,6 +907,11 @@ struct server_metrics {
     uint64_t n_auto_save_draft_skipped     = 0; // units published without one (no cells, or the range was ignored)
     uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars
     uint64_t n_auto_restore_draft_cold     = 0; // disk restores with a draft context left cold (a node lacked a sidecar)
+    // system-node boundary (server_preamble_cache), copied from the HTTP side when metrics are read
+    uint64_t n_sysnode_probed              = 0; // chat requests whose preamble end was looked up
+    uint64_t n_sysnode_probe_renders       = 0; // of those, rendered (not cached)
+    uint64_t n_sysnode_probe_failed        = 0; // no probe rendered: the message delimiters decide the node
+    uint64_t n_sysnode_seam_mismatch       = 0; // preamble tokens not a prefix of the request: no node
 
     void init() {
         t_start = ggml_time_us();

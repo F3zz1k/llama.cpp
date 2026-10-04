@@ -95,6 +95,10 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // end of the leading system preamble in prompt tokens (server_preamble_cache), the disk cache's
+    // system-node position; -1 when unknown (no chat template render, media, probe failure)
+    int32_t preamble_end = -1;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
@@ -608,11 +612,11 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
-    // token offset of the first user message (block-aligned DOWN to B_ctx, the mid-prefill shared-
-    // context base boundary — Option A), computed once at task creation via
-    // common_chat_msg_spans::first_user_message_pos() and stashed here so the arming site reads it off
-    // the persistent prompt, not the transient task. -1 when there is no user boundary (e.g.
-    // generation-prompt-only requests) → the base save is not armed (no-op).
+    // token offset where the leading system preamble ends, the position of the mid-prefill system
+    // node: the template-generic preamble end (task params preamble_end) or, without one, the first
+    // user message from the message delimiters (common_chat_msg_spans::first_user_message_pos()).
+    // Computed once at task launch and stashed here so the arming site reads it off the persistent
+    // prompt, not the transient task. -1 when there is none → the node is not armed (no-op).
     int32_t ctx_boundary = -1;
 
     void clear() {

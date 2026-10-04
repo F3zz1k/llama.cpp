@@ -108,7 +108,7 @@ upstream.
 | `--slot-save-incremental` | off | Save a growing conversation as a small delta node chained to its previous snapshot instead of a whole snapshot each time. Every memory type except pure recurrent supports it (see `docs/kv-cache/incremental-disk-cache.md`). Requires `--slot-save-auto`. |
 | `--slot-save-context-min-tokens N` | 4096 | Whole-save a shared preamble (system prompt, tools, RAG) once, mid-prefill, as a base that later chats restore. The floor is `max(--slot-save-block, N)`. |
 | `--slot-restore-min-tokens N` | 0 | Skip a disk restore whose verified prefix is shorter than `N` tokens and re-prefill instead. `0` always restores. |
-| `--slot-save-node-system` | on | Node at the end of the system prompt (the first user message) while a cold prompt prefills; a request carrying only a system prompt caches all of it. `--no-slot-save-node-system` turns it off. |
+| `--slot-save-node-system` | on | Node at the end of the system prompt (with tools and the template's own preamble, found by rendering the chat template, for every template) while a cold prompt prefills; a request carrying only a system prompt caches all of it. `--no-slot-save-node-system` turns it off. |
 | `--slot-save-node-prompt off\|cold\|on` | cold | Node at the end of the last user message while the prompt prefills, so a resend, regenerate or edit restores it on models that cannot rewind (recurrent, hybrid, sliding window past one window). `cold`: only for prompts with no reuse; `on`: whenever a block of new prompt precedes it; `off`: never. |
 | `--slot-save-node-response` | off | Save the conversation as soon as each response completes, not only on idle, reclaim and shutdown. |
 | `--slot-save-node-tool` | off | Same, only for responses that end in tool calls. |

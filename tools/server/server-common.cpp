@@ -1710,6 +1710,173 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
 }
 
 // used by /chat/completions endpoint
+//
+// system-prompt node boundary (server_preamble_cache)
+//
+
+int32_t server_preamble_cache::chars(const common_chat_templates * tmpls, const common_chat_templates_inputs & inputs, const std::string & prompt) {
+    n_probed++;
+
+    // everything that renders into the preamble: the leading system / developer messages, the tools
+    // and the flags and kwargs the template reads (not the clock: the stored preamble text is
+    // compared instead, which also catches a template that renders the date)
+    size_t k = 0;
+    while (k < inputs.messages.size() &&
+           (inputs.messages[k].role == "system" || inputs.messages[k].role == "developer")) {
+        k++;
+    }
+    std::string key = std::to_string((uintptr_t) tmpls);
+    key += common_chat_msgs_to_json_oaicompat(std::vector<common_chat_msg>(inputs.messages.begin(), inputs.messages.begin() + k)).dump();
+    key += common_chat_tools_to_json_oaicompat(inputs.tools).dump();
+    key += string_format("|%d|%d|%d|%d|%d|%d|%d|%d", (int) inputs.tool_choice, (int) inputs.parallel_tool_calls,
+                         (int) inputs.reasoning_format, (int) inputs.enable_thinking, (int) inputs.use_jinja,
+                         (int) inputs.add_bos, (int) inputs.add_eos, (int) inputs.force_pure_content);
+    for (const auto & kv : inputs.chat_template_kwargs) {
+        key += "|" + kv.first + "=" + kv.second;
+    }
+    const size_t h = std::hash<std::string>{}(key);
+
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (size_t i = by_inputs.size(); i-- > 0; ) {
+            const auto & e = by_inputs[i];
+            if (e.key == h && prompt.size() >= (size_t) e.n_chars && prompt.compare(0, e.n_chars, e.preamble) == 0) {
+                const int32_t n = e.n_chars;
+                std::rotate(by_inputs.begin() + i, by_inputs.begin() + i + 1, by_inputs.end());
+                return n;
+            }
+        }
+    }
+
+    n_probe_renders++;
+    const int32_t n = common_chat_preamble_end(tmpls, inputs, prompt);
+    if (n < 0) {
+        n_probe_failed++;
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto it = by_inputs.begin(); it != by_inputs.end(); ++it) {
+        if (it->key == h) {
+            by_inputs.erase(it);
+            break;
+        }
+    }
+    if (by_inputs.size() >= N_ENTRIES) {
+        by_inputs.erase(by_inputs.begin());
+    }
+    by_inputs.push_back({ h, n, prompt.substr(0, n) });
+    return n;
+}
+
+// tokenize like the completion path does (BOS added, special tokens parsed), without a trailing EOS:
+// the preamble is a prefix, not a whole prompt
+static llama_tokens preamble_tokenize(const llama_vocab * vocab, const std::string & text, bool add_special) {
+    llama_tokens t = common_tokenize(vocab, text, add_special, true);
+    if (add_special && llama_vocab_get_add_eos(vocab) && !t.empty() && t.back() == llama_vocab_eos(vocab)) {
+        t.pop_back();
+    }
+    return t;
+}
+
+static size_t tokens_lcp(const llama_tokens & a, size_t a0, const llama_tokens & b) {
+    size_t n = 0;
+    while (a0 + n < a.size() && n < b.size() && a[a0 + n] == b[n]) {
+        n++;
+    }
+    return n;
+}
+
+// The longest prefix of `pre` (the preamble's tokens) that no continuation of the text can change.
+// A special token ends a fragment of its own, so nothing merges into one. A plain-text tail (a role
+// header that is not a special token, or a newline after one) can merge with what follows, e.g. a
+// trailing "\n" with a message starting "\n", or "<user>" with "Hello" into "<", "user", ">Hello":
+// the tail is tokenized again followed by one character of each pre-tokenizer class, and the result
+// is cut back to the shortest common prefix. Depends on the preamble text only.
+static size_t preamble_seam(const llama_vocab * vocab, const std::string & preamble, const llama_tokens & pre) {
+    const size_t n = pre.size();
+    const auto is_special = [&](llama_token t) {
+        return (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+    };
+    if (n == 0 || is_special(pre[n - 1])) {
+        return n;
+    }
+
+    // the plain-text fragment after the last special token is tokenized on its own, so it can be
+    // re-tokenized alone; checked, and the whole preamble is used when it does not reproduce
+    size_t j = n - 1;
+    while (j > 0 && !is_special(pre[j - 1])) {
+        j--;
+    }
+    std::string tail;
+    for (size_t i = j; i < n; i++) {
+        tail += common_token_to_piece(vocab, pre[i], true);
+    }
+    const bool local = j > 0 && preamble.size() >= tail.size() &&
+        preamble.compare(preamble.size() - tail.size(), tail.size(), tail) == 0 &&
+        preamble_tokenize(vocab, tail, false) == llama_tokens(pre.begin() + j, pre.end());
+
+    static const std::vector<std::string> conts_local = {
+        "A", "a", "1", " ", " A", "\n", "\n\n", "\t", "<", ">", "#", "(", "\"", "'", "{", "-", "*", ".",
+        "\xe4\xb8\x80" /* CJK */, "\xf0\x9f\x98\x80" /* emoji */,
+    };
+    static const std::vector<std::string> conts_full = { "A", "1", " ", "\n", "<" };
+
+    size_t x = n;
+    if (local) {
+        for (const auto & c : conts_local) {
+            x = std::min(x, j + tokens_lcp(pre, j, preamble_tokenize(vocab, tail + c, false)));
+        }
+    } else {
+        for (const auto & c : conts_full) {
+            x = std::min(x, tokens_lcp(pre, 0, preamble_tokenize(vocab, preamble + c, true)));
+        }
+    }
+    return x;
+}
+
+int32_t server_preamble_cache::tokens(const llama_vocab * vocab, const std::string & prompt, int32_t n_chars, const llama_tokens & prompt_tokens) {
+    if (n_chars <= 0 || (size_t) n_chars > prompt.size()) {
+        return -1;
+    }
+
+    llama_tokens toks;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (size_t i = by_text.size(); i-- > 0; ) {
+            const auto & e = by_text[i];
+            if (e.preamble.size() == (size_t) n_chars && prompt.compare(0, n_chars, e.preamble) == 0) {
+                toks = e.toks;
+                found = true;
+                std::rotate(by_text.begin() + i, by_text.begin() + i + 1, by_text.end());
+                break;
+            }
+        }
+    }
+    if (!found) {
+        const std::string preamble = prompt.substr(0, n_chars);
+        llama_tokens pre = preamble_tokenize(vocab, preamble, true);
+        pre.resize(preamble_seam(vocab, preamble, pre));
+        toks = pre;
+        std::lock_guard<std::mutex> lock(mtx);
+        if (by_text.size() >= N_ENTRIES) {
+            by_text.erase(by_text.begin());
+        }
+        by_text.push_back({ preamble, std::move(pre) });
+    }
+
+    if (toks.empty()) {
+        return -1;
+    }
+    if (prompt_tokens.size() < toks.size() ||
+        !std::equal(toks.begin(), toks.end(), prompt_tokens.begin())) {
+        n_seam_mismatch++;
+        return -1;
+    }
+    return (int32_t) toks.size();
+}
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
@@ -1873,6 +2040,11 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+
+    // where the system prompt ends, for the disk cache's system node (only when that node is on)
+    if (opt.preamble_cache) {
+        llama_params["preamble_end_chars"] = opt.preamble_cache->chars(opt.tmpls.get(), inputs, chat_params.prompt);
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

@@ -4632,6 +4632,10 @@ private:
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
+            // the system node's template-generic position (server_preamble_cache), only when the node is on
+            if (auto_cache_enabled() && params_base.slot_save_node_system) {
+                chat_params.preamble_cache = std::make_shared<server_preamble_cache>();
+            }
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
@@ -4992,11 +4996,15 @@ private:
             slot.smpl.reset();
         }
 
-        // stash the first-user-message boundary B for the [0,B) shared-context checkpoint onto the
-        // persistent prompt, computed once here at task launch. The save site also runs at idle-flush
-        // and shutdown, when the transient task may be gone, so it must never read the task for this —
-        // it reads slot.prompt.ctx_boundary instead. -1 (no user span) makes the checkpoint no-op.
-        slot.prompt.ctx_boundary = task.params.message_spans.first_user_message_pos();
+        // stash the system-preamble boundary for the [0,B) shared-context node onto the persistent
+        // prompt, computed once here at task launch: the template-generic preamble end when the chat
+        // path measured one, else the first user message from the message delimiters (a /completion
+        // client's own message_delimiters). The save site also runs at idle-flush and shutdown, when
+        // the transient task may be gone, so it must never read the task for this: it reads
+        // slot.prompt.ctx_boundary instead. -1 (no boundary) makes the node a no-op.
+        slot.prompt.ctx_boundary = task.params.preamble_end >= 0
+            ? task.params.preamble_end
+            : task.params.message_spans.first_user_message_pos();
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
@@ -5787,6 +5795,12 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    if (const auto & pc = chat_params.preamble_cache) {
+                        res->metrics.n_sysnode_probed        = pc->n_probed.load();
+                        res->metrics.n_sysnode_probe_renders = pc->n_probe_renders.load();
+                        res->metrics.n_sysnode_probe_failed  = pc->n_probe_failed.load();
+                        res->metrics.n_sysnode_seam_mismatch = pc->n_seam_mismatch.load();
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -7158,21 +7172,25 @@ private:
                             const auto &  spans    = slot.task->params.message_spans;
 
                             // --- SYSTEM node (--slot-save-node-system, default on) ---
-                            // Position: the first user message, block-aligned DOWN so the base stays inside
-                            // the shared preamble; on a request that carries only a system prompt (a pre-cache
-                            // of it), the end of that system prompt exactly, so all of it is cached (capped
-                            // at n_prompt - 1: the node must be a strict prefix to be cut mid-prefill).
-                            // Floor: --slot-save-context-min-tokens. COLD only: n_past < B_ctx means the
-                            // [0, B_ctx) region was NOT reused or restored, so there is new state to persist.
+                            // Position: the end of the leading system preamble, exactly (nodes need not be
+                            // block-aligned). For a chat request it is template-generic: the prefix of the
+                            // prompt that the system / developer messages, the tools and the template decide on
+                            // their own (server_preamble_cache), so a request carrying only a system prompt (a
+                            // pre-cache of it) caches all of it, and a template's default system prompt counts
+                            // too. Without one (a raw /completion prompt), the message delimiters: the first
+                            // user message, or the end of the system span when there is no user message.
+                            // Capped at n_prompt - 1: the node must be a strict prefix to be cut mid-prefill.
+                            // Floor: --slot-save-context-min-tokens. COLD only, and only when at least one block
+                            // of [0, B_ctx) is new: a node a few tokens past one just restored (a system-only
+                            // pre-cache followed by system + user requests) would be a near-duplicate root.
                             if (params_base.slot_save_node_system) {
                                 const int     floor    = std::max(B, params_base.slot_save_context_min_tokens);
-                                const int32_t boundary = slot.prompt.ctx_boundary; // first_user_message_pos, stashed at task launch
-                                int32_t B_ctx = boundary > 0 ? boundary - (boundary % B) : -1;
-                                if (boundary <= 0) {
-                                    const int32_t sys_end = spans.system_only_context_end();
-                                    B_ctx = sys_end > 0 ? std::min(sys_end, n_prompt - 1) : -1;
+                                int32_t       B_ctx    = slot.prompt.ctx_boundary; // stashed at task launch
+                                if (B_ctx <= 0) {
+                                    B_ctx = spans.system_only_context_end();
                                 }
-                                if (B_ctx >= floor && B_ctx < n_prompt && n_past < B_ctx) {
+                                B_ctx = B_ctx > 0 ? std::min(B_ctx, n_prompt - 1) : -1;
+                                if (B_ctx >= floor && B_ctx < n_prompt && n_past + B <= B_ctx) {
                                     slot.ctx_save_pos = B_ctx;
                                 }
                             }
@@ -8234,6 +8252,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+            // the system node's position, from the chat path's preamble end (characters of the
+            // rendered prompt); a /completion client with a string prompt may send it too
+            if (meta->chat_params.preamble_cache && inputs.size() == 1 && prompt.is_string() && !task.tokens.has_media()) {
+                const int32_t n_chars = json_value(data, "preamble_end_chars", -1);
+                if (n_chars > 0) {
+                    task.params.preamble_end = meta->chat_params.preamble_cache->tokens(
+                        ctx_server.vocab, prompt.get<std::string>(), n_chars, task.tokens.get_tokens());
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;

@@ -3754,9 +3754,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--slot-save-node-system"},
         {"--no-slot-save-node-system"},
-        "auto disk cache: publish a node at the end of the leading system context (the first user message) "
-        "while a cold prompt prefills, so other conversations sharing that system prompt restore it; a "
-        "request with only a system prompt caches all of it (default: enabled)",
+        "auto disk cache: publish a node at the end of the leading system context (system and developer "
+        "messages, tools, the template's own preamble; found by rendering the chat template, for every "
+        "template) while a cold prompt prefills, so other conversations sharing that system prompt restore "
+        "it; a request with only a system prompt caches all of it (default: enabled)",
         [](common_params & params, bool value) {
             params.slot_save_node_system = value;
         }

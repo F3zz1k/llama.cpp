@@ -83,7 +83,7 @@ never restores into a smaller context, and sliding-window models only restore at
 
 | Flag | Default | Node |
 |---|---|---|
-| `--slot-save-node-system` | on | at the end of the system prompt (the first user message), while a cold prompt prefills; a request with only a system prompt caches all of it |
+| `--slot-save-node-system` | on | at the end of the system prompt, while a cold prompt prefills; a request with only a system prompt caches all of it. The end is found by rendering the request's system messages and tools through the chat template again, followed by placeholder conversations, so it works for every template, including a default system prompt the template inserts itself |
 | `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never |
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
@@ -136,6 +136,9 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_save_failed_total` | saves dropped with nothing written (each logs a WRN with the reason) |
 | `auto_cache_evicted_total` | units this instance evicted to stay under the caps |
 | `auto_cache_restore_draft_{warm,cold}_total` | restores whose draft came back warm / cold |
+| `auto_cache_sysnode_probed_total` / `auto_cache_sysnode_probe_renders_total` | chat requests whose system-prompt end was looked up / of those, not already cached |
+| `auto_cache_sysnode_probe_failed_total` | requests whose template rendered none of the boundary probes (the message delimiters place the node) |
+| `auto_cache_sysnode_seam_mismatch_total` | requests whose system-prompt tokens were not a prefix of the prompt (no system node) |
 
 A miss includes conversations no cache could have held, so read it next to `auto_cache_evicted_total`:
 misses that climb with evictions mean the store is too small.
@@ -150,13 +153,21 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 - Prompts shorter than `max(--slot-save-block, --slot-save-min-tokens)` are never saved or looked up.
 - The system and prompt nodes are written for text prompts only; conversations with images or audio are
   saved on idle, reclaim, shutdown and after responses.
-- The system and prompt nodes depend on the chat template's message delimiters. A raw `/completion`
-  prompt has no messages, so its prompt node sits one block before the end and it gets no system node
-  (a client can pass `message_delimiters` itself, as the chat path does).
-- The system-prompt-only pre-cache needs a template whose parser marks the system role: the Qwen3-Coder
-  family (Qwen3.5 to 3.8), gpt-oss, Cohere2-MoE, Inkling, Kimi-K3, Ling3 and LLM-jp-harmony do. Gemma 4,
-  DeepSeek and templates handled by the generic autoparser mark only user and assistant turns, so on
-  those the system node is written only once a user message follows the system prompt.
+- The system node is placed from the chat template for every template (the boundary is checked over
+  all of `models/templates` by `test-chat-preamble`). The first chat request with a new system prompt
+  or tool set pays for the template renders that find it: about four times one render of the request,
+  measured 5 ms with no tools and 55-260 ms with 50 tools on a Threadripper 1950X (600 ms on Inkling's
+  template); later requests with the same system prompt and tools reuse the result. A raw
+  `/completion` prompt has no messages: it gets a system node only when the client sends
+  `message_delimiters` (the first user message) or `preamble_end_chars` (the preamble's length in
+  characters, for a string prompt).
+- The prompt node still depends on the chat template's message delimiters (the end of the last user
+  message). Where they do not match, as on Laguna, whose `<user>` header is plain text that byte-level
+  BPE merges into the message, it falls back to one block before the end of the prompt.
+- A system prompt shorter than `max(--slot-save-block, --slot-save-context-min-tokens)` (4096 tokens
+  by default) gets no system node; a typical 1-2k token chat-UI system prompt is below it.
+- A template that moves the system prompt into a later turn (Mistral-Nemo puts it in the last user
+  message) has no stable system prefix; no system node is written for it.
 - The prompt node's floor is `max(--slot-save-block, --slot-save-min-tokens)`. main-patched armed a
   node near the end of a cold prompt for sliding-window models only, with the floor
   `max(--slot-save-block, --slot-save-context-min-tokens)`; the default `cold` prompt node now does

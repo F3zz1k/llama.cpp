@@ -1654,6 +1654,26 @@ std::string server_task_result_metrics::to_metrics() {
             "Disk KV restores that left the speculative draft cold (some node had no .dft sidecar)",
             (double) metrics.n_auto_restore_draft_cold
         },
+        {
+            "auto_cache_sysnode_probed_total",
+            "Auto disk KV cache: chat requests whose system-prompt end was looked up for the system node",
+            (double) metrics.n_sysnode_probed
+        },
+        {
+            "auto_cache_sysnode_probe_renders_total",
+            "Auto disk KV cache: of those, requests that rendered the boundary probes (not cached)",
+            (double) metrics.n_sysnode_probe_renders
+        },
+        {
+            "auto_cache_sysnode_probe_failed_total",
+            "Auto disk KV cache: requests where no boundary probe rendered (the message delimiters place the system node)",
+            (double) metrics.n_sysnode_probe_failed
+        },
+        {
+            "auto_cache_sysnode_seam_mismatch_total",
+            "Auto disk KV cache: requests whose system-prompt tokens were not a prefix of the prompt (no system node)",
+            (double) metrics.n_sysnode_seam_mismatch
+        },
     };
 
     const std::vector<metric_item> gauges = {

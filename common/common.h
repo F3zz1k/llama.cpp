@@ -736,7 +736,7 @@ struct common_params {
     bool    slot_save_idle_seconds_set = false; // true once --slot-save-idle-seconds is given explicitly
     // checkpoint triggers of the auto disk cache: which moments publish a node (docs/disk-cache.md).
     // The conversation itself is saved on idle (slot_save_idle_seconds), on reclaim and at shutdown.
-    bool    slot_save_node_system   = true;  // node at the end of the leading system context (first user
+    bool    slot_save_node_system   = true;  // node at the end of the leading system context (chat template preamble end
                                              // message; a system-only request caches the whole system prompt)
     common_slot_save_node_prompt slot_save_node_prompt = COMMON_SLOT_SAVE_NODE_PROMPT_COLD; // node at the end of the last user message
                                              // (cold by default: every class that cannot rewind needs it)

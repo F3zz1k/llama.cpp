@@ -228,7 +228,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--slot-save-auto` | automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_AUTO) |
 | `--slot-save-block N` | token-ID hash block size for the auto disk cache index; reuse granularity is one block (default: 256)<br/>(env: LLAMA_ARG_SLOT_SAVE_BLOCK) |
 | `--slot-save-idle-seconds N` | flush a slot's warm KV to the auto disk cache after N seconds of idleness, so a lone request survives a crash and is visible to peer instances without further traffic; requires --slot-save-auto (default: 60, -1 = disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS) |
-| `--slot-save-node-system, --no-slot-save-node-system` | auto disk cache: publish a node at the end of the leading system context (the first user message) while a cold prompt prefills, so other conversations sharing that system prompt restore it; a request with only a system prompt caches all of it (default: enabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_NODE_SYSTEM) |
+| `--slot-save-node-system, --no-slot-save-node-system` | auto disk cache: publish a node at the end of the leading system context (system and developer messages, tools, the template's own preamble; found by rendering the chat template, for every template) while a cold prompt prefills, so other conversations sharing that system prompt restore it; a request with only a system prompt caches all of it (default: enabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_NODE_SYSTEM) |
 | `--slot-save-node-prompt {off,cold,on}` | auto disk cache: publish a node at the end of the last user message while the prompt prefills, so a resend, regenerate or edit of the response restores it even on models that cannot rewind a longer snapshot (recurrent, hybrid, sliding-window past one window); 'cold' only for prompts that got essentially no reuse, 'on' whenever a block of new prompt precedes it, 'off' never. Takes effect with --slot-save-auto (default: cold)<br/>(env: LLAMA_ARG_SLOT_SAVE_NODE_PROMPT) |
 | `--slot-save-node-response, --no-slot-save-node-response` | auto disk cache: save the conversation as soon as each response completes, instead of only on idle, on reclaim and at shutdown (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_NODE_RESPONSE) |
 | `--slot-save-node-tool, --no-slot-save-node-tool` | auto disk cache: save the conversation when a response ends in tool calls (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_NODE_TOOL) |
@@ -1301,7 +1301,8 @@ could not be restored. Everything else about the cache is unaffected.
 same leading context — a common system prompt, developer/tool preamble, or a large retrieved (RAG)
 block, everything before the first user turn — each one would otherwise persist a near-identical
 whole prefix, a fan-out of large files. Instead the server saves that shared prefix `[0, B)` **once**
-as a deduplicated base (B = the first-user-message token offset, block-aligned down, gated to
+as a deduplicated base (B = the end of the system preamble, found by rendering the request's system
+messages and tools through the chat template followed by placeholder conversations; gated to
 `>= max(--slot-save-block, --slot-save-context-min-tokens)`), and every later same-context chat writes
 nothing for the base. Combined with `--slot-save-incremental`, each chat's own save then collapses to
 a small `[B, N)` delta parented on that one base — one base plus N deltas instead of N whole prefixes.
@@ -1312,8 +1313,9 @@ The checkpoint is written **only for pure-attention text models** (`PART` sequen
 `n_swa == 0`, non-media prompts). It is deliberately suppressed for recurrent/hybrid (e.g. GDN) and
 sliding-window (SWA) models, where a `[0, B)` sub-range of the KV is not a sound prefix state and
 would silently produce wrong output; those classes fall back to the existing whole-prefix save with
-no change. Templates that embed the system prompt inside the first user turn (Mistral/Llama-2
-`[INST]`) yield no boundary and simply no-op.
+no change. Templates that move the system prompt into a later turn (Mistral-Nemo puts it in the last
+user message) have no stable system prefix, so the boundary falls before it and the node is not
+written.
 
 `--slot-restore-min-tokens` is an absolute floor on the restore side: when the byte-verified matched
 prefix is shorter than N tokens the server reprocesses the prompt rather than paying the multi-GB disk
