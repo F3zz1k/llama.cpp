@@ -2303,19 +2303,6 @@ private:
         return restore_is_whole_prefix_only() && !swa_snapshot_is_whole_window(n_cells);
     }
 
-    // Whether a snapshot taken at a SMALLER n_ctx may be restored into this
-    // context. Gated on n_swa_mem: for an iSWA / hybrid-iSWA model the SWA
-    // sub-cache classes are unanalysed for cross-ctx reuse, so they stay on
-    // exact fingerprint matching. n_swa_mem comes from llama_model_n_swa() and
-    // is NOT zeroed by --swa-full, unlike n_swa, so it is the reliable gate.
-    //
-    // NOTE n_swa_mem == 0 does NOT mean "plain attention" — for the hybrid
-    // recurrent models this is aimed at it means the recurrent tier, whose
-    // sizing is n_ctx-invariant outright.
-    bool auto_allow_smaller_ctx() const {
-        return n_swa_mem == 0;
-    }
-
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -2353,6 +2340,34 @@ private:
         return any ? h : 0;
     }
 
+    // The n_ctx_orig_yarn the live context runs with, derived the way llama_context and the model
+    // loader derive it: --yarn-orig-ctx when set, else the GGUF rope.scaling.original_context_length
+    // (an --override-kv of it wins, as in the loader), else n_ctx_train. Only its comparison with
+    // n_ctx_seq matters (model_fp::ctx_long_regime). 0 if nothing can be read, which turns the
+    // regime bit off rather than guessing.
+    uint32_t auto_rope_orig_ctx() const {
+        if (params_base.yarn_orig_ctx != 0) {
+            return (uint32_t) params_base.yarn_orig_ctx;
+        }
+        char arch[64] = {0};
+        if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) > 0) {
+            const std::string key = std::string(arch) + ".rope.scaling.original_context_length";
+            for (const auto & ov : params_base.kv_overrides) {
+                if (ov.key[0] != 0 && key == ov.key && ov.tag == LLAMA_KV_OVERRIDE_TYPE_INT && ov.val_i64 > 0) {
+                    return (uint32_t) ov.val_i64;
+                }
+            }
+            char val[32] = {0};
+            if (llama_model_meta_val_str(model_tgt, key.c_str(), val, sizeof(val)) > 0) {
+                const unsigned long v = std::strtoul(val, nullptr, 10);
+                if (v > 0) {
+                    return (uint32_t) v;
+                }
+            }
+        }
+        return (uint32_t) std::max<int32_t>(0, llama_model_n_ctx_train(model_tgt));
+    }
+
     // Compute the live model fingerprint once at load (invariant 3). Pure-CPU; only called from
     // an auto_cache_enabled() branch so it costs nothing when OFF.
     // See README "Automatic disk prompt cache" for which flags invalidate the cache.
@@ -2381,6 +2396,7 @@ private:
         fp.fp_cache_k     = (uint32_t) params_base.cache_type_k;
         fp.fp_cache_v     = (uint32_t) params_base.cache_type_v;
         fp.fp_n_ctx       = (uint32_t) llama_n_ctx_seq(ctx_tgt);
+        fp.fp_n_ctx_orig  = auto_rope_orig_ctx();
         // FULL and RS share a value: on a recurrent/hybrid model the class is RS only because MTP (or
         // any draft) asked for n_rs_seq > 0 rollback rows, which are never serialised (state_write
         // writes the current row, state_read resets rs_idx to 0), so the blob is the same and turning
@@ -2423,12 +2439,12 @@ private:
         return fp;
     }
 
-    // Auto-snapshot filename: a full-identity prefix (every operator== field, not just fp_model)
+    // Auto-snapshot filename: a full-identity prefix (every restore_compatible field, not just fp_model)
     // so that peers sharing one dir who agree on the token prefix but differ in any geometry field
     // get DISJOINT names instead of atomically renaming over each other; chain-hash + token-count
     // make it deterministic across same-config processes (a same-prefix save from another process
     // yields the same name -> atomic-rename-idempotent). The prefix is naming/collision-avoidance
-    // only: the scan still verifies fp == cur_fp after reading the sidecar (it never parses the
+    // only: the scan still runs restore_compatible after reading the sidecar (it never parses the
     // prefix), and the block chain keeps its fp_model salt, so foreign v1 units written under the
     // old fp_model-prefixed name still index and restore unchanged.
     std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens) const {
@@ -2436,6 +2452,26 @@ private:
         snprintf(buf, sizeof(buf), "auto-%016" PRIx64 "-%016" PRIx64 "-%zu.bin",
                  cur_fp.identity_hash(), chain_hash, n_tokens);
         return params_base.slot_save_path + std::string(buf);
+    }
+
+    // A delta's parent: the tip's own directory and "auto-<identity>-" prefix, with the parent's
+    // (id, n_tokens) pair. A chain is written under one identity prefix (the save-side parent-find
+    // only links a parent named under the writer's), so resolving under the tip's prefix is exact,
+    // and it keeps a chain readable when the identity_hash rule changes under it (a store written
+    // before n_ctx left the identity) or a peer named it. Falls back to the live identity for a tip
+    // whose name is not an auto snapshot (a renamed file restored through /slots).
+    std::string auto_parent_state_filename(const std::string & tip_path, uint64_t parent_id, size_t n_tokens) const {
+        uint64_t tip_id = 0;
+        uint32_t tip_n  = 0;
+        if (!slot_save_parse_node_id(tip_path, tip_id, tip_n)) {
+            return auto_state_filename(parent_id, n_tokens);
+        }
+        const size_t slash = tip_path.find_last_of("/\\");
+        const size_t base  = (slash == std::string::npos) ? 0 : slash + 1;
+        // "auto-" (5) + 16 hex identity + "-" (1); slot_save_parse_node_id validated the layout
+        char tail[64];
+        snprintf(tail, sizeof(tail), "%016" PRIx64 "-%zu.bin", parent_id, n_tokens);
+        return tip_path.substr(0, base + 5 + 16 + 1) + std::string(tail);
     }
 
     // Insert a snapshot at a boundary it reaches. Multiple snapshots are RETAINED per boundary
@@ -2568,8 +2604,8 @@ private:
                 }
                 continue;
             }
-            if (!fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
-                continue; // foreign model / requant / different ctx geometry (invariant 3)
+            if (!fp.restore_compatible(cur_fp)) {
+                continue; // foreign model / requant / different KV geometry (invariant 3)
             }
             // rehash from the sidecar's cells + media records (media empty on v1 => the
             // text-only chain, bit-identical to what the writer keyed the file with). Only
@@ -2683,8 +2719,11 @@ private:
                     continue;
                 }
                 for (const auto_cache_entry & c : it->second) { // longest first within the boundary
-                    if (!c.fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
+                    if (!c.fp.restore_compatible(cur_fp)) {
                         continue; // invariant 3
+                    }
+                    if (!model_fp::fits_ctx(c.n_tokens, cur_fp)) {
+                        continue; // a larger rung's unit longer than this whole context: capacity
                     }
                     if (restore_needs_whole_prefix(c.n_tokens) && c.n_tokens > req.size()) {
                         // A snapshot longer than the request is never a whole prefix of it, and every
@@ -2959,10 +2998,10 @@ private:
             err = ".meta sidecar carries no media records for a media state file";
             return false;
         }
-        // EXACT on purpose: manual /slots restore, an operator-driven path where an
-        // exact fingerprint match is the documented contract.
-        if (!(disk_fp == cur_fp)) {
-            err = "snapshot fingerprint mismatch (model, projector or context geometry changed)";
+        // The same identity gate as the auto restore. Capacity needs no check here: the
+        // state is already loaded, and llama_state_seq refused it if it did not fit.
+        if (!disk_fp.restore_compatible(cur_fp)) {
+            err = "snapshot fingerprint mismatch (model, projector or KV geometry changed)";
             return false;
         }
         if (disk_toks != cells) {
@@ -3097,7 +3136,7 @@ private:
             if (chain.size() > MAX_CHAIN_DEPTH) {
                 return false; // pathological depth -> cold prefill (invariant 4)
             }
-            const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
+            const std::string parent_path = auto_parent_state_filename(tip_path, cur_parent_id, cur_range_lo);
             model_fp     parent_fp;
             llama_tokens parent_toks;
             std::vector<server_media_record> parent_media;
@@ -3108,12 +3147,9 @@ private:
                                 &parent_parent_id, &parent_lo, &parent_hi)) {
                 return false; // parent meta missing/corrupt -> cold prefill
             }
-            // EXACT on purpose. Delta parents resolve by FILENAME via auto_state_filename,
-            // whose identity_hash folds fp_n_ctx - so any parent found here necessarily
-            // shares our n_ctx and an exact compare is already the right test. Relaxing it
-            // would be dead code today, and would silently become load-bearing if
-            // identity_hash ever drops fp_n_ctx.
-            if (!(parent_fp == cur_fp)) {
+            // Every hop is checked on its own against the live context, so a chain can never
+            // mix identities. Capacity follows from the tip's (a parent is a strict prefix of it).
+            if (!parent_fp.restore_compatible(cur_fp)) {
                 return false; // fingerprint drift on the parent -> cold prefill
             }
             // contiguity: the parent must end exactly where its child begins.
@@ -3167,13 +3203,16 @@ private:
                             &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
             return 0; // invariant 4
         }
-        if (!disk_fp.restore_compatible(cur_fp, auto_allow_smaller_ctx())) {
+        if (!disk_fp.restore_compatible(cur_fp)) {
             return 0; // invariant 3
         }
+        if (!model_fp::fits_ctx(disk_toks.size(), cur_fp)) {
+            return 0; // capacity: checked before any state-file I/O (the lookup filters it too)
+        }
         if (disk_fp.fp_n_ctx != cur_fp.fp_n_ctx) {
-            // Cross-rung restore. Logged unconditionally: if the relaxed
-            // fingerprint is ever wrong the symptom is a CONFIDENT WRONG
-            // ANSWER, and this line is the only forensic trail.
+            // Cross-rung restore. Logged unconditionally: if n_ctx ever turns out to
+            // reach the state bytes the symptom is a CONFIDENT WRONG ANSWER, and this
+            // line is the only forensic trail.
             SRV_INF("auto restore: cross-ctx reuse, snapshot n_ctx=%u into live n_ctx=%u\n",
                     (unsigned) disk_fp.fp_n_ctx, (unsigned) cur_fp.fp_n_ctx);
         }
@@ -3962,13 +4001,10 @@ private:
                 if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media)) {
                     continue; // unreadable meta -> not a usable parent (invariant 4)
                 }
-                // EXACT on purpose - do NOT switch this to restore_compatible(). This is the
-                // incremental-save parent-find. Relaxing it would let an instance parent its
-                // delta on a snapshot taken at a DIFFERENT n_ctx, coupling the chains of two
-                // rungs: the link is unresolvable by name (identity_hash still folds fp_n_ctx,
-                // so rungs keep disjoint filenames) and the delta becomes permanent dead
-                // weight. Chains stay rung-local; that costs nothing and removes the class.
-                if (!(disk_fp == cur_fp)) {
+                // The restore gate: a parent saved by another rung of this model is a valid
+                // parent, because n_ctx is not identity and both rungs name units alike. Whether
+                // the link resolves by name is checked below, after the strict-prefix test.
+                if (!disk_fp.restore_compatible(cur_fp)) {
                     continue; // invariant 3
                 }
                 // STRICT prefix of the CELL tokens (media cells LLAMA_TOKEN_NULL on both sides):
@@ -4024,6 +4060,14 @@ private:
                 uint64_t name_id  = 0;
                 uint32_t name_len = 0;
                 if (!slot_save_parse_node_id(cand.state_path, name_id, name_len) || name_len != parent_hi_sz) {
+                    continue;
+                }
+                // The delta is published under THIS instance's identity prefix, and the restore walk
+                // resolves its parent under the tip's prefix, so the parent must carry the same one. A
+                // unit named under an earlier naming rule (before n_ctx left the identity, or before
+                // the full-identity prefix) is a fine restore target but would leave the delta
+                // pointing at a name that does not exist: take a whole root instead.
+                if (cand.state_path != auto_state_filename(name_id, name_len)) {
                     continue;
                 }
                 parent_hi   = (uint32_t) parent_hi_sz;

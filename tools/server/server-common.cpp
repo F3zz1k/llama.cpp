@@ -1196,9 +1196,11 @@ static inline uint64_t auto_hash_splitmix64(uint64_t x) {
     return x;
 }
 
-// Fold every operator== field through the shared mix primitive. Order is fixed (any change
-// re-names files, i.e. a cache miss, never corruption). See the header for why this partitions
-// the on-disk names but deliberately does NOT touch the fp_model-salted block chain.
+// Fold every restore_compatible field through the shared mix primitive. Order is fixed (any change
+// re-names files, i.e. a cache miss, never corruption). n_ctx enters only as the LongRoPE regime
+// bit, in the slot fp_n_ctx used to take, so rungs of one model share names (model_fp::fp_n_ctx).
+// See the header for why this partitions the on-disk names but deliberately does NOT touch the
+// fp_model-salted block chain.
 uint64_t model_fp::identity_hash() const {
     uint64_t h = 0;
     h = auto_hash_mix64(h, fp_model);
@@ -1209,7 +1211,7 @@ uint64_t model_fp::identity_hash() const {
     h = auto_hash_mix64(h, fp_rope_type);
     h = auto_hash_mix64(h, fp_cache_k);
     h = auto_hash_mix64(h, fp_cache_v);
-    h = auto_hash_mix64(h, fp_n_ctx);
+    h = auto_hash_mix64(h, ctx_long_regime(*this) ? 1u : 0u); // live only: reads fp_n_ctx_orig
     h = auto_hash_mix64(h, fp_kv_full);
     h = auto_hash_mix64(h, fp_block);
     h = auto_hash_mix64(h, fp_rope_scale);

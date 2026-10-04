@@ -365,7 +365,29 @@ struct model_fp {
     uint32_t fp_rope_type  = 0;
     uint32_t fp_cache_k    = 0; // ggml_type of K cache (enum int)
     uint32_t fp_cache_v    = 0; // ggml_type of V cache (enum int)
-    uint32_t fp_n_ctx      = 0; // effective per-seq n_ctx
+    // Effective per-seq n_ctx of the WRITER. Persisted in the .meta, but NOT an identity field: it is
+    // a capacity record. A unit restores into any context whose n_ctx holds its cells (fits_ctx), in
+    // either direction, because no memory class serialises anything that depends on kv_size. Audited
+    // per class (src/, merge-upstream-20261003):
+    //   kv           llama_kv_cache::state_write_range picks cells by sequence, position range and
+    //                position-relative SWA mask, and writes pos/seq/ext plus their K/V rows; kv_size is
+    //                only the transposed-V source stride (llama-kv-cache.cpp state_write_data).
+    //   iswa         base + SWA llama_kv_cache; the SWA cache's size follows n_ubatch/--swa-full, but
+    //                its bytes are the unmasked window, chosen by position (llama-kv-cache-iswa.cpp).
+    //   recurrent    mem_size = max(1, n_seq_max) (llama-model.cpp create_memory), no n_ctx.
+    //   hybrid, hybrid-iswa, hybrid_idx, dsa, dsa-iswa, msa: compositions of the two above, each part
+    //                written by the same writers (the hybrid_idx indexer and the dsa/msa indexer are
+    //                plain llama_kv_cache instances sized like the attention cache).
+    //   dsv4         raw part is iSWA; compressed K rows are min(comp_size, (pos_max+1)/ratio), which
+    //                is (pos_max+1)/ratio whenever the unit fits; the compressor states are a fixed
+    //                2*ratio rows (llama-kv-cache-dsv4.cpp state_write_impl). Only the legacy
+    //                version-1 K-cache section required n_rows == kv_size; it is refused, not misread.
+    // The read side enforces capacity again (state_read_meta / dsv4_state_read_k_cache throw), so a
+    // unit that does not fit fails cleanly even if a caller skipped fits_ctx.
+    // The ONE way n_ctx reaches the state is the model, not the memory class: LongRoPE models pick
+    // rope_long over rope_short when n_ctx_seq > n_ctx_orig_yarn (llama_model::get_rope_factors),
+    // which bakes different K positions. That threshold is the identity field, see ctx_long_regime.
+    uint32_t fp_n_ctx      = 0;
     // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0. Separates FULL from everything else; it does
     // NOT encode the 4-valued class, so RS and PART share the 0 side. That is sound rather than a
     // latent collision: an arch in llm_arch_supports_rs_rollback has recurrent memory, so without
@@ -400,9 +422,9 @@ struct model_fp {
     // for media snapshots — existing v1 snapshots on an --mmproj server keep matching.
     uint64_t fp_mmproj          = 0;
 
-    // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
-    // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
-    // with a different block size cannot be longest-prefix-matched against the current index.
+    // Exact equality of every PERSISTED field (fp_n_ctx included, the live-only fp_n_ctx_orig
+    // excluded): what a .meta round trip must preserve (tests/test-slot-meta.cpp). It is not the
+    // restore gate; that is restore_compatible.
     bool operator==(const model_fp & o) const {
         return fp_model == o.fp_model && fp_n_vocab == o.fp_n_vocab &&
                fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
@@ -417,42 +439,40 @@ struct model_fp {
                fp_mmproj == o.fp_mmproj;
     }
 
-    // Whether a snapshot carrying THIS fingerprint (read from disk) may be
-    // restored into a live context whose fingerprint is `live`.
+    // Effective n_ctx_orig_yarn of the LIVE context (--yarn-orig-ctx, else the GGUF
+    // rope.scaling.original_context_length honouring --override-kv, else n_ctx_train), the threshold
+    // llama_model::get_rope_factors compares n_ctx_seq against. Set only on the live fingerprint by
+    // auto_compute_fingerprint and never persisted: a disk fingerprint that passes every other field
+    // has the same model file and the same fp_yarn_orig_ctx, hence the same threshold, so the live
+    // value decides the regime of both sides (--override-kv itself is not fingerprinted, as before).
+    uint32_t fp_n_ctx_orig      = 0;
+
+    // Whether a context of fp_n_ctx cells runs LongRoPE's long factors, given the live threshold.
+    // Two contexts on opposite sides of it bake different K rotations into the same tokens, so the
+    // regime is identity even though n_ctx itself is not. On a model without rope_long the bit is
+    // inert except that rungs straddling the original context (only reachable with rope scaling,
+    // which splits identity anyway) do not share.
+    bool ctx_long_regime(const model_fp & live) const {
+        return live.fp_n_ctx_orig > 0 && fp_n_ctx > live.fp_n_ctx_orig;
+    }
+
+    // Whether a unit carrying THIS fingerprint (read from disk) may be restored into the live
+    // context `live`: every identity field equal, n_ctx compared only through ctx_long_regime. Any
+    // difference REFUSES the restore (invariant 3). The second half of the gate is capacity,
+    // fits_ctx, which needs the unit's cell count and is checked by the caller before any state-file
+    // I/O. fp_block is identity on purpose: a unit hashed with a different block size cannot be
+    // longest-prefix-matched against the current index.
     //
-    // Identical to operator== in every field except fp_n_ctx, which is allowed
-    // to be SMALLER on disk when `allow_smaller_ctx`. A conversation that grows
-    // past a context rung migrates to a larger-ctx instance; without this it
-    // can reuse NONE of its own snapshots and pays a full cold prefill
-    // (measured ~197 s at 127k tokens on our rig).
-    //
-    // Safe because the serialised blob has no n_ctx dependence: positions come
-    // entirely from the blob, and n_ctx enters memory construction only as
-    // attn_kv_size = cparams.n_ctx_seq, which sets cells.size() and nothing
-    // else. The one size interaction is already guarded — state_read_data
-    // rejects cell_count > cells.size(), and find_slot rejects
-    // n_tokens > cells.size() — so the REVERSE direction (a large snapshot into
-    // a small context) fails loudly, which matters because routers legitimately
-    // downsize instances when idle.
-    //
-    // operator== stays EXACT on purpose: it is load-bearing for snapshot NAMING
-    // (identity_hash folds fp_n_ctx, so rungs keep disjoint filenames and cannot
-    // atomically rename over one another) and for the incremental-save
-    // parent-find, which must keep delta chains rung-local.
-    //
-    // `allow_smaller_ctx` must be false for iSWA/hybrid-iSWA models: their
-    // classes are unanalysed here, so they stay on exact matching.
-    bool restore_compatible(const model_fp & live, bool allow_smaller_ctx) const {
-        if (fp_n_ctx != live.fp_n_ctx) {
-            if (!allow_smaller_ctx || fp_n_ctx > live.fp_n_ctx) {
-                return false;
-            }
-        }
+    // One gate for every use: the startup scan, the lookup, the restore, every parent of a delta
+    // chain, the incremental-save parent-find and the manual /slots media restore. A delta may
+    // therefore be written onto a unit another rung saved; the chain stays resolvable because both
+    // rungs name units by the same identity_hash.
+    bool restore_compatible(const model_fp & live) const {
         return fp_model == live.fp_model && fp_n_vocab == live.fp_n_vocab &&
                fp_n_ctx_train == live.fp_n_ctx_train && fp_n_embd == live.fp_n_embd &&
                fp_n_layer == live.fp_n_layer && fp_rope_type == live.fp_rope_type &&
                fp_cache_k == live.fp_cache_k && fp_cache_v == live.fp_cache_v &&
-               fp_kv_full == live.fp_kv_full &&
+               ctx_long_regime(live) == live.ctx_long_regime(live) && fp_kv_full == live.fp_kv_full &&
                fp_block == live.fp_block && fp_rope_scale == live.fp_rope_scale &&
                fp_rope_base == live.fp_rope_base && fp_yarn_ext == live.fp_yarn_ext &&
                fp_yarn_attn == live.fp_yarn_attn && fp_yarn_beta_fast == live.fp_yarn_beta_fast &&
@@ -461,14 +481,22 @@ struct model_fp {
                fp_mmproj == live.fp_mmproj;
     }
 
-    // 64-bit digest of EVERY identity field above — the exact set operator== compares.
-    // Used only to name the auto-snapshot files (auto_state_filename): two peers sharing
-    // one --slot-save-path that agree on fp_model but differ in any geometry field
-    // (cache-type, block, rope/YaRN, n_ctx, LoRA, mmproj, ...) would otherwise mint the
-    // same filename for the same token prefix and atomically rename over each other; a
-    // full-identity prefix gives them disjoint names so both coexist. It is NOT the index
-    // key or a restore gate — the block-chain hash keeps its fp_model salt (text-only
-    // .meta bytes stay byte-frozen) and every restore is still guarded by operator==.
+    // Capacity half of a restore: a unit of `n_cells` cells fits the live context. A unit from a
+    // larger rung that is longer than this context is skipped before its state file is opened.
+    static bool fits_ctx(size_t n_cells, const model_fp & live) {
+        return n_cells <= (size_t) live.fp_n_ctx;
+    }
+
+    // 64-bit digest of every identity field restore_compatible compares, n_ctx entering only as
+    // ctx_long_regime. Used only to name the auto-snapshot files (auto_state_filename) and only on
+    // the LIVE fingerprint (it reads fp_n_ctx_orig): two peers sharing one --slot-save-path that
+    // agree on fp_model but differ in any identity field (cache-type, block, rope/YaRN, LoRA,
+    // mmproj, ...) would otherwise mint the same filename for the same token prefix and atomically
+    // rename over each other. Peers that differ only in n_ctx (context rungs, a lower-ctx vision
+    // rung) mint the SAME name for the same tokens: the unit is interchangeable, so that is a dedup,
+    // and their delta chains resolve by name across rungs. It is NOT the index key or a restore
+    // gate: the block-chain hash keeps its fp_model salt (text-only .meta bytes stay byte-frozen)
+    // and every restore is still guarded by restore_compatible.
     uint64_t identity_hash() const;
 };
 
