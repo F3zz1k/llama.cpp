@@ -1245,6 +1245,117 @@ def first_token_logprobs(body) -> dict:
     return {t["id"]: t["logprob"] for t in body["completion_probabilities"][0]["top_logprobs"]}
 
 
+def _metric_v(s: ServerProcess, name: str) -> float:
+    res = s.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    for line in res.body.splitlines():
+        if line.startswith(f"llamacpp:{name} "):
+            return float(line.split()[1])
+    raise AssertionError(f"metric {name} not found")
+
+
+def _make_node_vision_server() -> ServerProcess:
+    """The vision server with the DEFAULT node settings (the system node on, the prompt node cold),
+    the system node's floor at one block."""
+    os.environ["LLAMA_MEDIA_MARKER"] = MEDIA_MARKER
+    vs = make_vision_server(auto=True)
+    vs.slot_save_node_prompt = None
+    vs.slot_save_context_min_tokens = 0
+    vs.server_metrics = True
+    return vs
+
+
+def _metas_by_len():
+    out = {}
+    for p in glob.glob(os.path.join(CACHE_DIR, "auto-*.bin.meta")):
+        version, toks, media = parse_meta(p)
+        out[len(toks)] = (p[:-len(".meta")], version, toks, media)
+    return out
+
+
+# the text after the image is longer than one block (the prompt node lands in it, after the image) or
+# shorter (the block-aligned position falls inside the image and the node moves down to its start)
+MEDIA_TAIL_LONG  = " Describe it now, in detail, listing every colour, every shape and every object you can see in it."
+MEDIA_TAIL_SHORT = " Describe it now."
+
+
+@pytest.mark.parametrize("tail", [MEDIA_TAIL_LONG, MEDIA_TAIL_SHORT])
+def test_vision_prompt_node_default(tail):
+    """The default prompt node on a media prompt (it used to skip every request carrying media). It is
+    cut where the previous cell is text, so no chunk is split: after the image when enough text follows
+    it (a v2 unit holding the image), else at the image's start (a v1 text unit). A same-prompt resend
+    after a restart, with the conversation unit removed, restores exactly that node, and its first token
+    matches a cold prefill within the measured split noise."""
+    prompt = VISION_TEXT_PRE + MEDIA_MARKER + tail
+    vs = _make_node_vision_server()
+    vs.start()
+    body = raw_media_request_body(vs, prompt, [IMG_B64], n_predict=1)
+    n_prompt = body["timings"]["prompt_n"]
+    assert _metric_v(vs, "auto_cache_node_media_skipped_total") == 0
+    vs.stop()
+    metas = _metas_by_len()
+    inside = sorted(n for n in metas if n < n_prompt)
+    assert len(inside) == 1, f"units {sorted(metas)}, prompt {n_prompt}"
+    node = inside[0]
+    _, version, toks, media = metas[node]
+    assert toks[-1] != LLAMA_TOKEN_NULL, "a node must end on a text cell"
+    if tail is MEDIA_TAIL_LONG:
+        assert version == 2 and len(media) == 1, (version, media)
+    else:
+        assert version == 1, version   # all text: the cut moved down to the image's start
+    # leave only the node: the conversation unit (prompt + generation) would otherwise be preferred
+    for n, (path, _, _, _) in metas.items():
+        if n != node:
+            for suffix in ("", ".meta", ".logits", ".dft"):
+                if os.path.exists(path + suffix):
+                    os.remove(path + suffix)
+
+    vs = _make_node_vision_server()
+    vs.start()
+    warm = raw_media_request_body(vs, prompt, [IMG_B64], n_predict=1, n_probs=8)
+    vs.stop()
+    assert warm["timings"].get("cache_disk_n", 0) == node, warm["timings"]
+    cold = make_vision_server(auto=False)
+    cold.start()
+    assert_media_close_to_cold(cold, prompt, [IMG_B64], warm, [IMG2_B64])
+    cold.stop()
+
+
+def test_vision_system_node_default():
+    """The system node on a chat request carrying an image (the template-generic preamble end used to
+    be skipped for media): a later conversation with the same system prompt and a different image
+    restores it after a restart."""
+    sys_msg = {"role": "system", "content": "You are a careful assistant who describes pictures for a museum catalogue. "
+                                            "Keep every answer short and never invent details."}
+
+    def req(vs, img):
+        res = vs.make_request("POST", "/chat/completions", data={
+            "temperature": 0, "max_tokens": 4, "id_slot": 0,
+            "messages": [sys_msg, {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": img}},
+                {"type": "text", "text": "What is in this picture?"}]}]})
+        assert res.status_code == 200, res.body
+        return res.body["timings"]
+
+    vs = _make_node_vision_server()
+    vs.start()
+    t = req(vs, IMG_DATA_URI)
+    assert _metric_v(vs, "auto_cache_sysnode_probed_total") >= 1
+    assert _metric_v(vs, "auto_cache_sysnode_seam_mismatch_total") == 0
+    assert _metric_v(vs, "auto_cache_node_media_skipped_total") == 0
+    vs.stop()
+    inside = sorted(n for n in _metas_by_len() if n < t["prompt_n"])
+    assert inside, f"no node inside the prompt: {sorted(_metas_by_len())}"
+    sys_node = inside[0]
+    assert _metas_by_len()[sys_node][1] == 1   # the preamble is text
+
+    vs = _make_node_vision_server()
+    vs.start()
+    t2 = req(vs, IMG2_DATA_URI)
+    vs.stop()
+    assert t2.get("cache_disk_n", 0) >= sys_node, t2
+
+
 def test_manual_slots_text_on_vision_server():
     """Manual save/restore/erase of a TEXT slot works under --mmproj (per-slot gate
     replacing the server-wide 501) and keeps the base on-disk shape: no .meta."""

@@ -42,7 +42,7 @@ TEMPLATES = [
     "GLM-4.7-Flash",                  # generic autoparser
     "Qwen3.5-4B",                     # qwen3-coder parser, has a system span
 ]
-MODELS = ["llama-dense", "qwen35-dense"]
+MODELS = ["llama-dense", "qwen35-dense", "gemma3-dense"]
 
 
 def _paths(model: str, tmpl: str):
@@ -55,7 +55,7 @@ def _paths(model: str, tmpl: str):
     return m, t
 
 
-def _server(model: str, tmpl: str, cache: bool = True) -> ServerProcess:
+def _server(model: str, tmpl: str, cache: bool = True, node_prompt: str | None = "off") -> ServerProcess:
     s = ServerProcess()
     s.model_hf_repo = None
     s.model_hf_file = None
@@ -77,7 +77,7 @@ def _server(model: str, tmpl: str, cache: bool = True) -> ServerProcess:
     s.slot_restore_min_tokens = 0
     s.slot_save_context_min_tokens = 0     # the system node's floor becomes the block size
     s.slot_save_idle_seconds = 3600
-    s.slot_save_node_prompt = "off"        # only the system node and the release units
+    s.slot_save_node_prompt = node_prompt  # "off": only the system node and the release units; None: the default
     return s
 
 
@@ -179,18 +179,24 @@ def _sys(user: str):
     return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
 
 
+@pytest.mark.parametrize("node_prompt", ["off", None])
 @pytest.mark.parametrize("model_name", MODELS)
 @pytest.mark.parametrize("tmpl_name", TEMPLATES)
-def test_system_node_restores_for_other_conversations(tmpl_name, model_name):
+def test_system_node_restores_for_other_conversations(tmpl_name, model_name, node_prompt):
+    """node_prompt None is the server default (cold): the prompt node is written too, at least one
+    block past the system node, and the system node still serves the other conversations."""
     model, tmpl = _paths(model_name, tmpl_name)
     first = _sys("What is the capital of France?")
-    s = _server(model, tmpl)
+    s = _server(model, tmpl, node_prompt=node_prompt)
     s.start()
     body = _chat(s, first)
     n_prompt = body["timings"]["prompt_n"]
     _assert_sysnode_counters(s)
     s.stop()
     sys_units = [u for u in _units() if u < n_prompt]
+    if node_prompt is None and len(sys_units) == 2:
+        assert sys_units[1] >= sys_units[0] + B, f"prompt node inside the system node's block: {sys_units}"
+        sys_units = sys_units[:1]
     assert len(sys_units) == 1, f"units {_units()}, prompt {n_prompt}"
     X = sys_units[0]
     assert B <= X < n_prompt
@@ -199,7 +205,7 @@ def test_system_node_restores_for_other_conversations(tmpl_name, model_name):
     for user in ["\nA question that starts with a newline", "Hello there, how are you?"]:
         msgs = _sys(user)
         before = set(_units())
-        s = _server(model, tmpl)
+        s = _server(model, tmpl, node_prompt=node_prompt)
         s.start()
         body = _chat(s, msgs)
         _assert_sysnode_counters(s)
@@ -326,4 +332,22 @@ def test_same_length_system_prompts_differing_in_the_tail(tmpl_name, model_name)
         else:
             assert t.get("cache_disk_n", 0) >= nodes[d], (d, t)
         _assert_equals_cold(model, tmpl, msgs, body)
+
+
+# With the default prompt node a short first message ends inside the system node's last block. The prompt
+# node must then not be armed: it would be a strict prefix of the system node that no request can use, and a
+# second synchronous save before the first token of every cold first prompt.
+@pytest.mark.parametrize("user", ["Hi", "Ok", "Hi there", "Hello, how are you today?"])
+@pytest.mark.parametrize("tmpl_name", TEMPLATES)
+def test_prompt_node_not_inside_system_node(tmpl_name, user):
+    model, tmpl = _paths("qwen35-dense", tmpl_name)
+    s = _server(model, tmpl, node_prompt=None)
+    s.start()
+    body = _chat(s, _sys(user))
+    s.stop()
+    n = body["timings"]["prompt_n"]
+    inside = sorted(u for u in _units() if u < n)
+    assert inside, _units()
+    assert all(b >= a + B for a, b in zip(inside, inside[1:])), f"prompt node within a block of the system node: {inside}"
+    _assert_node_brackets_system(model, tmpl, inside[0])
 

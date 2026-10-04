@@ -1655,6 +1655,11 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_auto_restore_draft_cold
         },
         {
+            "auto_cache_node_media_skipped_total",
+            "Auto disk KV cache: mid-prefill nodes (system or prompt) not armed because media left no cut above the floor whose previous cell is text",
+            (double) metrics.n_auto_node_media_skipped
+        },
+        {
             "auto_cache_sysnode_probed_total",
             "Auto disk KV cache: chat requests whose system-prompt end was looked up for the system node",
             (double) metrics.n_sysnode_probed

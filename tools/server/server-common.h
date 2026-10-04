@@ -913,6 +913,7 @@ struct server_metrics {
     uint64_t n_auto_save_draft_skipped     = 0; // units published without one (no cells, or the range was ignored)
     uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars
     uint64_t n_auto_restore_draft_cold     = 0; // disk restores with a draft context left cold (a node lacked a sidecar)
+    uint64_t n_auto_node_media_skipped     = 0; // mid-prefill nodes not armed: no text-after-text cut above the floor before a media chunk
     // system-node boundary (server_preamble_cache), copied from the HTTP side when metrics are read
     uint64_t n_sysnode_probed              = 0; // chat requests whose preamble end was looked up
     uint64_t n_sysnode_probe_renders       = 0; // of those, rendered (not cached)

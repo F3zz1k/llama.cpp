@@ -7239,11 +7239,22 @@ private:
                         if (auto_cache_enabled() &&
                             slot.task->need_sampling() &&               // generative only (not embed/rerank; keeps the can_split path)
                             slot.alora_invocation_start <= 0 &&         // aLoRA caching bound (mirror the auto-restore gate)
-                            are_lora_equal(slot.lora, params_base.lora_adapters) && // fp captures the global LoRA set (invariant 3)
-                            !input_tokens.has_media()) {                // text-only keeps the block-hash array dense
+                            are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures the global LoRA set (invariant 3)
                             const int     B        = params_base.slot_save_block;
                             const int32_t n_prompt = slot.task->n_tokens();
                             const auto &  spans    = slot.task->params.message_spans;
+
+                            // A mid-prefill cut must not split a media chunk, and the prefill loop can only
+                            // stop right after a TEXT token (it clamps after pushing one; a chunk is
+                            // processed whole). So a node sits where the previous cell is text: a text
+                            // position, or the start of a chunk. A candidate inside or right after a chunk
+                            // moves down to that chunk's start. A no-op for a text-only prompt.
+                            const auto cut_down = [&](int32_t p) -> int32_t {
+                                while (p > 0 && input_tokens[p - 1] == LLAMA_TOKEN_NULL) {
+                                    p--;
+                                }
+                                return p;
+                            };
 
                             // --- SYSTEM node (--slot-save-node-system, default on) ---
                             // Position: the end of the leading system preamble, exactly (nodes need not be
@@ -7264,8 +7275,12 @@ private:
                                     B_ctx = spans.system_only_context_end();
                                 }
                                 B_ctx = B_ctx > 0 ? std::min(B_ctx, n_prompt - 1) : -1;
-                                if (B_ctx >= floor && B_ctx < n_prompt && n_past + B <= B_ctx) {
-                                    slot.ctx_save_pos = B_ctx;
+                                const auto    ok    = [&](int32_t x) { return x >= floor && x < n_prompt && n_past + B <= x; };
+                                const int32_t B_cut = B_ctx > 0 ? cut_down(B_ctx) : -1;
+                                if (ok(B_cut)) {
+                                    slot.ctx_save_pos = B_cut;
+                                } else if (B_cut != B_ctx && ok(B_ctx)) {
+                                    metrics.n_auto_node_media_skipped++; // only the media cut stopped it
                                 }
                             }
 
@@ -7281,16 +7296,27 @@ private:
                             // whenever at least one block of new prompt precedes it. The mid-prefill save is
                             // the true whole state at that position, so it is sound for every memory class.
                             // Floor: max(--slot-save-block, --slot-save-min-tokens), as for any other save.
+                            // When the system node is armed, the prompt node must lie at least one block past
+                            // it: anything closer is a prefix that the system node already covers for every
+                            // request that could reuse it, and would only cost a second save on a cold first
+                            // prompt with a short first message.
                             if (params_base.slot_save_node_prompt != COMMON_SLOT_SAVE_NODE_PROMPT_OFF) {
                                 const int     floor    = std::max(B, params_base.slot_save_min_tokens);
                                 const int32_t user_end = spans.last_user_message_end();
                                 const int32_t e        = std::min(user_end > 0 ? user_end : n_prompt - 1, n_prompt - 1);
-                                const int32_t B_p      = e > 0 ? e - (e % B) : -1;
-                                const bool    want     = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
-                                                         ? n_past + B <= B_p
-                                                         : n_past < floor;
-                                if (want && B_p >= floor && B_p < n_prompt && n_past < B_p && B_p != slot.ctx_save_pos) {
+                                const int32_t B_al     = e > 0 ? e - (e % B) : -1;
+                                const int32_t B_p      = B_al > 0 ? cut_down(B_al) : -1;
+                                const auto    ok       = [&](int32_t x) {
+                                    const bool want = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
+                                                      ? n_past + B <= x
+                                                      : n_past < floor;
+                                    const bool past_sys = slot.ctx_save_pos <= 0 || x >= slot.ctx_save_pos + B;
+                                    return want && past_sys && x >= floor && x < n_prompt && n_past < x;
+                                };
+                                if (ok(B_p)) {
                                     slot.prompt_save_pos = B_p;
+                                } else if (B_p != B_al && ok(B_al)) {
+                                    metrics.n_auto_node_media_skipped++; // only the media cut stopped it
                                 }
                             }
                         }
@@ -8328,8 +8354,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             // the system node's position, from the chat path's preamble end (characters of the
-            // rendered prompt); a /completion client with a string prompt may send it too
-            if (meta->chat_params.preamble_cache && inputs.size() == 1 && prompt.is_string() && !task.tokens.has_media()) {
+            // rendered prompt); a /completion client with a string prompt may send it too. A media
+            // prompt takes the same path: tokens() compares against the cell tokens, where a media
+            // cell never equals a text token, so a preamble containing media simply gets no node.
+            if (meta->chat_params.preamble_cache && inputs.size() == 1 && prompt.is_string()) {
                 const int32_t n_chars = json_value(data, "preamble_end_chars", -1);
                 if (n_chars > 0) {
                     task.params.preamble_end = meta->chat_params.preamble_cache->tokens(
