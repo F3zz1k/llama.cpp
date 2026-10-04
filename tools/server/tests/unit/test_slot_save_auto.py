@@ -42,12 +42,21 @@ FIXTURE_SHA256 = {
 # equal FIXTURE_SHA256's — invariant 0 for the on-disk BYTES is preserved). The old-prefix
 # fixture above is still what the restore tests feed in, and it still indexes and restores
 # (the scan verifies fp == cur_fp after reading the sidecar and never parses the prefix).
+#
+# merge-upstream-20261003 (e1998922a) then changed the middle hash for a unit whose length is not a
+# whole number of blocks, as this one is (377 = 23 blocks of 16 + 9): a unit is named by its identity
+# over EVERY token (the chain value after its last cell), not by its last whole block, so two units of
+# equal length that differ only in that partial block no longer share a name. The .meta records the
+# same value in its chain-hash field (a delta's parent_id is the parent's file id), so that one 8-byte
+# field changes; every other byte of the .meta, the v1 layout, and the .bin are unchanged, and no
+# reader uses the field (an older build reads this unit as before). Asserted field by field below.
 EMITTED_SHA256 = {
-    "auto-de633b3190d4d950-5efede8f57f0c198-377.bin":
+    "auto-de633b3190d4d950-a028e20ed7d8f6b7-377.bin":
         FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin"],
-    "auto-de633b3190d4d950-5efede8f57f0c198-377.bin.meta":
+    "auto-de633b3190d4d950-a028e20ed7d8f6b7-377.bin.meta":
         FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin.meta"],
 }
+EMITTED_CHAIN_HASH = 0xa028e20ed7d8f6b7
 
 # The .bin holds the KV numbers themselves, and those depend on the backend's arithmetic: the
 # frozen fixture is a GPU (SYCL) capture, and a CPU build emits a .bin of the same size and layout
@@ -147,9 +156,10 @@ def verify_and_copy_fixture(dst: str, names=None):
 def test_text_only_meta_byte_identical():
     """The current binary re-emits the golden unit for the capture prompt with byte-identical
     contents (invariant 0: text-only on-disk BYTES are frozen at the pre-media base build's).
-    Since F4 the filename PREFIX is the full-identity hash rather than fp_model alone, so the
-    emitted name is EMITTED_SHA256's (the block-chain-hash/token-count tail and the file bytes
-    are unchanged — see the EMITTED_SHA256 comment)."""
+    Since F4 the filename PREFIX is the full-identity hash rather than fp_model alone, and since
+    e1998922a the middle hash of this unaligned unit is its identity over every token, so the
+    emitted name is EMITTED_SHA256's; the .bin bytes are unchanged and the .meta differs only in
+    its chain-hash field (see the EMITTED_SHA256 comment)."""
     global server
     server.slot_save_path = CACHE_DIR
     server.slot_save_auto = True
@@ -176,7 +186,15 @@ def test_text_only_meta_byte_identical():
             assert actual == EMITTED_BIN_SHA256_PER_BACKEND[backend], \
                 f"{name}: emitted bytes differ from the {backend} frozen capture ({actual})"
         else:
-            assert actual == expected, f"{name}: emitted bytes differ from the golden fixture"
+            # the frozen .meta with only its chain-hash field replaced by the unit's id (see above)
+            with open(os.path.join(FIXTURE_DIR, "auto-f414107cff91a49e-5efede8f57f0c198-377.bin.meta"), "rb") as f:
+                frozen = bytearray(f.read())
+            assert hashlib.sha256(frozen).hexdigest() == expected
+            off = SLOT_META_TOKS_OFF + 4
+            struct.pack_into("<Q", frozen, off, EMITTED_CHAIN_HASH)
+            with open(os.path.join(CACHE_DIR, name), "rb") as f:
+                emitted = f.read()
+            assert emitted == bytes(frozen), f"{name}: emitted .meta differs from the golden one beyond its chain-hash field"
 
 
 def test_v1_meta_still_indexed():
