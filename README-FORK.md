@@ -189,8 +189,12 @@ image's id and geometry into the state file). The fork adds a `.logits` sidecar 
 hybrid models, so resending exactly the saved prompt after a restore does not re-process it,
 refuses saves to `auto-*` names (reserved for the automatic cache), and restores any file that has a
 `.meta` sidecar (an automatic cache unit, or a media save from a fork build before 2026-10-03) the
-fork's way. Upstream's format has no projector fingerprint, so restoring a media snapshot after
-swapping `--mmproj` is not refused. Details: `docs/kv-cache/03-multimodal-cache.md`.
+fork's way. Upstream's format records no model or projector identity, so the fork writes a small `.fp`
+sidecar beside each save, and a restore refuses a file whose `.fp` names another model, or, for a
+media save, another `--mmproj` (a file without one, saved by upstream, is restored unchecked). A save is
+written to a temp name and renamed over the old file, so a failed save leaves the previous one intact.
+After a manual restore the speculative draft (MTP) starts cold: only the automatic cache saves draft
+state. Details: `docs/kv-cache/03-multimodal-cache.md`.
 
 ### Pinning a snapshot (permanent, never-evicted cache)
 

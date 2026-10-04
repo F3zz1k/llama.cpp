@@ -453,7 +453,7 @@ The restored KV state round-trips faithfully, but a *fully* restored prompt — 
 
 ### Manual `/slots` save/restore with multimodal
 
-The manual `/slots/{id}?action=save|restore` endpoints use upstream's implementation and file format: the state file carries the slot's tokens and, for a media slot, each media chunk's id and geometry (no pixels; the embeddings come from the state file). A restored media chunk is a placeholder that is never re-encoded: any follow-up that would require re-processing it (e.g. a divergence before it) drops it and re-processes from the request's own data. Upstream's format records no model or `--mmproj` fingerprint, so restoring a media snapshot after swapping the projector is not refused. A fork-format file that has a `.meta` sidecar (an auto-cache unit, or a media save made by an older fork build) is restored the fork's way: a delta unit with its parent chain, media rebuilt from the sidecar.
+The manual `/slots/{id}?action=save|restore` endpoints use upstream's implementation and file format: the state file carries the slot's tokens and, for a media slot, each media chunk's id and geometry (no pixels; the embeddings come from the state file). A restored media chunk is a placeholder that is never re-encoded: any follow-up that would require re-processing it (e.g. a divergence before it) drops it and re-processes from the request's own data. Upstream's format records no model or `--mmproj` fingerprint, so the fork writes a `.fp` sidecar next to each save and refuses a restore whose `.fp` names another model or, for a media snapshot, another projector; a file without one (saved by upstream) is restored unchecked. A fork-format file that has a `.meta` sidecar (an auto-cache unit, or a media save made by an older fork build) is restored the fork's way: a delta unit with its parent chain, media rebuilt from the sidecar.
 
 ### Operational notes
 
@@ -1213,7 +1213,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
-The file is in upstream's format. On recurrent and hybrid models (and any model whose memory cannot be trimmed back by one token) a `.logits` sidecar is also written next to it, so that resending exactly the saved prompt after a restore emits its first token without re-processing the prompt. Filenames starting with `auto-` are reserved for the automatic disk cache and are refused.
+The file is in upstream's format. On recurrent and hybrid models (and any model whose memory cannot be trimmed back by one token) a `.logits` sidecar is also written next to it, so that resending exactly the saved prompt after a restore emits its first token without re-processing the prompt. Filenames starting with `auto-` are reserved for the automatic disk cache and are refused. A `.fp` sidecar records the model and projector identity for the restore check. The file is written to a temporary name and renamed into place, so a failed save leaves the previous file and its sidecars as they were. A restore leaves a speculative draft context (MTP) cold; only the automatic disk cache saves draft state.
 
 **Response format**
 

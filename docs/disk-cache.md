@@ -84,7 +84,7 @@ never restores into a smaller context, and sliding-window models only restore at
 | Flag | Default | Node |
 |---|---|---|
 | `--slot-save-node-system` | on | at the end of the system prompt, while a cold prompt prefills; a request with only a system prompt caches all of it. The end is found by rendering the request's system messages and tools through the chat template again, followed by placeholder conversations, so it works for every template, including a default system prompt the template inserts itself |
-| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never |
+| `--slot-save-node-prompt off\|cold\|on` | cold | at the end of the last user message, while the prompt prefills. `cold`: only for prompts that got essentially no reuse. `on`: whenever at least one block of new prompt precedes it (a delta under `--slot-save-incremental`). `off`: never. When the system node is written in the same prefill, the prompt node must lie at least one block past it, or it is skipped |
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
@@ -139,6 +139,8 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_sysnode_probed_total` / `auto_cache_sysnode_probe_renders_total` | chat requests whose system-prompt end was looked up / of those, not already cached |
 | `auto_cache_sysnode_probe_failed_total` | requests whose template rendered none of the boundary probes (the message delimiters place the node) |
 | `auto_cache_sysnode_seam_mismatch_total` | requests whose system-prompt tokens were not a prefix of the prompt (no system node) |
+| `auto_cache_sysnode_probe_short_total` | chat prompts too short in bytes to reach the system node's floor, so not probed at all |
+| `auto_cache_node_media_skipped_total` | system or prompt nodes not written because media left no cut above the floor (see Known limits) |
 
 A miss includes conversations no cache could have held, so read it next to `auto_cache_evicted_total`:
 misses that climb with evictions mean the store is too small.
@@ -151,13 +153,24 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 ## Known limits
 
 - Prompts shorter than `max(--slot-save-block, --slot-save-min-tokens)` are never saved or looked up.
-- The system and prompt nodes are written for text prompts only; conversations with images or audio are
-  saved on idle, reclaim, shutdown and after responses.
+- The system and prompt nodes are written for prompts with images or audio too. A node is cut where the
+  previous cell is text, so no media chunk is split: a position inside or right after a chunk moves down
+  to the chunk's start. When that falls below the floor the node is skipped and counted in
+  `auto_cache_node_media_skipped_total`.
+- Every unit is named and deduplicated by its identity over all of its tokens, so two system prompts of
+  the same length that differ only near the end (a date, a user name) get a node each. Index lookups
+  still go by whole blocks, and every restore byte-compares the tokens.
+- Both nodes are written synchronously while a cold prompt prefills, on the server-loop thread: each
+  delays that request's first token by its write (a whole snapshot, or a delta under
+  `--slot-save-incremental`) and holds up other slots meanwhile. The cost per model class is measured at
+  the GPU gate; the default `cold` prompt node adds at most one write per conversation start.
 - The system node is placed from the chat template for every template (the boundary is checked over
   all of `models/templates` by `test-chat-preamble`). The first chat request with a new system prompt
   or tool set pays for the template renders that find it: about four times one render of the request,
   measured 5 ms with no tools and 55-260 ms with 50 tools on a Threadripper 1950X (600 ms on Inkling's
-  template); later requests with the same system prompt and tools reuse the result. A raw
+  template); later requests with the same system prompt and tools reuse the result. A prompt with fewer
+  bytes than the node floor in tokens cannot reach it and is not probed. A system prompt that changes on
+  every request (a time stamp) pays the renders every time and never gets a reusable node. A raw
   `/completion` prompt has no messages: it gets a system node only when the client sends
   `message_delimiters` (the first user message) or `preamble_end_chars` (the preamble's length in
   characters, for a string prompt).
@@ -175,6 +188,11 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
 - On a rollback to a release older than the `.dft` draft sidecars, purge `*.dft` from the store first;
   an older binary counts them as units, evicts them and can delete a newer binary's `.tmp.dft` temps.
   Never run the two on one store at the same time.
+- A unit whose length is not a whole number of blocks is named by its identity over every token since
+  merge-upstream-20261003; older builds named it by its last whole block. Restores still work across
+  the change (the index is rebuilt from the `.meta` files), but an older binary that saves a delta onto
+  a newer unit names a parent that does not exist, so that delta is dead weight. Purge the store when
+  moving between the two in either direction.
 - Every instance writing to one directory must agree on the model, `-c` (except for the rung rule above),
   `--cache-type-k/v`, `--slot-save-block`, the mmproj and the RoPE settings; a unit from a mismatched
   instance is refused, never restored into the wrong context.

@@ -992,8 +992,14 @@ static void slot_save_enforce_limits(const std::string & dir,
 //      KV-type/FULL-vs-attention/LoRA); a mismatch refuses the restore.
 //   4. Fallback totality: any failure (corrupt file, fp/vocab mismatch, IO error,
 //      no match) falls back to a normal prefill — never crash, never wrong output.
-//   5. Hot-path purity: the multi-GB save runs only on slot release/reassign, never
-//      during generation; restore happens once before prefill.
+//   5. Hot-path purity: no save runs during generation (token decode); restore happens
+//      once before prefill. Saves run on slot release/reassign (idle flush, reclaim,
+//      shutdown) AND, for the two mid-prefill nodes (system node, prompt node), inside
+//      a cold prefill at the node position, synchronously on the server-loop thread.
+//      Those two delay that request's first token by the write (whole root, or a
+//      delta under --slot-save-incremental) and stall other slots for as long; the cost
+//      is measured per class at the GPU gate. If it proves material, the fix is to
+//      move publishing to a writer thread (see Concurrency), not to narrow the nodes.
 //
 // Concurrency: all slot work runs on the single server-loop thread, so the index is
 // single-threaded and the mutex below is uncontended today; it becomes load-bearing
@@ -3403,7 +3409,7 @@ private:
     // Skips redundant writes (an equal-or-longer snapshot already covers this prefix), writes the
     // state + .logits + .meta as a 3-file unit (atomically, .meta LAST so a torn write is never
     // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
-    // is the gate; invariant 5: only called on slot release/reassign, never during generation.
+    // is the gate; invariant 5: never during generation (release/reassign, or a mid-prefill node).
     // SHARED atomic-publish tail, factored out of auto_save_slot_if_useful so the temp->fsync->
     // rename (meta last) publish invariant, the capacity pre-flight and the per-boundary index
     // insert live in ONE place. Persists KV cells [lo, hi) of slot.id's sequence as one disk unit
