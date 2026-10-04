@@ -4282,41 +4282,28 @@ private:
         return aw_admit_res::queued;
     }
 
-    // A restore is about to look up the disk index: if the writer still holds a unit that is a usable
-    // prefix of this request (longer than what memory already matches by a block), wait for it to be
-    // published, bounded. Waiting out a write (seconds) beats re-prefilling the prefix, and nothing is
-    // read from the queue itself: the restore then reads only published units.
-    void aw_wait_pending_prefix(const server_tokens & request, int32_t n_past) {
+    // Is a unit the writer still holds a usable prefix of this request (at least a block longer than what
+    // memory already matches)? Then the task waits for its publish (update_slots defers it, the other slots
+    // keep running): waiting out a write beats re-prefilling the prefix, and the restore then reads only
+    // published units, never the queue.
+    size_t aw_pending_prefix(const server_tokens & request, int32_t n_past) {
         if (!aw.running) {
-            return;
+            return 0;
         }
-        std::unique_lock<std::mutex> lk(aw.mtx);
+        std::lock_guard<std::mutex> lk(aw.mtx);
         if (aw.jobs.empty()) {
-            return;
+            return 0;
         }
         const llama_tokens & req = request.get_cell_tokens();
         const size_t floor = (size_t) std::max(0, n_past) + (size_t) std::max(1, params_base.slot_save_block);
-        std::vector<std::shared_ptr<aw_job>> want;
+        size_t n = 0;
         for (const auto & j : aw.jobs) {
             const llama_tokens & t = *j->toks;
             if (!j->done && t.size() >= floor && t.size() <= req.size() && std::equal(t.begin(), t.end(), req.begin())) {
-                want.push_back(j);
+                n++;
             }
         }
-        if (want.empty()) {
-            return;
-        }
-        const int64_t t0 = ggml_time_us();
-        const bool all = aw.cv.wait_for(lk, std::chrono::milliseconds(AW_PENDING_WAIT_MS), [&]() {
-            for (const auto & j : want) {
-                if (!j->done) {
-                    return false;
-                }
-            }
-            return true;
-        });
-        SRV_INF("auto-restore: waited %.1f ms for %zu queued unit(s) that prefix this request%s\n",
-                (ggml_time_us() - t0) / 1000.0, want.size(), all ? "" : " (timed out)");
+        return n;
     }
 
     // ---- publish side (writer thread, or the server thread in sync mode) -------------------------------
@@ -7990,6 +7977,7 @@ private:
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
+            int  n_aw_deferred = 0; // new tasks waiting for a queued prefix to be published
 
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
@@ -8019,6 +8007,10 @@ private:
                     const auto n_tokens_prev = batch.size();
 
                     // TODO: maybe move branch to outside of this loop in the future
+                    if (slot.state == SLOT_STATE_STARTED && auto_pending_defer(slot, input_tokens)) {
+                        n_aw_deferred++;
+                        return; // stays STARTED: re-checked next iteration, the other slots keep running
+                    }
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
@@ -8146,7 +8138,6 @@ private:
                                     // auto_index_lookup folds each chunk's identity into the boundary hashes.
                                     int n_restored = 0;
                                     auto_not_prefix_skips = 0;
-                                    aw_wait_pending_prefix(input_tokens, n_past);
                                     for (const auto & cand : auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
@@ -8999,7 +8990,43 @@ private:
                     slot_batched = &slot;
                 }
             });
+
+            if (n_aw_deferred > 0 && batch.size() == 0) {
+                // nothing else to decode: wait briefly for the writer instead of spinning the loop (the queue
+                // loop re-runs update_slots at once, and new tasks are taken between iterations)
+                std::unique_lock<std::mutex> lk(aw.mtx);
+                aw.cv.wait_for(lk, std::chrono::milliseconds(20));
+            }
         }
+    }
+
+    // A new task whose prefix the background writer still holds (aw_pending_prefix) is held in STARTED until
+    // that unit is published, at most AW_PENDING_WAIT_MS, then proceeds to the disk lookup as usual. The wait
+    // never blocks the server thread: other slots keep prefilling and decoding meanwhile. Mirrors the
+    // restore's own gates, so a task that would not restore does not wait.
+    bool auto_pending_defer(server_slot & slot, const server_tokens & input_tokens) {
+        if (!aw.running || input_tokens.empty() || !slot.task->params.cache_prompt || !slot.task->need_sampling() ||
+                !are_lora_equal(slot.lora, params_base.lora_adapters)) {
+            return false;
+        }
+        const int32_t n_mem = (int32_t) slot.prompt.tokens.get_common_prefix(input_tokens);
+        const size_t  n     = aw_pending_prefix(input_tokens, n_mem);
+        const int64_t now   = ggml_time_us();
+        if (n > 0 && slot.aw_pending_t0_us < 0) {
+            slot.aw_pending_t0_us = now;
+            SLT_INF(slot, "auto-restore: %zu queued unit(s) prefix this request, waiting for the writer to publish them\n", n);
+        }
+        if (slot.aw_pending_t0_us < 0) {
+            return false;
+        }
+        const bool timed_out = now - slot.aw_pending_t0_us >= AW_PENDING_WAIT_MS * 1000;
+        if (n > 0 && !timed_out) {
+            return true;
+        }
+        SLT_INF(slot, "auto-restore: waited %.1f ms for the queued unit(s) that prefix this request%s\n",
+                (now - slot.aw_pending_t0_us) / 1000.0, timed_out && n > 0 ? " (timed out)" : "");
+        slot.aw_pending_t0_us = -1;
+        return false;
     }
 
     // returns true = success ; false = retry with smaller batch size
