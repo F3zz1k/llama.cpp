@@ -12,7 +12,8 @@ llama-server -m model.gguf -c 32768 \
     --slot-save-auto
 ```
 
-That is the minimal setup. The sections below give the recommended command lines, what each flag does,
+That is the minimal setup. Add `--metrics` to see the cache's hit, miss, save and eviction counters on
+`GET /metrics` (see [Seeing hits and misses](#seeing-hits-and-misses)). The sections below give the recommended command lines, what each flag does,
 when the server writes a node, how to see hits and misses, and the known limits. The design notes are
 in [`docs/kv-cache/`](kv-cache/README.md).
 
@@ -144,8 +145,11 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_restore_failed_total` | restores whose load failed (fell back to a shorter unit or a cold prefill) |
 | `auto_cache_restore_tokens_total` | prompt tokens restored from disk |
 | `auto_cache_save_root_total` / `auto_cache_save_delta_total` | whole snapshots / delta nodes written |
+| `auto_cache_save_whole_fallback_total` | saves that would have been deltas, written whole because the memory type cannot write deltas (included in the root count) |
+| `auto_cache_save_bytes_total` | state bytes written by published saves |
 | `auto_cache_save_failed_total` | saves dropped with nothing written (each logs a WRN with the reason) |
 | `auto_cache_evicted_total` | units this instance evicted to stay under the caps |
+| `auto_cache_save_draft_total` / `auto_cache_save_draft_skipped_total` | `.dft` draft sidecars written / units published without one although a draft context exists |
 | `auto_cache_restore_draft_{warm,cold}_total` | restores whose draft came back warm / cold |
 | `auto_cache_sysnode_probed_total` / `auto_cache_sysnode_probe_renders_total` | chat requests whose system-prompt end was looked up / of those, not already cached |
 | `auto_cache_sysnode_probe_failed_total` | requests whose template rendered none of the boundary probes (the message delimiters place the node) |
@@ -192,10 +196,10 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   by default) gets no system node; a typical 1-2k token chat-UI system prompt is below it.
 - A template that moves the system prompt into a later turn (Mistral-Nemo puts it in the last user
   message) has no stable system prefix; no system node is written for it.
-- The prompt node's floor is `max(--slot-save-block, --slot-save-min-tokens)`. main-patched armed a
-  node near the end of a cold prompt for sliding-window models only, with the floor
-  `max(--slot-save-block, --slot-save-context-min-tokens)`; the default `cold` prompt node now does
-  this for every class that cannot rewind, at the lower floor.
+- The prompt node's floor is `max(--slot-save-block, --slot-save-min-tokens)`. Builds before
+  merge-upstream-20261003 armed a node near the end of a cold prompt for sliding-window models only,
+  with the floor `max(--slot-save-block, --slot-save-context-min-tokens)`; the default `cold` prompt
+  node now does this for every class that cannot rewind, at the lower floor.
 - On a rollback to a release older than the `.dft` draft sidecars, purge `*.dft` from the store first;
   an older binary counts them as units, evicts them and can delete a newer binary's `.tmp.dft` temps.
   Never run the two on one store at the same time.

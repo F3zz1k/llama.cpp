@@ -1,24 +1,43 @@
-# llama.cpp — recurrent-model & mmproj KV caching fork
+# llama.cpp: recurrent-model and mmproj KV caching fork
 
 This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The
 `main-patched` branch is **upstream `master` plus a small set of llama-server patches**
 that make disk KV caching work for model types where it was previously broken or blocked.
 
-**Upstream baseline:** `main-patched` currently carries upstream `master` at `d7bd3bfca`
-(2026-08-28), absorbed by the merge of 2026-08-29. The previous baseline was `9d57ce456`
-(2026-08-14). That merge crossed an upstream **state-file format bump**
-(`LLAMA_STATE_SEQ_VERSION` 2 -> 3), so KV snapshots written by any earlier build of this
-fork are refused by this one; see
+## How I use it (start here)
+
+Build `llama-server` as you would upstream, then add two flags and a directory. Conversations are
+saved to disk and restored after a slot is reused, after a restart, or by another instance pointed
+at the same directory:
+
+```bash
+llama-server -m model.gguf -c 32768 -ngl 999 -fa on \
+    --slot-save-path ~/kvcache/shared --slot-save-auto --slot-save-incremental \
+    --slot-save-max-mb 40960 --metrics
+```
+
+Then check it is working with `curl -s localhost:8080/metrics | grep auto_cache_` (restore hits,
+misses, saves and evictions) and the `cache_disk_n` field of each response's `timings`.
+
+[`docs/disk-cache.md`](docs/disk-cache.md) is the quick start: the recommended command lines (a
+pool sharing one store, MTP or a draft model, recurrent and hybrid models, a shared system prompt,
+context rungs), every flag with its default, when a node is written, how to read hits and misses,
+and the known limits.
+
+## Upstream baseline
+
+`main-patched` currently carries upstream `master` at `836d57176`
+(2026-10-03), merged as `4310ec58c`. The previous baseline was `d7bd3bfca` (2026-08-28). That
+merge did not change the engine state-file format (`LLAMA_STATE_SEQ_VERSION` is still 3), but
+the same refresh changed how automatic cache units are named, so a store written by an earlier
+build should be purged at deploy (see the known limits in
+[`docs/disk-cache.md`](docs/disk-cache.md#known-limits)). The 2026-08-29 merge crossed the
+upstream state-file bump (`LLAMA_STATE_SEQ_VERSION` 2 -> 3); see
 [`docs/kv-cache/README.md`](docs/kv-cache/README.md#engine-state-file-format-bin-and-upstream-version-bumps)
-for who is affected and what an operator has to do at deploy time.
+for who that affects and what an operator has to do at deploy time.
 
-Everything else is stock llama.cpp — see the upstream [README.md](README.md) to build and
+Everything else is stock llama.cpp: see the upstream [README.md](README.md) to build and
 run normally. This document only covers what the fork adds.
-
-**Using the disk KV cache:** [`docs/disk-cache.md`](docs/disk-cache.md) is the quick start:
-copy-paste `llama-server` command lines (minimal, a pool sharing one store, with MTP or a draft
-model, recurrent and hybrid models, a shared system prompt, context rungs), every flag with its
-default, when a node is written, how to read hits and misses in the response, and the known limits.
 
 ---
 
@@ -93,8 +112,12 @@ Full design write-ups (what changed, how it works, and why): see
 
 ## The new command-line flags
 
-All flags are **off by default**. With none of them set, llama-server behaves exactly like
-upstream.
+The automatic cache is **off by default**: without `--slot-save-auto`, llama-server behaves
+exactly like upstream (plain `--slot-save-path` only enables the manual `/slots` endpoints). The
+defaults below apply once `--slot-save-auto` is on, and some of them are on: the system node,
+the `cold` prompt node, the reclaim save and the 60 s idle save. Add `--metrics` to get the
+`auto_cache_*` counters on `GET /metrics`; they are listed in
+[`docs/disk-cache.md`](docs/disk-cache.md#seeing-hits-and-misses).
 
 | Flag | Default | What it does |
 |------|---------|--------------|
@@ -233,34 +256,65 @@ Each feature branch is a clean single-purpose delta, meant to be submittable ups
 
 ## How to keep the fork up to date with upstream
 
-Bump `master` to the new upstream, refresh each feature branch onto it, then rebuild `main-patched` as their merge:
+`main-patched` is **never rebased and never force-pushed**. Upstream is merged into it, so every
+deployed release stays reachable and its commit hash keeps meaning the same thing. In this
+checkout `origin` is upstream (`ggml-org/llama.cpp`) and `fork` is this repository.
 
-```bash
-git remote add upstream https://github.com/ggml-org/llama.cpp.git   # one-time
-git fetch upstream master && git branch -f master upstream/master
-# rebase each feature branch onto the new master (resolving conflicts — see below), then:
-git checkout -B main-patched master
-git merge --no-ff auto-disk-kvcache-pin
-git merge --no-ff auto-disk-kvcache-mm
-git merge --no-ff l0-fattn-alloc
-git push --force-with-lease origin master main-patched kv-restore-reuse auto-disk-kvcache auto-disk-kvcache-pin auto-disk-kvcache-mm l0-fattn-alloc
-```
+1. **Branch the refresh off `main-patched`** and merge upstream into it in one merge commit:
 
-Merge the branches **sequentially, in that order** — never as one multi-branch (octopus)
-merge, which cannot resolve any conflict. The `-pin` -> `-mm` merge always conflicts
-(**add/add**) on `README-FORK.md` and `docs/kv-cache/02-auto-disk-cache.md`: both branches
-carry these files with different content. Take the `-mm` copies, which document the `.pin`
-feature too — `git checkout --theirs README-FORK.md docs/kv-cache/02-auto-disk-cache.md`,
-then `git add` both and `git commit` to conclude the merge.
-(`docs/kv-cache/01-primitives-recurrent-restore.md` is identical on both branches and
-resolves itself, and the two branches' `tools/server/server-context.cpp` edits touch
-different regions and auto-merge.)
+   ```bash
+   git fetch origin master
+   git checkout -b merge-upstream-YYYYMMDD main-patched
+   git merge origin/master        # one merge, resolved by hand; rerere stays off
+   ```
 
-Conflicts against **upstream** land almost entirely in `tools/server/server-context.cpp`
-and are **not** trivial: upstream's server refactors relocate code, and a 3-way merge can
-silently mis-place a small hunk into the wrong decode loop (this has caused a segfault).
-Always build **and** exercise the disk save->restart->restore path afterward.
-`docs/kv-cache/` explains what each commit touches.
+2. **Resolve against the PR heads, hunk by hunk.** Where a carried feature also exists as an
+   upstream PR (or as one of our feature branches), use the PR head as the reference for that
+   file, not "ours" or "theirs" wholesale. Upstream refactors in
+   `tools/server/server-context.cpp`, `src/llama-context.cpp` and `src/llama-kv-cache.cpp`
+   relocate code, and a 3-way merge can silently drop a disk-cache hunk or place it in the wrong
+   decode loop (this has caused a segfault). Carried code that upstream has since replaced is
+   dropped deliberately and recorded under "Retired carries" below.
+
+3. **Feature branches are re-merged, not rebased.** A fix that lives on its own branch (for
+   example `sycl-topk-unfilled-slot`, or an upstream PR head we carry) is merged into the refresh
+   branch after the upstream merge, as its own merge commit. Feature branches themselves are
+   brought forward by merging `master` into them when they need it, never by rebasing.
+
+4. **Survival audit**, mandatory before any build is trusted:
+   - every line the previous `main-patched` added over its upstream baseline
+     (`git diff <old-baseline> <old-main-patched>`) still exists in the merged tree, except an
+     explicit allow-list of retired carries;
+   - `llama-server --help` is diffed between the old and the new build: no `--slot-save-*` flag may
+     disappear;
+   - a symbol grep for the carried primitives (`state_write_range`,
+     `LLAMA_STATE_SEQ_FLAGS_NO_CLEAR`, `llama_state_seq_save_file_range`,
+     `llama_state_seq_load_file_ext`, the `.pin` marker, the logits sidecar, the l0-fattn allocator).
+
+5. **Gates**, in order:
+   - CPU build, `ctest`, and the server pytest suite (`tools/server/tests/unit/test_slot_save*.py`),
+     each compared against the previous baseline's known failures rather than expected clean;
+   - the GPU build, then `test-backend-ops test` on one drained card, compared against the
+     previous release's failure list;
+   - per served model: a request through the server, a disk save, a graceful stop, a fresh start and
+     `auto-restore: reused N tokens from disk` in the log, with delta nodes published where the
+     memory type supports them; vision and long-context needle checks where they apply;
+   - speculative decoding (MTP, draft models) t/s with the generated content recorded.
+
+6. **Promote**: fast-forward `main-patched` to the refresh branch, tag it
+   `main-patched-b<N>-<commit>`, and push without force:
+
+   ```bash
+   git checkout main-patched && git merge --ff-only merge-upstream-YYYYMMDD
+   git push fork main-patched merge-upstream-YYYYMMDD
+   ```
+
+   Purge the disk store at deploy whenever the refresh changed the state-file format or the unit
+   naming (see the known limits in `docs/disk-cache.md`).
+
+Never resolve with an octopus merge (several branches in one `git merge`): it cannot resolve
+any conflict. Merge one branch at a time. `docs/kv-cache/` explains what each carried commit
+touches.
 
 ---
 
