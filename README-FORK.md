@@ -208,7 +208,9 @@ Turns containing images (or audio) are cached too: on a resend of the same conve
 with a *different* image reuses the prefix before that image and re-processes the rest.
 Swapping the `--mmproj` file invalidates media snapshots (each records a fingerprint of
 the projector it was encoded with, shown in `/props` as `fp_mmproj`) while text snapshots
-keep working.
+keep working. Text snapshots also restore across a server with and a server without `--mmproj` (the
+text KV does not depend on the projector), so a text-only and a vision instance of one model share
+their text conversations.
 
 ### Manual save/restore (advanced, no `--slot-save-auto`)
 

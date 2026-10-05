@@ -94,12 +94,24 @@ its position. Pick `N` from what an interruption may cost: the re-prefill after 
   tokens on the previous checkpoint, about `N` times the per-token KV size (Qwen3.8-27B with f16 KV:
   about 66 KB per token, so 2.1 GB at `N` = 32768) plus one copy of the side-state (a hybrid's recurrent
   state, 112.57 MiB on Qwen3.8-Flash-Next). The positional part goes through the deferred copy, so the
-  prefill does not wait for it; the side-state is copied at once.
+  prefill does not wait for it; the side-state is copied at once. Every node stores its own side-state,
+  so a chain of `K` checkpoints holds `K` of them on disk; a restore through the chain reads only the
+  last one on hybrid models (the inner nodes load their attention cells only, see
+  `--slot-restore-selective`).
 - **a whole snapshot** instead on a model that cannot write deltas (the delta probe says no) or without
   `--slot-save-incremental`: the checkpoint at `k * N` writes all `k * N` tokens again, so a 1M-token
-  prefill at `N` = 32768 writes about 16 times the final unit. Use a larger `N` there, or none.
+  prefill at `N` = 32768 writes about 16 times the final unit. Each whole checkpoint replaces the
+  previous one of the same prefill once it is published, so the store keeps one, the deepest (it serves
+  a resume and a new question at the end of the long message; an edit further back in the message
+  restores from the nodes before it). Use a larger `N` there, or none.
 - **one unit** against `--slot-save-max-count`: a 1M-token prefill at `N` = 32768 adds 32. Raise the
-  count cap with it (the byte cap stays the real limit).
+  count cap with it (the byte cap stays the real limit). A delta chain is evictable only from its tip,
+  so when one prefill's chain alone fills a cap, the newest delta is not kept (a WRN and
+  `auto_cache_evict_bound_exceeded_total`): the store stays within its caps and the chain ends at the
+  deepest checkpoint the cap holds.
+
+Keep the number of checkpoints per prompt modest: `N` at least `n_ctx / 32` (the server warns at load
+when `n_ctx / N` is above 32).
 
 A checkpoint captured while the prefill keeps running becomes durable once its deferred copy has been
 emitted, which during a busy prefill happens about 10 s after the capture (the trickle). The default is
@@ -111,7 +123,10 @@ unit's identity, so the rungs name units alike, deduplicate them and continue ea
 and a unit restores into any rung whose context holds it, in either direction, for every model class
 (sliding-window and recurrent included). They must still agree on the model file, KV cache types,
 Flash Attention (`-fa` on or off changes the V layout), the KV stream count (`--parallel` without
-`--kv-unified`), `--slot-save-block`, the mmproj and the RoPE/YaRN settings. The one exception is a
+`--kv-unified`), `--slot-save-block` and the RoPE/YaRN settings. The mmproj matters only for units that
+hold images or audio: a text unit restores across a rung with and a rung without `--mmproj` (the text
+K/V does not depend on the projector), so a text-only rung and a vision rung of one model share their
+text conversations. The one exception is a
 LongRoPE model (Phi-3 style `rope_factors_long`/`rope_factors_short`): rungs on opposite sides of its
 original context use different factors, so they do not share. That threshold is the model's own
 (`rope.scaling.original_context_length`, else `context_length`); `--yarn-orig-ctx` does not move it, and
@@ -133,6 +148,7 @@ different content (a whole unit and a delta) under one name.
 | `--slot-save-context-min-tokens N` | 4096 | smallest system prefix worth a node of its own |
 | `--slot-save-max-mb N` / `--slot-save-max-count N` | 0 (unlimited) | least-recently-used eviction caps for the whole directory |
 | `--slot-restore-min-tokens N` | 0 | skip a restore shorter than `N` tokens and prefill instead |
+| `--slot-restore-selective` | on | on hybrid models, load only what a restore needs: the recurrent state alone when the slot already holds the unit's attention cells (restore mode 2), and only the attention cells of a delta chain's inner nodes. `--no-slot-restore-selective` loads every unit whole |
 | `--slot-save-staging-mb N` | 1024 | host memory a save may hold between its copy off the device and its write by the background writer; `0` writes every save on the server thread (see below) |
 | `--slot-save-prefill-interval N` | 0 (off) | while a prompt prefills, publish a node every `N` tokens (each multiple of `N`); must be 0 or at least `--slot-save-block` (see "Long prompts") |
 | `--slot-save-defer` / `--no-slot-save-defer` | on | copy only the side-state off the device at a save and the positional K/V later (see "Deferred positional copy"); needs the background writer |
@@ -146,7 +162,7 @@ different content (a whole unit and a delta) under one name.
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
-| `--slot-save-prefill-interval N` | 0 (off) | every multiple of `N` tokens while a prompt prefills, so an interrupted prefill resumes from the last one. A prefill that resumes an interrupted one counts as cold for the prompt node above (only with the interval set): the slot still holds an unfinished cold prefill, the reuse ends on a multiple of `N`, or the reuse already reaches into the last user message |
+| `--slot-save-prefill-interval N` | 0 (off) | every multiple of `N` tokens while a prompt prefills, so an interrupted prefill resumes from the last one. A prefill that resumes an interrupted one counts as cold for the prompt node above (only with the interval set): the slot still holds an unfinished cold prefill, the reuse is a disk restore of a whole unit whose length is a multiple of `N` (a checkpoint), or the reuse already reaches into the last user message. A warm or RAM reuse that ends on a multiple of `N` is not a resume |
 | `--slot-save-on-reclaim` | on | the conversation, before a request that does not extend it takes its slot (it diverges at least one block before the slot's end, so a different conversation sharing only a system prompt counts) |
 | (shutdown) | always | every slot's conversation, on a graceful stop |
 
@@ -325,7 +341,8 @@ Per request, `timings` in the response says where the prompt came from:
 
 `GET /props` carries the memory class as the cache handles it, under `auto_cache`: `seq_rm` (`part`,
 `full`, `rs` or `no`), `n_swa`, `rewinds` (a longer unit restores trimmed to the request),
-`side_only_restore` (restore mode 2), `logits_sidecar`, `draft_sidecar` and the settings that shape the
+`side_only_restore` (restore mode 2), `inner_side_skipped` (a chain's inner nodes load their positional
+cells only), `logits_sidecar`, `draft_sidecar` and the settings that shape the
 store (`block`, `incremental`, `deferred`, `node_prompt`, `prefill_interval`). Whether the model writes
 deltas is decided by a probe at the first save and reported by the gauge
 `llamacpp:auto_cache_delta_capable` (0 not probed yet, 1 deltas, 2 whole roots only). The test
@@ -345,7 +362,8 @@ deltas is decided by a probe at the first save and reported by the gauge
 | `auto_cache_restore_miss_identity_total` | misses where a unit of the same model held the prefix under another identity (another rung's RoPE/YaRN settings, cache types, mmproj, LoRA or block size); each logs a WRN naming the fields that differ |
 | `auto_cache_restore_side_only_total` | restores that loaded only a unit's side-state over the slot's own cells (restore mode 2) |
 | `auto_cache_skipped_shared_total` | tasks with a shared prompt prefix (decision tasks) that the cache neither restores nor saves (a WRN at most once a minute) |
-| `auto_cache_evict_bound_exceeded_total` | eviction passes that left the store above a cap because every remaining unit has a live child, is pinned or was just written |
+| `auto_cache_evict_bound_exceeded_total` | eviction passes that could not get the store under a cap by evicting: every remaining unit has a live child, is pinned or was just written. When the just-written unit is a delta whose own chain fills the cap, it is not kept (the save counts as failed) |
+| `auto_cache_prefill_checkpoint_superseded_total` | whole periodic prefill checkpoints removed because a deeper one of the same prefill replaced them |
 | `auto_cache_save_root_total` / `auto_cache_save_delta_total` | whole snapshots / delta nodes written |
 | `auto_cache_save_whole_fallback_total` | saves that would have been deltas, written whole because the memory type cannot write deltas (included in the root count) |
 | `auto_cache_save_bytes_total` | state bytes written by published saves |
@@ -442,13 +460,17 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   changes it every turn and defeats the cache.
 - One store, one cap: `--slot-save-max-mb` is enforced over the whole directory by whichever instance
   saves, so give every pool sharing it the same value.
-- Prefill checkpoints: on a model with a draft (MTP or a draft model) a checkpoint usually has no `.dft`
-  sidecar, because the draft lags the target mid-prefill, so a prefill resumed from one drafts cold until
-  its first response. A checkpoint is durable only once published: one still waiting for its deferred
-  copy (about 10 s during a busy prefill) is lost with the process. Generation is not checkpointed.
-- Restore mode 2 (side-state only) covers the recurrent and hybrid classes on text units. The k-pool
-  indexer classes (GLM-5 next, Qwen3.8-Flash-Next), sliding windows, DeepSeek-V4 and media units restore
-  whole, as before.
+- Prefill checkpoints with a draft (MTP or a draft model): on the CPU MTP test model every checkpoint
+  carries its `.dft` sidecar and a restore through a checkpoint chain comes back draft-warm, at prefill
+  batch sizes from 32 to 512. A real MTP model is checked at the GPU gate. The draft chain loads all or
+  nothing: one node without a `.dft` leaves the restored conversation drafting cold (counted in
+  `auto_cache_restore_draft_cold_total`). A checkpoint is durable only once published: one still
+  waiting for its deferred copy (about 10 s during a busy prefill) is lost with the process. Generation
+  is not checkpointed.
+- Restore mode 2 (side-state only) covers the recurrent and hybrid classes on text units, and the
+  inner-node skip covers the hybrid class. The k-pool indexer classes (GLM-5 next, Qwen3.8-Flash-Next),
+  sliding windows, DeepSeek-V4 and media units restore whole, as before. `--no-slot-restore-selective`
+  turns both off.
 - The eviction is least-recently-used over leaves (a node with a live child is never evicted). There is no
   value model yet: a store-wide system node or a prompt node that has become a leaf ages out like any
   other unit unless restores keep touching it, or it is pinned.
