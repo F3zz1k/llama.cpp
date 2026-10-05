@@ -3767,6 +3767,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_STAGING_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-defer"},
+        {"--no-slot-save-defer"},
+        "auto disk cache: at a save, copy only the side-state (recurrent state, sliding window, indexer and "
+        "compressor state) off the device at once and leave the positional K/V of append-only caches in "
+        "place, copied later while the server is idle, or at once before anything could change those cells. "
+        "Takes the device copy off the request's time to first token; the saved units are byte-identical. "
+        "Needs the background writer (--slot-save-staging-mb > 0); classes with nothing positional copy "
+        "everything at the save as before (default: enabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_defer = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_DEFER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-save-node-system"},
         {"--no-slot-save-node-system"},
         "auto disk cache: publish a node at the end of the leading system context (system and developer "

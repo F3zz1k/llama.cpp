@@ -89,7 +89,15 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // warning, i.e. the behaviour before this lock existed. On Windows it is a no-op for the same reason.
 class auto_store_lock {
 public:
+    // lock scopes open on the calling thread (held or not): a deferred capture's flush must never wait for
+    // the writer inside one, the writer may need the exclusive lock to get there (see aw_def_flush_cb)
+    static int & depth() {
+        static thread_local int d = 0;
+        return d;
+    }
+
     auto_store_lock(const std::string & dir, bool exclusive, int timeout_ms) {
+        depth()++;
 #ifndef _WIN32
         fd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0) {
@@ -123,7 +131,10 @@ public:
         ok = true;
 #endif
     }
-    ~auto_store_lock() { release(); }
+    ~auto_store_lock() {
+        release();
+        depth()--;
+    }
     auto_store_lock(const auto_store_lock &) = delete;
     auto_store_lock & operator=(const auto_store_lock &) = delete;
 
@@ -2029,6 +2040,7 @@ public:
     ~server_context_impl() {
         // the writer touches the index and the counters below; whatever it still holds is abandoned
         aw_stop(ggml_time_ms());
+        aw_def_abandon_all(); // before destroy() frees the contexts the captures reference
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2115,6 +2127,7 @@ private:
         std::atomic<uint64_t> failed{0}, root{0}, delta{0}, bytes{0}, evicted{0}, draft{0}, draft_skipped{0};
         std::atomic<uint64_t> queued{0}, streamed{0}, dropped_staging{0}, orphan_dropped{0}, shutdown_abandoned{0};
         std::atomic<uint64_t> admission_waits{0}, admission_wait_us{0};
+        std::atomic<uint64_t> deferred{0}, deferred_forced{0}, deferred_bytes{0};
         std::atomic<uint64_t> site_requested[AUTO_SAVE_SITE_COUNT] = {};
         std::atomic<uint64_t> site_published[AUTO_SAVE_SITE_COUNT] = {};
     } aw_cnt;
@@ -2158,9 +2171,14 @@ private:
             m.n_auto_save_site_requested[i] = aw_cnt.site_requested[i].load();
             m.n_auto_save_site_published[i] = aw_cnt.site_published[i].load();
         }
+        m.n_auto_save_deferred           = aw_cnt.deferred.load();
+        m.n_auto_save_deferred_forced    = aw_cnt.deferred_forced.load();
+        m.n_auto_save_deferred_bytes     = aw_cnt.deferred_bytes.load();
         std::lock_guard<std::mutex> lk(aw.mtx);
         m.n_auto_save_staging_bytes      = aw.staged;
         m.n_auto_save_queue_depth        = aw.jobs.size();
+        m.n_auto_save_deferred_host      = aw.deferred_host;
+        m.n_auto_save_deferred_pending   = aw.def_count;
     }
 
     // Disk-restore accounting, at the point where the request's cached prefix is final. A restore whose
@@ -3294,6 +3312,8 @@ private:
                                const server_tokens & req, int n_keep_mem) {
         // read the small .meta sidecar (tokens + fp + media records) — never opens the multi-GB
         // state file (invariant 5).
+        // the restore replaces this slot's cells: its deferred copies are emitted first, outside the lock
+        aw_def_force_slot(slot.id, "forced");
         // Shared store lock from this .meta read until the chain is loaded: every .meta read below
         // (the tip here, each parent in auto_build_restore_chain) then describes the .bin loaded for it.
         auto_store_lock rd_lock(std::filesystem::path(cand.state_path).parent_path().string(),
@@ -3754,11 +3774,24 @@ private:
             }
         }
 
+        // 2c) stage 2: when the memory class has positional cells, capture only the side-state now and leave
+        //     the positional K/V in the cache, copied later (aw_def_*). Same bytes, same unit.
+        if (aw_capture_deferred(slot, job, ctx, is_node ? lo_pos : -1, dft_p0, dft_p1, dft_trailer, site)) {
+            return false;
+        }
+
         // 3) admission, then the copy. The job is queued before the copy starts, so a staged job's first
         //    chunks are already being written while the rest is copied.
         const size_t n_total = job->bin.n_expected + job->dft.n_expected + job->logits.size() * sizeof(float);
         FILE * f_bin = nullptr;
         FILE * f_dft = nullptr;
+        if (aw.running && !aw.def.empty()) {
+            // The writer is FIFO and owes the deferred captures first. A save captured at once now would hold
+            // staging the deferred copies ahead of it need to drain (or wait for a writer that waits for them),
+            // so their bytes go first. Only a class or a budget that rules deferral out gets here with copies
+            // pending, so this is rare.
+            aw_def_force_all("wait");
+        }
         if (!aw.running) {
             job->site = site;
             job->mode = aw_mode::sync;
@@ -3898,7 +3931,33 @@ private:
         size_t n_produced = 0;
     };
 
-    enum class aw_mode : uint8_t { staged, streamed, sync };
+    enum class aw_mode : uint8_t { staged, streamed, sync, deferred };
+
+    struct aw_job;
+
+    // the sink the engine copies the state into, one per stream being captured (or emitted, stage 2)
+    struct aw_sink_ctx {
+        server_context_impl * self = nullptr;
+        aw_job *              job  = nullptr;
+        aw_stream *           st   = nullptr;
+        aw_chunk              cur;
+        FILE *                direct   = nullptr; // sync mode: chunks go straight into this temp file
+        bool                  failed   = false;
+        bool                  blocking = true;    // deferred emission: wait for staging room (a forced copy)
+        bool                  paused   = false;   // deferred emission: no room now, continue later
+    };
+
+    // Stage 2: the part of one stream the deferred capture still owes. The engine handle references the
+    // positional K/V still in the cache; `tail` follows the engine's bytes (the .dft trailer).
+    struct aw_def_part {
+        llama_state_deferred * h        = nullptr; // server thread only, freed once emitted
+        std::vector<uint8_t>   tail;
+        size_t                 tail_off = 0;
+        size_t                 host     = 0;       // host bytes the handle holds (counted in aw.deferred_host)
+        bool                   active   = false;
+        bool                   finished = false;
+        aw_sink_ctx            sc;
+    };
 
     struct aw_job {
         int         slot_id = -1;
@@ -3930,6 +3989,20 @@ private:
         int64_t     t_d2h_dft = 0;
         int64_t     t_logits  = 0;
         int64_t     t_enq     = 0;
+        // stage 2 (mode deferred): the positional bytes are emitted after the capture, on the server thread
+        aw_def_part def_bin;
+        aw_def_part def_dft;
+        size_t      n_deferred = 0;                // positional bytes left in the cache at the capture
+        int64_t     t_emit     = 0;                // time spent emitting them
+        int64_t     t_emitted  = 0;                // when the last byte was emitted (us)
+        int         n_forced   = 0;                // times a cache mutation forced the copy
+        const char * def_how   = "";               // what finished the copy: idle, trickle, forced, wait, sleep, shutdown
+
+        ~aw_job() {
+            // normally freed (on the server thread) as soon as emitted; only a teardown leaves one here
+            llama_state_deferred_free(def_bin.h);
+            llama_state_deferred_free(def_dft.h);
+        }
     };
 
     struct aw_state {
@@ -3957,6 +4030,14 @@ private:
         int64_t                 shutdown_ms    = 90 * 1000;
         int64_t                 stall_ms       = 60 * 1000;
         int64_t                 last_reap_ms   = -1;
+        // stage 2: deferred captures still owing positional bytes, FIFO (server thread only)
+        std::deque<std::shared_ptr<aw_job>> def;
+        size_t                  deferred_host  = 0;     // host bytes held by deferred captures (guarded by mtx)
+        size_t                  def_count      = 0;     // def.size(), for the metrics (guarded by mtx)
+        bool                    defer          = false; // --slot-save-defer, with the writer running
+        bool                    defer_idle     = true;  // test hook: false holds deferred copies until forced
+        int64_t                 defer_trickle_ms = 10 * 1000; // a copy pending this long is trickled while busy
+        int64_t                 def_retry_ms   = -1;    // the idle emission found no staging room: retry then
     } aw;
 
     static constexpr size_t  AW_MAX_CHUNK            = 64u << 20;
@@ -3966,6 +4047,9 @@ private:
     static constexpr int64_t AW_PENDING_WAIT_MS      = 30 * 1000;  // a new task waits this long for a queued prefix
     static constexpr int64_t AW_STALL_MS             = 60 * 1000;  // a writer silent this long is treated as hung
     static constexpr int64_t AW_IDLE_RETRY_MS        = 200;        // a deferred idle flush re-checks this often
+    static constexpr size_t  AW_DEF_IDLE_SLICE       = 64u << 20;  // deferred bytes emitted per idle wakeup
+    static constexpr size_t  AW_DEF_TRICKLE_SLICE    = 8u << 20;   // ... per busy loop iteration, once overdue
+    static constexpr int64_t AW_DEF_RETRY_MS         = 5;          // idle emission without staging room re-checks this often
 
     static int64_t aw_env_i64(const char * name, int64_t def) {
         const char * v = getenv(name);
@@ -3985,15 +4069,23 @@ private:
         aw.reap_age_s     = aw_env_i64("LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S", 600);
         aw.shutdown_ms    = aw_env_i64("LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS", AW_SHUTDOWN_DEADLINE_MS);
         aw.stall_ms       = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS", AW_STALL_MS);
+        aw.defer_idle       = aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_NO_IDLE", 0) == 0;
+        aw.defer_trickle_ms = aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS", 10 * 1000);
+        if (aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_NO_HOOK", 0) != 0) {
+            // test hook, the positive control: a mutation no longer forces a pending copy
+            llama_state_deferred_set_hook_enabled(false);
+            SRV_WRN("%s", "auto disk cache: TEST HOOK: the flush-on-mutate hook is disabled\n");
+        }
         auto_reap_dead_temps();
         if (aw.budget == 0) {
             SRV_INF("%s", "auto disk cache: saves are published on the server thread (--slot-save-staging-mb 0)\n");
             return;
         }
         aw.running = true;
+        aw.defer   = params_base.slot_save_defer;
         aw.th = std::thread([this]() { aw_loop(); });
-        SRV_INF("auto disk cache: background writer started, staging budget %zu MiB, chunk %zu KiB\n",
-                aw.budget >> 20, aw.chunk >> 10);
+        SRV_INF("auto disk cache: background writer started, staging budget %zu MiB, chunk %zu KiB, positional copy %s\n",
+                aw.budget >> 20, aw.chunk >> 10, aw.defer ? "deferred (stage 2)" : "at the capture");
     }
 
     // Closes the queue and joins the writer. What is still queued at `deadline_ms` is abandoned: the
@@ -4030,16 +4122,6 @@ private:
 
     // ---- capture side (server thread) -----------------------------------------------------------------
 
-    // the sink the engine copies the state into, one per stream being captured
-    struct aw_sink_ctx {
-        server_context_impl * self = nullptr;
-        aw_job *              job  = nullptr;
-        aw_stream *           st   = nullptr;
-        aw_chunk              cur;
-        FILE *                direct = nullptr; // sync mode: chunks go straight into this temp file
-        bool                  failed = false;
-    };
-
     // hand a filled chunk to the consumer (the writer, or the temp file in sync mode)
     void aw_push_chunk(aw_sink_ctx & sc) {
         if (sc.cur.n == 0) {
@@ -4055,6 +4137,9 @@ private:
         {
             std::lock_guard<std::mutex> lk(aw.mtx);
             sc.st->chunks.push_back(std::move(sc.cur));
+            if (sc.job->mode == aw_mode::deferred) {
+                aw.last_progress_ms = ggml_time_ms(); // a writer waiting for a deferred copy is not stalled
+            }
         }
         sc.cur = {};
         aw.cv.notify_all();
@@ -4113,7 +4198,34 @@ private:
                 return sc.cur.buf.get();
             }
             const size_t cap = std::clamp<size_t>(left, 1, aw.chunk);
-            if (sc.job->mode == aw_mode::streamed) {
+            if (sc.job->mode == aw_mode::deferred) {
+                // stage 2: chunks in flight share the staging budget; a forced copy waits for room like a
+                // streamed save, an idle one pauses and continues on a later wakeup
+                std::unique_lock<std::mutex> lk(aw.mtx);
+                const size_t room = std::max(aw.budget, 2 * aw.chunk);
+                auto fits = [&]() { return aw.staged == 0 || aw.staged + cap <= room; };
+                if (!fits() && !sc.blocking) {
+                    sc.paused = true;
+                    return nullptr;
+                }
+                bool stalled = false;
+                while (!aw.cv.wait_for(lk, std::chrono::milliseconds(500),
+                                       [&]() { return fits() || sc.st->aborted || aw_past_deadline(); })) {
+                    if (aw_stalled_locked()) {
+                        stalled = true;
+                        break;
+                    }
+                }
+                if (stalled || sc.st->aborted || aw_past_deadline()) {
+                    if (stalled) {
+                        SRV_WRN("slot %d: auto-save: the background writer made no progress for %" PRId64 " ms, "
+                                "abandoning a deferred save\n", sc.job->slot_id, aw.stall_ms);
+                    }
+                    sc.failed = true;
+                    return nullptr;
+                }
+                aw.staged += cap;
+            } else if (sc.job->mode == aw_mode::streamed) {
                 // the ring of two chunks: wait for the writer to drain it, never past the shutdown deadline
                 std::unique_lock<std::mutex> lk(aw.mtx);
                 const size_t ring = 2 * aw.chunk;
@@ -4137,7 +4249,7 @@ private:
             }
             sc.cur.buf.reset(new (std::nothrow) uint8_t[cap]);
             if (!sc.cur.buf) {
-                if (sc.job->mode == aw_mode::streamed) {
+                if (sc.job->mode == aw_mode::streamed || sc.job->mode == aw_mode::deferred) {
                     {
                         std::lock_guard<std::mutex> lk(aw.mtx);
                         aw.staged -= std::min(aw.staged, cap); // the ring slot this chunk reserved
@@ -4325,6 +4437,329 @@ private:
             }
         }
         return n;
+    }
+
+    // ---- stage 2: deferred positional copies (server thread) ------------------------------------------
+    //
+    // A capture whose memory class has positional cells (llama_state_seq_get_size_deferred: cells of an
+    // append-only cache, never side-state) copies only the side-state and metadata at the capture and keeps
+    // a reference to the rest (llama_state_seq_save_deferred). The job is queued like any other, in mode
+    // `deferred`, and its streams are fed later on the server thread, in FIFO order:
+    //   - idle: the queue loop's idle wakeups emit AW_DEF_IDLE_SLICE at a time, pausing when the staging is
+    //     full, so a task arriving meanwhile is served at once;
+    //   - trickle: a copy still pending defer_trickle_ms after its capture gets AW_DEF_TRICKLE_SLICE per
+    //     busy loop iteration, so a long generation cannot hold a unit back indefinitely;
+    //   - forced: before anything changes a referenced cell (the flush-on-mutate hook in the engine calls
+    //     aw_def_flush_cb), when a capture or a task must wait for the writer, and before sleep, shutdown
+    //     or a restore into the slot.
+    // The engine only reads the device with ggml_backend_tensor_get, on every backend. Units are byte for
+    // byte what an immediate capture writes. Side-state held by pending captures is bounded by the staging
+    // budget (aw.deferred_host); chunks in flight share the budget with staged saves (aw.staged).
+
+    // Captures `job` deferred and queues it. Returns false (nothing done) when the class, the mode or the
+    // budget rules it out: the caller then captures it at once (stage 1).
+    bool aw_capture_deferred(server_slot & slot, const std::shared_ptr<aw_job> & job, llama_context * ctx,
+                             llama_pos p0, llama_pos dft_p0, llama_pos dft_p1, const std::vector<uint8_t> & dft_trailer,
+                             auto_save_site site) {
+        if (!aw.running || !aw.defer || aw.shutdown || delta_capable == delta_cap::no) {
+            return false;
+        }
+        const llama_tokens & toks = *job->toks;
+        size_t n_def = 0;
+        const size_t n_q = llama_state_seq_get_size_deferred(ctx, slot.id, p0, -1, toks.size(), &n_def);
+        if (n_q != job->bin.n_expected || n_def == 0) {
+            return false; // nothing positional in this class (or a size mismatch: stage 1 decides)
+        }
+        size_t n_def_dft = 0, n_q_dft = 0;
+        if (job->has_dft) {
+            n_q_dft = llama_state_seq_get_size_deferred(ctx_dft, slot.id, dft_p0, dft_p1, toks.size(), &n_def_dft);
+        }
+        const size_t n_host = (n_q - n_def) + (job->has_dft ? n_q_dft - n_def_dft : 0);
+        if (n_host > aw.budget) {
+            return false; // the side-state alone exceeds the budget: copy at once, streamed
+        }
+        // side-state held by pending captures stays within the budget: older captures go first if needed
+        while (!aw.def.empty()) {
+            size_t held = 0;
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                held = aw.deferred_host;
+            }
+            if (held + n_host <= aw.budget) {
+                break;
+            }
+            aw_def_force_front("wait");
+        }
+
+        const int64_t t0 = ggml_time_us();
+        llama_state_deferred * hb = llama_state_seq_save_deferred(ctx, slot.id, p0, -1, toks.data(), toks.size());
+        if (hb == nullptr || llama_state_deferred_size(hb) != job->bin.n_expected) {
+            llama_state_deferred_free(hb);
+            return false;
+        }
+        job->t_d2h_tgt = ggml_time_us() - t0;
+        llama_state_deferred * hd = nullptr;
+        if (job->has_dft) {
+            const int64_t t1 = ggml_time_us();
+            hd = llama_state_seq_save_deferred(ctx_dft, slot.id, dft_p0, dft_p1, toks.data(), toks.size());
+            if (hd == nullptr || llama_state_deferred_size(hd) + dft_trailer.size() != job->dft.n_expected) {
+                llama_state_deferred_free(hd);
+                hd = nullptr;
+                job->has_dft = false; // the unit restores with a cold draft
+                aw_cnt.draft_skipped++;
+                SLT_DBG(slot, "auto-save: no draft sidecar for this unit (the draft capture failed)%s\n", "");
+            }
+            job->t_d2h_dft = ggml_time_us() - t1;
+        }
+
+        job->site       = site;
+        job->mode       = aw_mode::deferred;
+        job->n_deferred = llama_state_deferred_n_deferred(hb) + (hd ? llama_state_deferred_n_deferred(hd) : 0);
+        auto arm = [&](aw_def_part & dp, aw_stream & st, llama_state_deferred * h) {
+            dp.h         = h;
+            dp.active    = true;
+            dp.host      = llama_state_deferred_size(h) - llama_state_deferred_n_deferred(h);
+            dp.sc.self   = this;
+            dp.sc.job    = job.get();
+            dp.sc.st     = &st;
+            llama_state_deferred_set_flush_cb(h, aw_def_flush_cb, this);
+        };
+        arm(job->def_bin, job->bin, hb);
+        if (hd) {
+            arm(job->def_dft, job->dft, hd);
+            job->def_dft.tail = dft_trailer;
+        }
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            aw.deferred_host += job->def_bin.host + job->def_dft.host;
+            job->t_enq = ggml_time_us();
+            aw.queued_bytes += job->bin.n_expected + job->dft.n_expected;
+            if (aw_idle_locked()) {
+                aw.last_progress_ms = ggml_time_ms();
+            }
+            aw.jobs.push_back(job);
+            aw.def_count++;
+        }
+        aw.cv.notify_all();
+        aw.def.push_back(job);
+        aw_cnt.queued++;
+        aw_cnt.deferred++;
+        aw_cnt.deferred_bytes += job->n_deferred;
+        return true;
+    }
+
+    // the handle's host bytes leave the deferred budget once it is emitted
+    void aw_def_release_part(aw_def_part & dp) {
+        if (dp.h) {
+            llama_state_deferred_free(dp.h);
+            dp.h = nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            aw.deferred_host -= std::min(aw.deferred_host, dp.host);
+        }
+        dp.host = 0;
+    }
+
+    void aw_def_end_part(aw_def_part & dp, aw_stream & st, bool ok) {
+        if (dp.finished) {
+            return;
+        }
+        aw_def_release_part(dp);
+        dp.finished = true;
+        aw_finish_stream(st, ok);
+    }
+
+    // Emits what one part still owes. Returns true when the part is finished (completely, or failed).
+    bool aw_def_step_part(aw_def_part & dp, aw_stream & st, bool blocking, size_t max, size_t & n) {
+        if (!dp.active || dp.finished) {
+            return true;
+        }
+        aw_sink_ctx & sc = dp.sc;
+        sc.blocking = blocking;
+        sc.paused   = false;
+        if (dp.h) {
+            if (max != 0 && n >= max) {
+                return false;
+            }
+            const llama_state_sink sink = { aw_sink_reserve, aw_sink_commit, &sc };
+            bool done = false;
+            n += llama_state_deferred_emit(dp.h, &sink, max != 0 ? max - n : 0, &done);
+            if (sc.failed) {
+                aw_def_end_part(dp, st, false);
+                return true;
+            }
+            if (!done) {
+                return false;
+            }
+            aw_def_release_part(dp);
+        }
+        while (dp.tail_off < dp.tail.size()) {
+            size_t avail = 0;
+            void * dst = aw_reserve(sc, dp.tail.size() - dp.tail_off, &avail);
+            if (dst == nullptr) {
+                if (sc.failed) {
+                    aw_def_end_part(dp, st, false);
+                    return true;
+                }
+                return false;
+            }
+            memcpy(dst, dp.tail.data() + dp.tail_off, avail);
+            aw_sink_commit(&sc, avail);
+            dp.tail_off += avail;
+            n           += avail;
+        }
+        if (sc.cur.n > 0) {
+            aw_push_chunk(sc);
+        }
+        aw_def_end_part(dp, st, !sc.failed && st.n_produced == st.n_expected);
+        return true;
+    }
+
+    // Advances one deferred job (.bin first: the writer consumes it before the .dft). True when finished.
+    bool aw_def_step_job(aw_job & job, bool blocking, size_t max, size_t & n) {
+        const int64_t t0 = ggml_time_us();
+        bool fin = aw_def_step_part(job.def_bin, job.bin, blocking, max, n);
+        if (fin && job.def_bin.finished && !job.def_dft.finished && job.def_dft.active) {
+            if (job.bin.aborted) {
+                aw_def_end_part(job.def_dft, job.dft, false); // the writer drops the unit, the draft with it
+            } else {
+                fin = aw_def_step_part(job.def_dft, job.dft, blocking, max, n);
+            }
+        }
+        job.t_emit += ggml_time_us() - t0;
+        if (fin) {
+            job.t_emitted = ggml_time_us();
+            if (job.bin.aborted) {
+                SRV_WRN("slot %d: auto-save: the deferred copy of a %zu-token unit failed, it is not published\n",
+                        job.slot_id, job.toks->size());
+            }
+        }
+        return fin;
+    }
+
+    // Advances the deferred jobs in FIFO order (the writer consumes them in that order): blocking until
+    // `upto` is finished (or every job when upto is null), or without blocking for at most `max` bytes.
+    // Returns the bytes emitted.
+    size_t aw_def_drive(bool blocking, size_t max, const aw_job * upto, const char * how) {
+        size_t n = 0;
+        if (blocking && !aw.def.empty()) {
+            // the writer has been waiting for these bytes, not hung: its silence so far is not a stall
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            aw.last_progress_ms = ggml_time_ms();
+        }
+        while (!aw.def.empty()) {
+            std::shared_ptr<aw_job> job = aw.def.front();
+            if (!aw_def_step_job(*job, blocking, max, n)) {
+                break; // no staging room (idle) or the slice is used up
+            }
+            job->def_how = how;
+            aw.def.pop_front();
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                aw.def_count = aw.def.size();
+            }
+            if (job.get() == upto || (max != 0 && n >= max)) {
+                break;
+            }
+        }
+        return n;
+    }
+
+    void aw_def_force_all(const char * how) {
+        if (!aw.def.empty()) {
+            aw_def_drive(/*blocking=*/true, 0, nullptr, how);
+        }
+    }
+
+    void aw_def_force_front(const char * how) {
+        if (!aw.def.empty()) {
+            aw_def_drive(/*blocking=*/true, 0, aw.def.front().get(), how);
+        }
+    }
+
+    // every deferred capture of `slot_id` (and, FIFO, those before it) before its cells are replaced
+    void aw_def_force_slot(int slot_id, const char * how) {
+        const aw_job * last = nullptr;
+        for (const auto & j : aw.def) {
+            if (j->slot_id == slot_id) {
+                last = j.get();
+            }
+        }
+        if (last) {
+            aw_def_drive(/*blocking=*/true, 0, last, how);
+        }
+    }
+
+    // The engine's flush-on-mutate hook: a cache operation is about to change cells this capture still
+    // references. Small remainders (within the deferred budget) are copied into host memory the capture owns,
+    // which never waits for the writer; larger ones are emitted now, FIFO, waiting for staging room, exactly
+    // like a stage-1 streamed save. Inside a store-lock scope nothing may wait for the writer (it may need the
+    // exclusive lock to drain), so the engine's host copy is used there regardless.
+    static bool aw_def_flush_cb(void * ud, llama_state_deferred * h) {
+        return ((server_context_impl *) ud)->aw_def_flush(h);
+    }
+
+    bool aw_def_flush(llama_state_deferred * h) {
+        aw_job * job = nullptr;
+        aw_def_part * part = nullptr;
+        for (const auto & j : aw.def) {
+            if (j->def_bin.h == h) {
+                job = j.get(); part = &j->def_bin;
+            } else if (j->def_dft.h == h) {
+                job = j.get(); part = &j->def_dft;
+            }
+        }
+        if (job == nullptr) {
+            return false;
+        }
+        job->n_forced++;
+        aw_cnt.deferred_forced++;
+        const size_t pend = llama_state_deferred_n_pending(h);
+        size_t held = 0;
+        {
+            std::lock_guard<std::mutex> lk(aw.mtx);
+            held = aw.deferred_host;
+        }
+        if (auto_store_lock::depth() > 0 || !aw.running || held + pend <= aw.budget) {
+            // the engine copies the rest into the capture's own host memory: account for it
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                aw.deferred_host += pend;
+            }
+            part->host += pend;
+            return false;
+        }
+        aw_def_drive(/*blocking=*/true, 0, job, "forced");
+        return true;
+    }
+
+    // idle wakeup: one slice, never waiting for the writer
+    void aw_def_idle_step() {
+        const size_t n = aw_def_drive(/*blocking=*/false, AW_DEF_IDLE_SLICE, nullptr, "idle");
+        aw.def_retry_ms = n == 0 && !aw.def.empty() ? ggml_time_ms() + AW_DEF_RETRY_MS : -1;
+    }
+
+    // busy loop: an overdue copy advances a little per iteration
+    void aw_def_trickle() {
+        if (aw.def.empty() || aw.defer_trickle_ms < 0) {
+            return;
+        }
+        if (ggml_time_us() - aw.def.front()->t_enq < aw.defer_trickle_ms * 1000) {
+            return;
+        }
+        aw_def_drive(/*blocking=*/false, AW_DEF_TRICKLE_SLICE, nullptr, "trickle");
+    }
+
+    // teardown after the writer stopped: the captures are dropped (their jobs were abandoned)
+    void aw_def_abandon_all() {
+        for (auto & job : aw.def) {
+            aw_def_end_part(job->def_bin, job->bin, false);
+            aw_def_end_part(job->def_dft, job->dft, false);
+        }
+        aw.def.clear();
+        std::lock_guard<std::mutex> lk(aw.mtx);
+        aw.def_count = 0;
     }
 
     // ---- publish side (writer thread, or the server thread in sync mode) -------------------------------
@@ -4775,7 +5210,14 @@ private:
                 aw_cnt.draft++;
             }
         }
-        const char * mode = job.mode == aw_mode::staged ? "staged" : job.mode == aw_mode::streamed ? "streamed" : "sync";
+        const char * mode = job.mode == aw_mode::staged ? "staged" : job.mode == aw_mode::streamed ? "streamed" :
+                            job.mode == aw_mode::deferred ? "deferred" : "sync";
+        char defer_info[160] = "";
+        if (job.mode == aw_mode::deferred) {
+            snprintf(defer_info, sizeof(defer_info), ", positional %zu B copied %.1f ms after the capture (copy %.1f ms, %s%s)",
+                     job.n_deferred, std::max<int64_t>(0, job.t_emitted - job.t_enq) / 1000.0, job.t_emit / 1000.0,
+                     job.def_how, job.n_forced > 0 ? ", forced by a cache mutation" : "");
+        }
         char what[64];
         if (job.media.empty()) {
             snprintf(what, sizeof(what), "%zu tokens", job.toks->size());
@@ -4783,11 +5225,11 @@ private:
             snprintf(what, sizeof(what), "%zu cells incl. %zu media chunks", job.toks->size(), job.media.size());
         }
         SRV_INF("slot %d: auto-save: persisted %s to %s (%s, %zu B: capture d2h %.1f ms [tgt %.1f / dft %.1f / logits %.1f], "
-                "queue-wait %.1f ms, write %.1f ms, fdatasync %.1f ms, publish %.1f ms, evict %.1f ms, mode %s)\n",
+                "queue-wait %.1f ms, write %.1f ms, fdatasync %.1f ms, publish %.1f ms, evict %.1f ms, mode %s%s)\n",
                 job.slot_id, what, fname.c_str(), job.is_node ? "delta" : "root", job.bin.n_expected,
                 (job.t_d2h_tgt + job.t_d2h_dft + job.t_logits) / 1000.0, job.t_d2h_tgt / 1000.0, job.t_d2h_dft / 1000.0,
                 job.t_logits / 1000.0, sync ? 0.0 : (t_start - job.t_enq) / 1000.0,
-                t_write / 1000.0, t_sync / 1000.0, t_pub / 1000.0, t_evict / 1000.0, mode);
+                t_write / 1000.0, t_sync / 1000.0, t_pub / 1000.0, t_evict / 1000.0, mode, defer_info);
         finish();
     }
 
@@ -5309,6 +5751,7 @@ private:
                 auto_save_slot_if_useful(slots[i], AUTO_SAVE_SITE_SHUTDOWN);
             }
         }
+        aw_def_force_all("shutdown"); // pending deferred copies, before the writer is closed
         aw_stop(t_deadline_ms);
     }
 
@@ -5327,6 +5770,10 @@ private:
     // pending. Called by the queue loop to bound its idle wait. A slot with no prior task (never ran)
     // or already flushed for its current idle period contributes nothing.
     int64_t auto_idle_next_deadline() {
+        if (!aw.def.empty() && aw.defer_idle) {
+            // a deferred copy is pending: wake at once (or shortly, when the last wakeup found no room)
+            return std::max(ggml_time_ms(), aw.def_retry_ms);
+        }
         if (!auto_idle_flush_enabled()) {
             return -1;
         }
@@ -5354,6 +5801,11 @@ private:
     // passed, so the wait returns at once). auto_save_slot_if_useful carries every correctness gate
     // and its dedup makes a repeat flush free.
     void auto_idle_flush() {
+        if (!aw.def.empty() && aw.defer_idle) {
+            // deferred copies first, one slice per wakeup: they are older than any idle flush
+            aw_def_idle_step();
+            return;
+        }
         if (!auto_idle_flush_enabled()) {
             return;
         }
@@ -5423,6 +5875,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            aw_def_force_all("sleep"); // the context is freed next
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -7361,6 +7814,7 @@ private:
                     // format, so it keeps the fork path, which composes delta chains and rebuilds media
                     // from the sidecar. Every other file takes upstream's body below, unchanged.
                     std::error_code meta_ec;
+                    aw_def_force_slot(id_slot, "forced"); // the restore replaces the slot's cells
                     if (std::filesystem::exists(slot_meta_sidecar_path(filepath), meta_ec) && !meta_ec) {
                         // shared store lock until the chain and its media sidecar are read (auto_store_lock)
                         auto_store_lock rd_lock(std::filesystem::path(filepath).parent_path().string(),
@@ -7648,6 +8102,7 @@ private:
 #endif
 
     void update_slots() {
+        aw_def_trickle(); // an overdue deferred copy advances a slice per iteration
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -8998,6 +9453,10 @@ private:
                 }
             });
 
+            if (n_aw_deferred > 0 && !aw.def.empty()) {
+                // a task waits for a queued prefix: the writer cannot publish it before the deferred copies
+                aw_def_force_all("wait");
+            }
             if (n_aw_deferred > 0 && batch.size() == 0) {
                 // nothing else to decode: wait briefly for the writer instead of spinning the loop (the queue
                 // loop re-runs update_slots at once, and new tasks are taken between iterations)

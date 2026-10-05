@@ -992,6 +992,11 @@ struct server_metrics {
     uint64_t n_auto_save_queue_depth        = 0; // gauge: saves queued or being written
     uint64_t n_auto_save_admission_waits    = 0; // saves whose capture waited for the writer (staging full, writer busy)
     uint64_t n_auto_save_admission_wait_us  = 0; // total time those captures waited
+    uint64_t n_auto_save_deferred           = 0; // saves captured deferred (stage 2): positional K/V copied after the capture
+    uint64_t n_auto_save_deferred_forced    = 0; // times a cache mutation forced a pending deferred copy
+    uint64_t n_auto_save_deferred_bytes     = 0; // positional bytes those captures left in the cache
+    uint64_t n_auto_save_deferred_pending   = 0; // gauge: deferred captures still owing positional bytes
+    uint64_t n_auto_save_deferred_host      = 0; // gauge: host bytes (side-state) held by those captures
     uint64_t n_auto_save_site_requested[AUTO_SAVE_SITE_COUNT] = {}; // units a save site decided to write
     uint64_t n_auto_save_site_published[AUTO_SAVE_SITE_COUNT] = {}; // of those, published (requested - published = lost)
     uint64_t n_auto_restore_draft_warm     = 0; // disk restores that brought the draft back from sidecars

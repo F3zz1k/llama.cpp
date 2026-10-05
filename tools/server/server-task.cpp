@@ -1710,6 +1710,21 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_auto_save_admission_wait_us / 1e6
         },
         {
+            "auto_cache_save_deferred_total",
+            "Auto disk KV cache: saves whose positional K/V was copied after the capture (stage 2); only the side-state was copied at the capture",
+            (double) metrics.n_auto_save_deferred
+        },
+        {
+            "auto_cache_save_deferred_forced_total",
+            "Auto disk KV cache: times a cache mutation (rewind, clear, shift, load, slot reuse, sleep) forced a pending deferred copy first",
+            (double) metrics.n_auto_save_deferred_forced
+        },
+        {
+            "auto_cache_save_deferred_bytes_total",
+            "Auto disk KV cache: positional bytes deferred captures left in the cache to copy later",
+            (double) metrics.n_auto_save_deferred_bytes
+        },
+        {
             "auto_cache_save_orphan_dropped_total",
             "Auto disk KV cache: queued deltas dropped because their parent failed to publish or left the store; each logs a WRN",
             (double) metrics.n_auto_save_orphan_dropped
@@ -1750,6 +1765,14 @@ std::string server_task_result_metrics::to_metrics() {
             "auto_cache_save_queue_depth",
             "Auto disk KV cache: saves queued for the background writer or being written",
             (double) metrics.n_auto_save_queue_depth
+        }, {
+            "auto_cache_save_deferred_pending",
+            "Auto disk KV cache: deferred captures still owing positional bytes",
+            (double) metrics.n_auto_save_deferred_pending
+        }, {
+            "auto_cache_save_deferred_host_bytes",
+            "Auto disk KV cache: host bytes (side-state) held by deferred captures not yet emitted",
+            (double) metrics.n_auto_save_deferred_host
         },
     };
 

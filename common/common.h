@@ -738,6 +738,7 @@ struct common_params {
     // device and its write; a save that does not fit streams through two chunks when the writer is idle and
     // is dropped (and counted) when it is busy. 0 writes every save on the server thread instead.
     int32_t slot_save_staging_mb = 1024;
+    bool    slot_save_defer      = true;  // stage 2: copy positional K/V after the capture (side-state at once)
     // checkpoint triggers of the auto disk cache: which moments publish a node (docs/disk-cache.md).
     // The conversation itself is saved on idle (slot_save_idle_seconds), on reclaim and at shutdown.
     bool    slot_save_node_system   = true;  // node at the end of the leading system context (chat template preamble end
