@@ -91,6 +91,7 @@ class ServerProcess:
     slot_save_node_response: bool | None = None  # None = server default (off)
     slot_save_node_tool: bool | None = None      # None = server default (off)
     slot_save_on_reclaim: bool | None = None     # None = server default (on)
+    slot_save_prefill_interval: int | None = None  # None = server default (0, off)
     id_slot: int | None = None
     cache_prompt: bool | None = None
     n_slots: int | None = None
@@ -275,6 +276,8 @@ class ServerProcess:
                 server_args.append(f"--{flag}" if value else f"--no-{flag}")
         if self.slot_save_node_prompt is not None:
             server_args.extend(["--slot-save-node-prompt", self.slot_save_node_prompt])
+        if self.slot_save_prefill_interval is not None:
+            server_args.extend(["--slot-save-prefill-interval", self.slot_save_prefill_interval])
         if self.n_ga:
             server_args.extend(["--grp-attn-n", self.n_ga])
         if self.n_ga_w:
