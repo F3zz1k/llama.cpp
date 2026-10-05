@@ -247,6 +247,23 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                  --splits 130,200,300,401 --nctx-a 1024 --nctx-b 2048)
         set_tests_properties(test-delta-bytes-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
     endforeach()
+    # Deferred capture (the background writer's stage 2): a unit whose positional K/V is copied later must be
+    # byte-identical to one captured at once, and every mutation of the captured cells must force the copy
+    # first (with a positive control that disables the hook). One run per memory class; the second field
+    # says whether the class has positional cells to defer (1) or copies everything at the capture (0).
+    llama_build(test-state-deferred.cpp)
+    set(STATE_DEFERRED_CLASSES
+        "llama-dense|1" "gemma3-dense|1" "mamba-dense|0" "qwen35-dense|1" "glm5-next-moe|1" "qwen4exp-moe|1"
+        "glm-dsa-moe|1" "deepseek32-moe|1" "hy_v4-moe|1" "minimax-m3-moe|1" "dots3note-moe|1" "deepseek4-moe|0")
+    foreach(case ${STATE_DEFERRED_CLASSES})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 expect)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-${model}")
+        llama_test(test-state-deferred NAME test-state-deferred-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-${model}" --expect-deferred ${expect})
+        set_tests_properties(test-state-deferred-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
     # DeepSeek-V4: chains long enough for HCA rows (ratio 128) to be written by deltas starting past row
     # 0, at block-aligned and unaligned starts, across a rung where the HCA cache size itself changes,
     # and with an MTP-style rollback whose drafts complete an HCA block
