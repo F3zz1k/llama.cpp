@@ -355,29 +355,45 @@ def test_incremental_requires_auto_at_startup():
 
 def test_eviction_never_removes_node_with_live_child():
     """(U7.7) A base whose delta child is still on disk is never evicted, even when the count cap
-    would otherwise be exceeded. With a cap of 1 and a root+delta pair, the just-written delta is
-    protected as just_written and the root is protected as its live parent, so the store is left
-    (correctly) above the cap with BOTH files intact rather than deleting the base out from under
-    its child."""
+    would otherwise be exceeded. With a cap of 1 and a root, the next turn's delta cannot fit: the
+    root cannot go while the delta is its live child, and the delta's own chain is all that blocks
+    the cap. The delta is therefore NOT kept (counted as a failed save and as a pass that could not
+    meet the cap), the base stays intact, and the store stays within its cap. (Before 2026-10-05 the
+    delta was kept and the store left above the cap; the review of the periodic prefill checkpoints
+    asked for the cap to hold, since a long checkpoint chain otherwise grows without bound.)"""
     global server
     server = _make_server(incremental=True)
     server.slot_save_max_count = 1
+    server.server_metrics = True
     server.start()
 
     _complete(server, P1, n_predict=0)
     m1 = _wait_for_metas(1, IDLE_SECONDS + 12)
     assert len(m1) == 1
 
-    _complete(server, P2A)
-    metas = _wait_for_metas(2, IDLE_SECONDS + 12)
-    server.stop()
+    def _metric(name):
+        res = server.make_request("GET", "/metrics")
+        for line in res.body.splitlines():
+            if line.startswith(f"llamacpp:{name} "):
+                return float(line.split()[1])
+        raise AssertionError(name)
 
+    _complete(server, P2A)
+    deadline = time.time() + IDLE_SECONDS + 12
+    while time.time() < deadline and _metric("auto_cache_evict_bound_exceeded_total") < 1:
+        time.sleep(0.25)
+    bound = _metric("auto_cache_evict_bound_exceeded_total")
+    delta_published = _metric("auto_cache_save_delta_total")
+    server.stop()
+    metas = _metas()
+
+    assert bound >= 1, "the delta that only its own chain kept above the cap was not reported"
     roots = _roots(metas)
     deltas = _deltas(metas)
-    assert len(roots) == 1 and len(deltas) == 1, \
-        "cap=1 must NOT evict the base while its delta child is live (both survive)"
+    assert len(roots) == 1 and len(deltas) == 0, (roots, deltas)
+    assert metas == m1, "the base root must be the unit left in the store"
     assert os.path.exists(_bin_for(roots[0])), "the base root .bin was wrongly evicted"
-    assert os.path.exists(_bin_for(deltas[0])), "the delta .bin was wrongly evicted"
+    assert delta_published == 0
 
 
 # --- (8) SWA model: incremental save+restore spanning > the sliding window -----

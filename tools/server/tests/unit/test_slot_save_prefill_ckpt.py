@@ -136,7 +136,12 @@ def _assert_equals_cold(name: str, prompt, body, extra: dict | None = None):
     worst = 0.0
     for dr, dc in zip(_dist(body), _dist(cold)):
         for k, v in dr.items():
-            assert k in dc, f"token {k} in the restored top-8 but not in the cold one"
+            if k not in dc:
+                # a near-tie at the edge of the top 8 (a different batch split moves the last digits): allowed only
+                # when the token sits within TOL of the cold list's last entry, i.e. it is the same distribution
+                edge = min(dc.values())
+                assert v <= edge + TOL, f"token {k} ({v}) in the restored top-8 but not in the cold one (edge {edge})"
+                continue
             worst = max(worst, abs(v - dc[k]))
     assert worst < TOL, f"restored logprobs differ from cold by {worst}"
 
