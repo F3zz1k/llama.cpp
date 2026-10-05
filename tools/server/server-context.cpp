@@ -1419,6 +1419,9 @@ struct server_slot {
     int32_t logits_last_n_tokens = -1;
     // Logits loaded from a sidecar at SLOT_RESTORE, consumed once by the restore-continue path.
     std::vector<float> restored_logits; // size n_vocab when a valid sidecar was loaded, else empty
+    // the token count those logits follow: a restore that is then trimmed (a plain-attention or whole-window
+    // SWA unit rewound to a shorter request) must not emit from the unit's logits
+    int32_t restored_logits_n = -1;
 
     stop_type stop;
 
@@ -2487,9 +2490,23 @@ private:
     // unit would otherwise re-decode the whole prompt to obtain the last token's logits. RS is what a
     // hybrid model becomes as soon as a draft (MTP) asks for rollback rows, so without it here the same
     // request costs nothing with MTP off and a full prefill with MTP on.
+    //
+    // Every class now (Q5 (a)): NO (DeepSeek-V4's compressed caches) cannot rewind at all and needs it as much
+    // as FULL and RS do; a sliding window past one window and plain attention could rewind by one token and
+    // re-decode it, but with the sidecar an exact resend of a saved unit emits its first token with no decode
+    // on every class, so a resend costs the same whatever the model. The cost is one n_vocab float row per
+    // unit on disk and its copy at each sampled token while --slot-save-path is set.
     bool logits_sidecar_class() const {
+        return true;
+    }
+
+    // The manual /slots save keeps upstream's behaviour for the classes that rewind by one token (an exact
+    // resend after a manual restore re-decodes that token, as upstream does) and writes the sidecar only where
+    // a resend could not continue without it: FULL, RS and NO.
+    bool logits_sidecar_manual() const {
         return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
     // An SWA snapshot whose cells all fit inside one window was persisted WHOLE. state_write drops
@@ -3227,6 +3244,7 @@ private:
         if (sidecar_path != nullptr && logits_sidecar_class()) {
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             if (slot_logits_read(*sidecar_path, nv, (uint32_t) token_count, slot.restored_logits)) {
+                slot.restored_logits_n = (int32_t) token_count;
                 SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
             }
         }
@@ -7286,7 +7304,8 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx,
+                              const float * logits = nullptr) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -7318,7 +7337,10 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            // `logits`: a full-vocab row held outside the context (the restore-continue path's saved logits)
+            std::vector<llama_token_data> cur = logits
+                ? get_token_probabilities_from_logits(logits, llama_vocab_n_tokens(llama_model_get_vocab(model_tgt)), n_probs_request)
+                : get_token_probabilities(ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -8037,12 +8059,12 @@ private:
                         SLT_WRN(*slot, "%s", "failed to write the fingerprint sidecar; a restore of this file is unchecked\n");
                     }
 
-                    // fork: the regenerate logits sidecar (FULL and RS classes), next to upstream's file and
+                    // fork: the regenerate logits sidecar (FULL, RS and NO classes), next to upstream's file and
                     // outside it, so the .bin stays upstream's format. Written only when the captured logits
                     // belong to exactly the state just saved (stamped with its token count), so a stale
                     // distribution can never be paired with this snapshot. Best effort: without it an exact
                     // resend after the restore re-prefills instead of emitting its first token at once.
-                    if (logits_sidecar_class()) {
+                    if (logits_sidecar_manual()) {
                         const size_t n_tok = slot->prompt.tokens.size();
                         if (slot->logits_last_n_tokens == (int32_t) n_tok && !slot->logits_last.empty()) {
                             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
@@ -9123,8 +9145,16 @@ private:
                             // No `n_past < n_ctx` clause: the fast path emits with NO decode so it
                             // needs no free context slot; a full-n_ctx no-suffix restore is handled
                             // here rather than falling through to a zero-token-added crash window.
+                            // Every class has a logits sidecar now, but a class that can rewind by one token
+                            // enters only with logits for exactly n_past tokens: a unit rewound to a shorter
+                            // request carries the logits of its own end, and without usable logits such a
+                            // class re-decodes one token below instead of re-prefilling everything.
+                            const bool restored_logits_ok = !slot.restored_logits.empty() && slot.restored_logits_n == n_past;
+                            const bool cannot_rewind_one  = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+                                                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO;
                             if (slot.just_restored &&
-                                logits_sidecar_class() &&
+                                (restored_logits_ok || cannot_rewind_one) &&
                                 slot.task->need_sampling() &&
                                 slot.alora_invocation_start <= 0 &&
                                 n_past == slot.task->n_tokens() &&
@@ -9132,7 +9162,7 @@ private:
 
                                 slot.just_restored = false; // one-shot consume (this path owns it)
 
-                                if (!slot.restored_logits.empty()) {
+                                if (restored_logits_ok) {
                                     // --- fast path: emit first token from saved logits, no decode ---
                                     slot.stats.n_prompt_cached    = n_past; // entire prompt "reused"
                                     slot.stats.n_prompt_processed = 0;      // prompt_n = 0 => observable reuse signal
@@ -9153,9 +9183,10 @@ private:
                                     }
 
                                     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-                                    const llama_token id = common_sampler_sample_from_logits(
-                                            slot.smpl.get(), slot.restored_logits.data(), nv, /*grammar_first=*/false);
+                                    const std::vector<float> saved_logits = std::move(slot.restored_logits);
                                     slot.restored_logits.clear(); // consumed
+                                    const llama_token id = common_sampler_sample_from_logits(
+                                            slot.smpl.get(), saved_logits.data(), nv, /*grammar_first=*/false);
 
                                     common_sampler_accept(slot.smpl.get(), id, true);
 
@@ -9197,12 +9228,13 @@ private:
 
                                     // First-token logprobs (n_probs>0): the post-sampling variant reads the
                                     // candidate set (cur_p), which common_sampler_sample_from_logits leaves
-                                    // populated — so we can serve it exactly as the normal path does. The
-                                    // pre-sampling variant reads raw ctx logits at a decode index we bypass
-                                    // here; idx=-1 is passed but populate_token_probs() only uses idx in that
-                                    // branch, so we restrict the call to post_sampling to stay correct.
-                                    if (slot.task->params.sampling.n_probs > 0 && slot.task->params.post_sampling_probs) {
-                                        populate_token_probs(slot, result, /*post_sampling=*/true, params_base.special, /*idx=*/-1);
+                                    // populated, so we can serve it exactly as the normal path does. The
+                                    // pre-sampling variant is computed from the saved logits themselves (the
+                                    // context holds no row for a decode this path never ran).
+                                    if (slot.task->params.sampling.n_probs > 0) {
+                                        const bool post = slot.task->params.post_sampling_probs;
+                                        populate_token_probs(slot, result, post, params_base.special, /*idx=*/-1,
+                                                             post ? nullptr : saved_logits.data());
                                     }
 
                                     if (!process_token(result, slot)) {

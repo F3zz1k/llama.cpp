@@ -2245,6 +2245,17 @@ json format_response_rerank(
 // other utils
 //
 
+static void token_probabilities_finish(std::vector<llama_token_data> & cur, size_t n_top);
+
+std::vector<llama_token_data> get_token_probabilities_from_logits(const float * logits, int n_vocab, size_t n_top) {
+    std::vector<llama_token_data> cur((size_t) std::max(0, n_vocab));
+    for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+        cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+    }
+    token_probabilities_finish(cur, n_top);
+    return cur;
+}
+
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
     std::vector<llama_token_data> cur;
 
@@ -2264,6 +2275,12 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
         }
     }
 
+    token_probabilities_finish(cur, n_top);
+    return cur;
+}
+
+// sort by logit (only the leading `n_top` need ordering) and turn the logits into probabilities
+static void token_probabilities_finish(std::vector<llama_token_data> & cur, size_t n_top) {
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
     if (n_top > cur.size()) {
         n_top = cur.size();
@@ -2293,8 +2310,6 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     for (auto & t : cur) {
         t.p /= cum_sum;
     }
-
-    return cur;
 }
 
 std::string safe_json_to_str(const json & data) {

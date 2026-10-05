@@ -1046,6 +1046,8 @@ struct server_metrics {
 //
 
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top);
+// the same for a full-vocab logits row held outside a context (n_vocab entries)
+std::vector<llama_token_data> get_token_probabilities_from_logits(const float * logits, int n_vocab, size_t n_top);
 
 std::string safe_json_to_str(const json & data);
 
