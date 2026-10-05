@@ -368,12 +368,15 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
-    // a deferred capture still pointing at these tensors takes its bytes now
-    llama_state_deferred_before_free_owner(this);
+    // a deferred capture still pointing at these tensors takes its bytes now (a cache viewing another
+    // cache's cells owns no tensors: the source's destructor does this)
+    if (!other) {
+        llama_state_deferred_before_free_owner(deferred_owner());
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
-    llama_state_deferred_before_mutate(this, -1, -1, -1);
+    llama_state_deferred_before_mutate(deferred_owner(), -1, -1, -1);
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -397,7 +400,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
     // freed cells can be overwritten by the next decode: a deferred capture of them is copied first
-    llama_state_deferred_before_mutate(this, seq_id, p0, p1);
+    llama_state_deferred_before_mutate(deferred_owner(), seq_id, p0, p1);
 
     if (p0 < 0) {
         p0 = 0;
@@ -473,7 +476,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     if (s0 != s1) {
         // a copy between streams overwrites the destination stream's data at the next update
-        llama_state_deferred_before_mutate(this, seq_id_dst, -1, -1);
+        llama_state_deferred_before_mutate(deferred_owner(), seq_id_dst, -1, -1);
     }
 
     if (s0 == s1) {
@@ -565,7 +568,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     // every other sequence loses its cells here
-    llama_state_deferred_before_mutate(this, -1, -1, -1);
+    llama_state_deferred_before_mutate(deferred_owner(), -1, -1, -1);
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -595,9 +598,10 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
-    // a shift moves positions now and rotates the shifted keys at the next update
+    // a shift moves positions now and rotates the shifted keys at the next update; cells this sequence
+    // shares with others (a same-stream seq_cp) move for every sequence on them, and can be freed for all
     if (shift != 0) {
-        llama_state_deferred_before_mutate(this, seq_id, p0, p1);
+        llama_state_deferred_before_mutate(deferred_owner(), shift_shares_cells(seq_id, p0, p1) ? -1 : seq_id, p0, p1);
     }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -651,7 +655,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
     if (d != 1) {
-        llama_state_deferred_before_mutate(this, seq_id, p0, p1);
+        llama_state_deferred_before_mutate(deferred_owner(), shift_shares_cells(seq_id, p0, p1) ? -1 : seq_id, p0, p1);
     }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -891,6 +895,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            // the shift graph ropes every cell of every stream, the unshifted ones by 0, which is not the
+            // identity under YaRN (mscale) or for a quantised or rotated K (requantisation): every pending
+            // capture of this cache is copied first, whichever sequence was shifted
+            llama_state_deferred_before_mutate(deferred_owner(), -1, -1, -1);
+
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();
@@ -2255,14 +2264,30 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
     }
 }
 
+bool llama_kv_cache::shift_shares_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id) && cells.seq_count(i) > 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool llama_kv_cache::state_positional(llama_seq_id seq_id) const {
     // with a sliding window find_slot reuses masked cells of the same sequence, so the window is side-state
-    return seq_id >= 0 && other == nullptr && swa_type == LLAMA_SWA_TYPE_NONE;
+    return seq_id >= 0 && positional_ok && other == nullptr && swa_type == LLAMA_SWA_TYPE_NONE;
 }
 
 void llama_kv_cache::state_write_kv(llama_io_write_i & io, const cell_ranges_t & cr, ggml_tensor * t, size_t offset, size_t size) const {
     if (cr.positional) {
-        io.write_tensor_positional(this, cr.seq_id, cr.pos_min, cr.pos_max, t, offset, size);
+        io.write_tensor_positional(deferred_owner(), cr.seq_id, cr.pos_min, cr.pos_max, t, offset, size);
     } else {
         io.write_tensor(t, offset, size);
     }
@@ -2290,7 +2315,7 @@ const slot_info_vec_t *   sinfos_in) {
 
     // a load replaces the sequence (or the whole cache); NO_CLEAR only appends into free cells
     if (seq_id == -1 || (flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR) == 0) {
-        llama_state_deferred_before_mutate(this, seq_id, -1, -1);
+        llama_state_deferred_before_mutate(deferred_owner(), seq_id, -1, -1);
     }
 
     if (sinfos_out) {

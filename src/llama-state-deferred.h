@@ -14,7 +14,9 @@
 //
 // Every cache operation that can change a cell's data or free it (clear, seq_rm, a cross-stream seq_cp,
 // seq_keep, seq_add, seq_div, a state load that replaces the sequence, the cache's destruction) calls
-// llama_state_deferred_before_mutate first. It forces every capture whose references intersect the
+// llama_state_deferred_before_mutate first. A shift of cells another sequence shares fires it for every
+// sequence, and the K-shift graph (which ropes every cell of every stream) fires it for the whole cache.
+// The owner is the cell store, which a cache viewing another cache's cells shares with its source. It forces every capture whose references intersect the
 // mutation: through the capture's flush callback when one is set (the caller then emits the bytes into
 // its own sink), else into host memory owned by the capture. Only ggml_backend_tensor_get is used to
 // read the device, so this works the same on every backend; on CPU the deferred copy is a memcpy.

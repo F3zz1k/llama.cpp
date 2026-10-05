@@ -115,17 +115,23 @@ void llama_state_deferred::resolve(bool sync) {
             if (s.host != nullptr) {
                 continue;
             }
-            // a partly emitted segment is resolved whole: the cursor reads the rest from the copy
+            // a partly emitted segment keeps only its remainder: it is cut at the cursor, so exactly the
+            // pending bytes are copied (and n_pending is what the capture's owner charges for them)
+            if (i == i_seg && seg_off > 0) {
+                s.t_off += seg_off;
+                s.size  -= seg_off;
+                seg_off  = 0;
+            }
             std::unique_ptr<uint8_t[]> buf(new uint8_t[s.size]);
             ggml_backend_tensor_get(s.tensor, buf.get(), s.t_off, s.size);
-            n_pending -= i == i_seg ? s.size - seg_off : s.size;
+            n_pending -= s.size;
             s.host   = buf.get();
             s.tensor = nullptr;
             resolved.push_back(std::move(buf));
         }
         n_resolved++;
     }
-    n_pending = 0;
+    GGML_ASSERT(n_pending == 0);
     registry_remove(this);
 }
 

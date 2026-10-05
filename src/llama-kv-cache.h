@@ -133,6 +133,11 @@ public:
 
     bool get_can_shift() const override;
 
+    // a cache whose rows are rewritten in place outside the cells' own lifecycle (the k-pool indexer cache of
+    // llama_memory_hybrid_idx, whose pooled scatter re-pools rows of cells other sequences captured) is not
+    // positional: a deferred capture then copies its K/V at once (llama_io_write_i::write_tensor_positional)
+    void set_state_positional(bool v) { positional_ok = v; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -318,6 +323,13 @@ private:
 
     llama_kv_cells_vec & v_cells;
 
+    // see set_state_positional
+    bool positional_ok = true;
+
+    // the key the deferred-capture hooks use for these cells: the cell store, which a cache built with
+    // mem_other shares with its source, so a mutation through either cache forces the same captures
+    const void * deferred_owner() const { return v_cells_impl.get(); }
+
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
@@ -363,8 +375,12 @@ private:
     };
 
     // K/V of this cache are positional for seq_id: an append-only cache (find_slot never reuses an occupied
-    // cell without a sliding window) that owns its cells (not a view of another cache's cells)
+    // cell without a sliding window) that owns its cells (not a view of another cache's cells), and whose
+    // rows nothing rewrites in place (set_state_positional)
     bool state_positional(llama_seq_id seq_id) const;
+
+    // a cell of seq_id in [p0, p1) also belongs to another sequence (a shift there moves it for both)
+    bool shift_shares_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
 
     // a K/V slice of `cr`, through write_tensor_positional when the cells are positional
     void state_write_kv(llama_io_write_i & io, const cell_ranges_t & cr, ggml_tensor * t, size_t offset, size_t size) const;

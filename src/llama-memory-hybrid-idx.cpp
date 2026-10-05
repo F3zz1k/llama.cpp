@@ -71,7 +71,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // the k-pool scatter rewrites pooled rows in place: its pad entries re-pool cells of other (captured)
+    // sequences, and a layout with shared cells re-pools every sequence's rows, so a deferred capture must
+    // copy the indexer cache at once (the attention cache still defers)
+    if (mem_idx && hparams_idx.indexer_kpool > 0) {
+        mem_idx->set_state_positional(false);
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
