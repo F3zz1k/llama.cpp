@@ -4038,6 +4038,7 @@ private:
         bool                    defer_idle     = true;  // test hook: false holds deferred copies until forced
         int64_t                 defer_trickle_ms = 10 * 1000; // a copy pending this long is trickled while busy
         int64_t                 def_retry_ms   = -1;    // the idle emission found no staging room: retry then
+        int64_t                 def_retry_step_ms = 0;  // ... after this delay, doubling while no room appears
     } aw;
 
     static constexpr size_t  AW_MAX_CHUNK            = 64u << 20;
@@ -4049,7 +4050,7 @@ private:
     static constexpr int64_t AW_IDLE_RETRY_MS        = 200;        // a deferred idle flush re-checks this often
     static constexpr size_t  AW_DEF_IDLE_SLICE       = 64u << 20;  // deferred bytes emitted per idle wakeup
     static constexpr size_t  AW_DEF_TRICKLE_SLICE    = 8u << 20;   // ... per busy loop iteration, once overdue
-    static constexpr int64_t AW_DEF_RETRY_MS         = 5;          // idle emission without staging room re-checks this often
+    static constexpr int64_t AW_DEF_RETRY_MS         = 5;          // idle emission without staging room first re-checks after this
 
     static int64_t aw_env_i64(const char * name, int64_t def) {
         const char * v = getenv(name);
@@ -4678,6 +4679,16 @@ private:
         }
     }
 
+    // `job` still owes deferred bytes (server thread)
+    bool aw_def_has(const aw_job * job) const {
+        for (const auto & j : aw.def) {
+            if (j.get() == job) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // every deferred capture of `slot_id` (and, FIFO, those before it) before its cells are replaced
     void aw_def_force_slot(int slot_id, const char * how) {
         const aw_job * last = nullptr;
@@ -4722,12 +4733,19 @@ private:
             held = aw.deferred_host;
         }
         if (auto_store_lock::depth() > 0 || !aw.running || held + pend <= aw.budget) {
-            // the engine copies the rest into the capture's own host memory: account for it
+            // the engine copies the rest (exactly `pend` bytes) into the capture's own host memory: account for it
             {
                 std::lock_guard<std::mutex> lk(aw.mtx);
                 aw.deferred_host += pend;
             }
             part->host += pend;
+            if (held + pend > aw.budget) {
+                // inside a store-lock scope (or with the writer stopped) the copy cannot wait for the writer, so
+                // it may exceed the budget; it is released as soon as the job is emitted
+                SRV_WRN("slot %d: auto-save: a forced deferred copy holds %zu B over the %zu B staging budget (%s)\n",
+                        job->slot_id, held + pend - aw.budget, aw.budget,
+                        auto_store_lock::depth() > 0 ? "inside a store-lock scope" : "writer not running");
+            }
             return false;
         }
         aw_def_drive(/*blocking=*/true, 0, job, "forced");
@@ -4735,9 +4753,24 @@ private:
     }
 
     // idle wakeup: one slice, never waiting for the writer
+    // without staging room the retry backs off from AW_DEF_RETRY_MS to AW_IDLE_RETRY_MS (at once when the
+    // writer is stalled), so a writer that cannot drain is not polled every few milliseconds
     void aw_def_idle_step() {
         const size_t n = aw_def_drive(/*blocking=*/false, AW_DEF_IDLE_SLICE, nullptr, "idle");
-        aw.def_retry_ms = n == 0 && !aw.def.empty() ? ggml_time_ms() + AW_DEF_RETRY_MS : -1;
+        if (n == 0 && !aw.def.empty()) {
+            bool stalled = false;
+            {
+                std::lock_guard<std::mutex> lk(aw.mtx);
+                stalled = aw_stalled_locked();
+            }
+            aw.def_retry_step_ms = stalled || aw.def_retry_step_ms > 0
+                ? std::min<int64_t>(stalled ? AW_IDLE_RETRY_MS : aw.def_retry_step_ms * 2, AW_IDLE_RETRY_MS)
+                : AW_DEF_RETRY_MS;
+            aw.def_retry_ms = ggml_time_ms() + aw.def_retry_step_ms;
+        } else {
+            aw.def_retry_step_ms = 0;
+            aw.def_retry_ms      = -1;
+        }
     }
 
     // busy loop: an overdue copy advances a little per iteration
@@ -5528,6 +5561,26 @@ private:
                 // cover is not waited for: what fails a root (IO, space, size) fails a second write the same
                 // way, so a lost root shows up as requested != published for this site instead.
                 const int64_t t0 = ggml_time_us();
+                // The writer is FIFO: a deferred job at or ahead of the cover owes positional bytes that only this
+                // thread emits, so emit them first, or the wait below ends only at the stall timeout (and the
+                // rewrite-as-root recovery is skipped). Never inside a store-lock scope, where nothing may wait
+                // for the writer.
+                if (auto_store_lock::depth() == 0) {
+                    const aw_job * upto = nullptr;
+                    for (const auto & j : aw.jobs) {
+                        if (aw_def_has(j.get())) {
+                            upto = j.get();
+                        }
+                        if (j == cover) {
+                            break;
+                        }
+                    }
+                    if (upto) {
+                        lk.unlock();
+                        aw_def_drive(/*blocking=*/true, 0, upto, "wait");
+                        lk.lock();
+                    }
+                }
                 while (!aw.cv.wait_for(lk, std::chrono::milliseconds(500), [&]() { return cover->done || aw_past_deadline(); })) {
                     if (aw_stalled_locked()) {
                         break;
