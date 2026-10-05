@@ -206,6 +206,10 @@ struct llama_context {
                 size_t   n_token_count,
 const llama_state_sink & sink);
 
+    size_t state_seq_get_size_deferred(llama_seq_id seq_id, llama_pos p0, llama_pos p1, size_t n_token_count, size_t * n_deferred);
+    llama_state_deferred * state_seq_save_deferred(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count);
+    void state_seq_write_for_capture(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count);
+
     size_t state_seq_get_size_range(
           llama_seq_id   seq_id,
              llama_pos   p0,

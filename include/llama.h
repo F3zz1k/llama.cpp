@@ -1017,6 +1017,63 @@ extern "C" {
                          uint8_t * head,
                           size_t   n_head);
 
+    // Deferred capture: the bytes llama_state_seq_save_sink would produce for the same arguments, with the
+    // positional K/V (cells of an append-only cache, the part a range writer filters by position) left in
+    // the cache and copied later. Side-state (recurrent folds, sliding windows, compressor and indexer
+    // blobs, cell metadata) is copied at once. Any cache operation that could change a referenced cell
+    // (clear, seq_rm, seq_keep, a cross-stream seq_cp, seq_add, seq_div, a state load replacing the
+    // sequence, freeing the context) first forces the capture: through its flush callback when one is set,
+    // else into host memory the capture owns. Only ggml_backend_tensor_get reads the device, on every
+    // backend. The bytes are those of llama_state_seq_save_sink at capture time: the format is unchanged.
+    typedef struct llama_state_deferred llama_state_deferred;
+
+    // Called by the flush-on-mutate hook before a referenced cell changes; the callback should emit the
+    // rest of the capture (llama_state_deferred_emit). Whatever it leaves referenced is then copied into
+    // host memory owned by the capture. Runs on the thread that called the mutating function.
+    typedef bool (*llama_state_deferred_flush_cb)(void * user_data, llama_state_deferred * d);
+
+    // Total bytes (header and token array included) and, in *n_deferred, how many of them a deferred
+    // capture would leave in the cache. No tensor data is copied. Returns 0 on failure.
+    LLAMA_API size_t llama_state_seq_get_size_deferred(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                          size_t   n_token_count,
+                          size_t * n_deferred);
+
+    // Returns NULL on failure. Free with llama_state_deferred_free (after the context is freed is fine).
+    LLAMA_API llama_state_deferred * llama_state_seq_save_deferred(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
+    LLAMA_API size_t   llama_state_deferred_size      (const llama_state_deferred * d); // total bytes
+    LLAMA_API size_t   llama_state_deferred_n_deferred(const llama_state_deferred * d); // bytes captured as references
+    LLAMA_API size_t   llama_state_deferred_n_pending (const llama_state_deferred * d); // references not copied yet
+    LLAMA_API uint32_t llama_state_deferred_n_forced  (const llama_state_deferred * d); // times the hook forced it
+
+    LLAMA_API void llama_state_deferred_set_flush_cb(llama_state_deferred * d, llama_state_deferred_flush_cb cb, void * user_data);
+
+    // Hands the next bytes, in order, to `sink`: at most max_bytes (0: no limit). Stops early when the
+    // sink's reserve() returns NULL, which here means "no room now" rather than an error: a later call
+    // continues where this one stopped. *done is set once every byte has been emitted. Returns the bytes
+    // emitted by this call.
+    LLAMA_API size_t llama_state_deferred_emit(
+            llama_state_deferred * d,
+          const llama_state_sink * sink,
+                          size_t   max_bytes,
+                            bool * done);
+
+    LLAMA_API void llama_state_deferred_free(llama_state_deferred * d);
+
+    // Testing only: with false the flush-on-mutate hook does nothing, so a mutation corrupts a pending
+    // capture (the positive control for the hook's own tests). Default true.
+    LLAMA_API void llama_state_deferred_set_hook_enabled(bool enabled);
+
     // Like llama_state_seq_load_file but takes state-seq flags (e.g. NO_CLEAR to append a delta).
     LLAMA_API size_t llama_state_seq_load_file_ext(
             struct llama_context * ctx,

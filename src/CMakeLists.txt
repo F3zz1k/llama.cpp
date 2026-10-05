@@ -21,6 +21,7 @@ set(LLAMA_CORE_SOURCES
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
+    llama-state-deferred.cpp
     llama-kv-cache.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp

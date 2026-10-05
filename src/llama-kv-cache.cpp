@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-state-deferred.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -366,7 +367,14 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() {
+    // a deferred capture still pointing at these tensors takes its bytes now
+    llama_state_deferred_before_free_owner(this);
+}
+
 void llama_kv_cache::clear(bool data) {
+    llama_state_deferred_before_mutate(this, -1, -1, -1);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -387,6 +395,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+
+    // freed cells can be overwritten by the next decode: a deferred capture of them is copied first
+    llama_state_deferred_before_mutate(this, seq_id, p0, p1);
 
     if (p0 < 0) {
         p0 = 0;
@@ -459,6 +470,11 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
+
+    if (s0 != s1) {
+        // a copy between streams overwrites the destination stream's data at the next update
+        llama_state_deferred_before_mutate(this, seq_id_dst, -1, -1);
+    }
 
     if (s0 == s1) {
         // since both sequences are in the same stream, no data copy is necessary
@@ -548,6 +564,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
+    // every other sequence loses its cells here
+    llama_state_deferred_before_mutate(this, -1, -1, -1);
+
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
 
@@ -575,6 +594,11 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+
+    // a shift moves positions now and rotates the shifted keys at the next update
+    if (shift != 0) {
+        llama_state_deferred_before_mutate(this, seq_id, p0, p1);
+    }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -625,6 +649,10 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+
+    if (d != 1) {
+        llama_state_deferred_before_mutate(this, seq_id, p0, p1);
+    }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -2190,6 +2218,9 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
                 if (cell_range_begin == cells.size()) {
                     cell_range_begin = i;
                 }
+                const llama_pos pos = cells.pos_get(i);
+                cr.pos_min = cr.pos_min < 0 ? pos : std::min(cr.pos_min, pos);
+                cr.pos_max = std::max(cr.pos_max, pos);
             } else {
                 if (cell_range_begin != cells.size()) {
                     cr.data.emplace_back(cell_range_begin, i);
@@ -2216,8 +2247,24 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
             continue;
         }
 
+        cr.positional = state_positional(seq_id);
+        cr.seq_id     = seq_id;
+
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
+    }
+}
+
+bool llama_kv_cache::state_positional(llama_seq_id seq_id) const {
+    // with a sliding window find_slot reuses masked cells of the same sequence, so the window is side-state
+    return seq_id >= 0 && other == nullptr && swa_type == LLAMA_SWA_TYPE_NONE;
+}
+
+void llama_kv_cache::state_write_kv(llama_io_write_i & io, const cell_ranges_t & cr, ggml_tensor * t, size_t offset, size_t size) const {
+    if (cr.positional) {
+        io.write_tensor_positional(this, cr.seq_id, cr.pos_min, cr.pos_max, t, offset, size);
+    } else {
+        io.write_tensor(t, offset, size);
     }
 }
 
@@ -2240,6 +2287,11 @@ const slot_info_vec_t *   sinfos_in) {
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+
+    // a load replaces the sequence (or the whole cache); NO_CLEAR only appends into free cells
+    if (seq_id == -1 || (flags & LLAMA_STATE_SEQ_FLAGS_NO_CLEAR) == 0) {
+        llama_state_deferred_before_mutate(this, seq_id, -1, -1);
+    }
 
     if (sinfos_out) {
         sinfos_out->assign(n_stream, slot_info{});
@@ -2360,7 +2412,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         for (const auto & range : cr.data) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
+            state_write_kv(io, cr, k, range.first * k_size_row, buf_size);
         }
     }
 
@@ -2387,7 +2439,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             for (const auto & range : cr.data) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * v_size_row;
-                io.write_tensor(v, range.first * v_size_row, buf_size);
+                state_write_kv(io, cr, v, range.first * v_size_row, buf_size);
             }
         }
     } else {
@@ -2422,7 +2474,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     const size_t range_size = range.second - range.first;
                     const size_t src_offset = (range.first + j * kv_size) * v_size_el;
                     const size_t buf_size = range_size * v_size_el;
-                    io.write_tensor(v, src_offset, buf_size);
+                    state_write_kv(io, cr, v, src_offset, buf_size);
                 }
             }
         }

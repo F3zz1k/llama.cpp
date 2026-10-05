@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-state-deferred.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -485,6 +486,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // a deferred capture made on this context takes its bytes while the caches still exist
+    llama_state_deferred_before_free_ctx(this);
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -3533,6 +3537,51 @@ size_t llama_context::state_seq_save_sink(llama_seq_id seq_id, llama_pos p0, lla
     return io.n_bytes();
 }
 
+void llama_context::state_seq_write_for_capture(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count) {
+    // the same bytes, in the same order, as state_seq_save_sink
+    const uint32_t hdr[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) n_token_count };
+    io.write(hdr, sizeof(hdr));
+    io.write(tokens, sizeof(llama_token) * n_token_count);
+
+    if (p0 < 0 && p1 < 0) {
+        state_seq_write_data(io, seq_id, 0);
+    } else if (memory) {
+        memory->state_write_range(io, seq_id, p0, p1, 0);
+    }
+}
+
+size_t llama_context::state_seq_get_size_deferred(llama_seq_id seq_id, llama_pos p0, llama_pos p1, size_t n_token_count, size_t * n_deferred) {
+    // the token values do not change any size: a zero array of the right length stands in for them
+    std::vector<llama_token> toks(n_token_count, 0);
+    llama_io_write_deferred io(nullptr, true);
+    state_seq_write_for_capture(io, seq_id, p0, p1, toks.data(), toks.size());
+    if (n_deferred) {
+        *n_deferred = io.n_positional;
+    }
+    return io.n_bytes();
+}
+
+llama_state_deferred * llama_context::state_seq_save_deferred(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count) {
+    // pass 1 sizes the host buffer for the immediate bytes, pass 2 copies them and records the references
+    llama_io_write_deferred plan(nullptr, true);
+    state_seq_write_for_capture(plan, seq_id, p0, p1, tokens, n_token_count);
+
+    std::unique_ptr<llama_state_deferred> d(new llama_state_deferred());
+    d->ctx    = this;
+    d->n_host = plan.n_immediate;
+    d->host.reset(new uint8_t[std::max<size_t>(1, plan.n_immediate)]);
+
+    llama_io_write_deferred io(d.get(), true);
+    state_seq_write_for_capture(io, seq_id, p0, p1, tokens, n_token_count);
+    if (io.n_immediate != plan.n_immediate || io.n_bytes() != plan.n_bytes()) {
+        throw std::runtime_error("deferred capture: the state changed between its two passes");
+    }
+    d->n_total = io.n_bytes();
+
+    llama_state_deferred_register(d.get());
+    return d.release();
+}
+
 size_t llama_context::state_seq_get_size_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * head, size_t n_head) {
     llama_io_write_head io(head, n_head);
 
@@ -4573,6 +4622,26 @@ size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, 
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting sequence state size: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+size_t llama_state_seq_get_size_deferred(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, size_t n_token_count, size_t * n_deferred) {
+    try {
+        return ctx->state_seq_get_size_deferred(seq_id, p0, p1, n_token_count, n_deferred);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error sizing a deferred sequence state capture: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+llama_state_deferred * llama_state_seq_save_deferred(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_deferred(seq_id, p0, p1, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error capturing sequence state: %s\n", __func__, err.what());
+        return nullptr;
     }
 }
 

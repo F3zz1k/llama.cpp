@@ -116,7 +116,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -353,7 +353,21 @@ private:
         uint32_t strm;
 
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
+
+        // set when the K/V bytes of these cells are positional (llama_io_write_i::write_tensor_positional):
+        // one sequence, in a cache whose cells nothing but a mutation of this cache can overwrite
+        bool         positional = false;
+        llama_seq_id seq_id     = -1;
+        llama_pos    pos_min    = -1;
+        llama_pos    pos_max    = -1;
     };
+
+    // K/V of this cache are positional for seq_id: an append-only cache (find_slot never reuses an occupied
+    // cell without a sliding window) that owns its cells (not a view of another cache's cells)
+    bool state_positional(llama_seq_id seq_id) const;
+
+    // a K/V slice of `cr`, through write_tensor_positional when the cells are positional
+    void state_write_kv(llama_io_write_i & io, const cell_ranges_t & cr, ggml_tensor * t, size_t offset, size_t size) const;
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
