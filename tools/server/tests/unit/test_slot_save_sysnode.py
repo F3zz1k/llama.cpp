@@ -1,5 +1,6 @@
 import glob
 import os
+import time
 import shutil
 
 import pytest
@@ -114,6 +115,12 @@ def _metric(s, name: str) -> float:
 
 
 def _assert_sysnode_counters(s):
+    # the callers stop the server right after this (a kill, no shutdown flush): wait until what was captured
+    # is on disk, including a node whose positional copy was deferred to the idle loop
+    deadline = time.time() + 30
+    while time.time() < deadline and (_metric(s, "auto_cache_save_queue_depth") != 0 or
+                                      _metric(s, "auto_cache_save_deferred_pending") != 0):
+        time.sleep(0.05)
     assert _metric(s, "auto_cache_sysnode_probed_total") >= 1
     assert _metric(s, "auto_cache_sysnode_probe_failed_total") == 0
     assert _metric(s, "auto_cache_sysnode_seam_mismatch_total") == 0

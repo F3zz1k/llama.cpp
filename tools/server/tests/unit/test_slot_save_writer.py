@@ -77,6 +77,10 @@ def _server(model: str, log_path: str, n_slots: int = 1, staging_mb=None, idle=I
     s.slot_save_idle_seconds = idle
     s.slot_save_node_prompt = "off"
     s.slot_save_staging_mb = staging_mb
+    if staging_mb is not None:
+        # the budget tests exercise the admission of saves copied at the capture (staged, streamed, waiting,
+        # dropped); a deferred save (stage 2, test_slot_save_defer.py) takes none of those paths
+        s.slot_save_defer = False
     s.log_path = log_path
     return s
 
