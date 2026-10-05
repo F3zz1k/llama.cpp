@@ -17,7 +17,16 @@ llama-server -m model.gguf -c 32768 -ngl 999 -fa on \
 ```
 
 Then check it is working with `curl -s localhost:8080/metrics | grep auto_cache_` (restore hits,
-misses, saves and evictions) and the `cache_disk_n` field of each response's `timings`.
+misses, saves and evictions) and the `cache_source` and `cache_disk_n` fields of each response's
+`timings`.
+
+For very long prompts (hundreds of thousands of tokens), add `--slot-save-prefill-interval N` (for
+example 32768): the prefill then publishes a checkpoint every `N` tokens, so a timeout, a disconnect or a
+crash resumes from the last one instead of starting over, and a new question at the end of the same long
+message restores to within `N` tokens. Each checkpoint costs one capture of about `N` tokens of KV (a
+delta under `--slot-save-incremental`, plus the recurrent state on a hybrid model) and one unit against
+`--slot-save-max-count`; it is off by default. See "Long prompts" in
+[`docs/disk-cache.md`](docs/disk-cache.md#recommended-command-lines).
 
 On a recurrent, hybrid or sliding-window model, add `--slot-save-node-prompt on` when your client drops
 the previous reasoning from the history or rewrites earlier answers (each follow-up then diverges inside
@@ -26,8 +35,8 @@ after a restart. The default (`cold`) writes that node only for a prompt that go
 
 [`docs/disk-cache.md`](docs/disk-cache.md) is the quick start: the recommended command lines (a
 pool sharing one store, MTP or a draft model, recurrent and hybrid models, a shared system prompt,
-context rungs), every flag with its default, when a node is written, how to read hits and misses,
-and the known limits.
+long prompts, context rungs), every flag with its default, when a node is written, how to read hits
+and misses, and the known limits.
 
 ## Upstream baseline
 
@@ -141,6 +150,7 @@ the `cold` prompt node, the reclaim save and the 60 s idle save. Add `--metrics`
 | `--slot-save-node-response` | off | Save the conversation as soon as each response completes, not only on idle, reclaim and shutdown. |
 | `--slot-save-node-tool` | off | Same, only for responses that end in tool calls. |
 | `--slot-save-on-reclaim` | on | Save a slot's conversation before a request from a different conversation takes the slot. `--no-slot-save-on-reclaim` turns it off. |
+| `--slot-save-prefill-interval N` | 0 (off) | While a prompt prefills, publish a checkpoint every `N` tokens, so an interrupted long prefill resumes from the last one. Must be 0 or at least `--slot-save-block`. Pair it with `--slot-save-incremental` and a higher `--slot-save-max-count`. |
 
 > **Eviction is opt-in.** Plain `--slot-save-path` (manual `/slots` save, upstream behaviour)
 > never deletes anything. The bounded LRU store only runs when `--slot-save-auto` owns the
@@ -213,8 +223,8 @@ curl http://localhost:8080/slots/0?action=restore -d '{"filename":"snap1.bin"}'
 ```
 
 They use upstream's implementation and file format, media slots included (upstream packs each
-image's id and geometry into the state file). The fork adds a `.logits` sidecar on recurrent and
-hybrid models, so resending exactly the saved prompt after a restore does not re-process it,
+image's id and geometry into the state file). The fork adds a `.logits` sidecar on recurrent, hybrid and
+DeepSeek-V4 models, so resending exactly the saved prompt after a restore does not re-process it,
 refuses saves to `auto-*` names (reserved for the automatic cache), and restores any file that has a
 `.meta` sidecar (an automatic cache unit, or a media save from a fork build before 2026-10-03) the
 fork's way. Upstream's format records no model or projector identity, so the fork writes a small `.fp`

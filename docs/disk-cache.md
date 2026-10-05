@@ -72,6 +72,39 @@ pre-cache): the whole system prompt is saved.
     --slot-save-context-min-tokens 4096    # the smallest system prefix worth its own node (default)
 ```
 
+**Long prompts (a few hundred thousand to a million tokens).** A prefill that long takes minutes to
+hours, and by default nothing of it reaches the disk until it finishes: a timeout, a disconnected
+client or a crash loses all of it, and a request that changes the end of the long message (a new
+question appended to the same document) cannot restore any of it on a model that cannot rewind.
+Periodic prefill checkpoints fix both:
+
+```sh
+    --slot-save-incremental --slot-save-prefill-interval 32768
+```
+
+While a prompt prefills, the batch stops at every multiple of `N` tokens (at or above the save floor,
+never inside an image) and the slot's state there is published like any other node. A prefill that is
+interrupted then resumes from the last published checkpoint, on the same instance or any peer, and a
+request that diverges inside the long message restores to within `N` tokens of the divergence. Every
+memory class is covered, the ones that cannot rewind included: a checkpoint is the true whole state at
+its position. Pick `N` from what an interruption may cost: the re-prefill after a restore is at most
+`N` tokens, and each checkpoint costs:
+
+- **one capture**: with `--slot-save-incremental` and a model that writes deltas it is a delta of `N`
+  tokens on the previous checkpoint, about `N` times the per-token KV size (Qwen3.8-27B with f16 KV:
+  about 66 KB per token, so 2.1 GB at `N` = 32768) plus one copy of the side-state (a hybrid's recurrent
+  state, 112.57 MiB on Qwen3.8-Flash-Next). The positional part goes through the deferred copy, so the
+  prefill does not wait for it; the side-state is copied at once.
+- **a whole snapshot** instead on a model that cannot write deltas (the delta probe says no) or without
+  `--slot-save-incremental`: the checkpoint at `k * N` writes all `k * N` tokens again, so a 1M-token
+  prefill at `N` = 32768 writes about 16 times the final unit. Use a larger `N` there, or none.
+- **one unit** against `--slot-save-max-count`: a 1M-token prefill at `N` = 32768 adds 32. Raise the
+  count cap with it (the byte cap stays the real limit).
+
+A checkpoint captured while the prefill keeps running becomes durable once its deferred copy has been
+emitted, which during a busy prefill happens about 10 s after the capture (the trickle). The default is
+0 (off), which changes nothing: no extra batch breaks and no extra saves.
+
 **Context rungs** (the same model at several `-c`, e.g. 1 GPU at 131072 and 2 GPUs at 262144, or a
 lower-context vision variant beside the text one): point them at the same store. `-c` is not part of a
 unit's identity, so the rungs name units alike, deduplicate them and continue each other's delta chains,
@@ -101,6 +134,7 @@ different content (a whole unit and a delta) under one name.
 | `--slot-save-max-mb N` / `--slot-save-max-count N` | 0 (unlimited) | least-recently-used eviction caps for the whole directory |
 | `--slot-restore-min-tokens N` | 0 | skip a restore shorter than `N` tokens and prefill instead |
 | `--slot-save-staging-mb N` | 1024 | host memory a save may hold between its copy off the device and its write by the background writer; `0` writes every save on the server thread (see below) |
+| `--slot-save-prefill-interval N` | 0 (off) | while a prompt prefills, publish a node every `N` tokens (each multiple of `N`); must be 0 or at least `--slot-save-block` (see "Long prompts") |
 | `--slot-save-defer` / `--no-slot-save-defer` | on | copy only the side-state off the device at a save and the positional K/V later (see "Deferred positional copy"); needs the background writer |
 
 ### When a node is written (checkpoint triggers)
@@ -112,6 +146,7 @@ different content (a whole unit and a delta) under one name.
 | `--slot-save-node-response` | off | the conversation, as soon as each response completes |
 | `--slot-save-node-tool` | off | the conversation, when a response ends in tool calls |
 | `--slot-save-idle-seconds N` | 60 | the conversation, once its slot has been idle `N` seconds (`-1` disables) |
+| `--slot-save-prefill-interval N` | 0 (off) | every multiple of `N` tokens while a prompt prefills, so an interrupted prefill resumes from the last one. A prefill that resumes an interrupted one counts as cold for the prompt node above (only with the interval set): the slot still holds an unfinished cold prefill, the reuse ends on a multiple of `N`, or the reuse already reaches into the last user message |
 | `--slot-save-on-reclaim` | on | the conversation, before a request that does not extend it takes its slot (it diverges at least one block before the slot's end, so a different conversation sharing only a system prompt counts) |
 | (shutdown) | always | every slot's conversation, on a graceful stop |
 
@@ -132,6 +167,15 @@ rewrite answers, and regenerate or edit after a restart, want `--slot-save-node-
 | Sliding window, conversation within one window | same as plain attention | nothing |
 | Recurrent, hybrid, indexer, compressed KV, sliding window past one window | restores the prompt node and prefills the tail after it: the generation prompt, since the node sits exactly at the end of the last user message (a request without a user message, raw tokens for example, places it a block boundary below its end, and an image that ends at that position moves it to before the image) | the prompt node (`--slot-save-node-prompt`: `cold`, the default, writes it only for the first prompt of a conversation, so a later turn falls back to the deepest earlier node; `on` writes it every turn; `off` turns this into a reported miss) |
 | any | a request that **extends** the saved conversation (the previous answer included) restores all of it | nothing |
+| any | the **exact** saved conversation again (a regenerate after a restart) | nothing: the unit's logits sidecar gives the first token with no decode, on every class |
+
+**On the same instance** (the slot still holds the conversation), a request that diverges inside it on a
+class that cannot rewind keeps nothing of the slot past its last in-memory context checkpoint. A node at
+or below the divergence then restores, and on the recurrent and hybrid classes (Qwen3.6, Qwen3.8, Mamba
+hybrids, Jamba) only its side-state is read: the slot's own attention cells for the same tokens are
+kept and trimmed to the node, so the restore reads the recurrent state instead of the whole unit
+(restore mode 2, `cache_disk_mode` `side` below). The comparison that decides between the slot and a disk
+node uses what the slot can really keep, not the raw token match.
 
 Without a usable node a miss is reported, never silent: a WRN line and the
 `auto_cache_restore_not_prefix_total` counter (below).
@@ -271,9 +315,21 @@ Per request, `timings` in the response says where the prompt came from:
 | Field | Meaning |
 |---|---|
 | `cache_n` | prompt tokens not prefilled |
+| `cache_source` | `cold` (nothing reused), `warm` (the resident slot), `ram` (the RAM prompt cache) or `disk` |
 | `cache_disk_n` | of those, restored from disk (absent when zero) |
+| `cache_disk_unit_n` | the restored unit's length (a plain-attention restore may trim it to `cache_disk_n`) |
+| `cache_disk_nodes` | files on its chain: 1 for a whole root, one more per delta |
+| `cache_disk_mode` | `whole` (the unit loaded) or `side` (only its side-state, over the slot's own cells) |
 | `cache_ram_n` | of those, loaded from the RAM prompt cache (`--cache-ram`, absent when zero) |
 | `prompt_n` | prompt tokens prefilled |
+
+`GET /props` carries the memory class as the cache handles it, under `auto_cache`: `seq_rm` (`part`,
+`full`, `rs` or `no`), `n_swa`, `rewinds` (a longer unit restores trimmed to the request),
+`side_only_restore` (restore mode 2), `logits_sidecar`, `draft_sidecar` and the settings that shape the
+store (`block`, `incremental`, `deferred`, `node_prompt`, `prefill_interval`). Whether the model writes
+deltas is decided by a probe at the first save and reported by the gauge
+`llamacpp:auto_cache_delta_capable` (0 not probed yet, 1 deltas, 2 whole roots only). The test
+`test_slot_save_dropped.py` holds the table of every memory class.
 
 `usage.prompt_tokens_details.cached_tokens` in the OpenAI-style responses equals `cache_n`. With
 `--metrics`, `GET /metrics` carries cumulative counters (prefix `llamacpp:`):
@@ -286,6 +342,10 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_restore_discarded_total` | restores whose tokens were thrown away before use (counted as misses) |
 | `auto_cache_restore_failed_total` | restores whose load failed (fell back to a shorter unit or a cold prefill) |
 | `auto_cache_restore_tokens_total` | prompt tokens restored from disk |
+| `auto_cache_restore_miss_identity_total` | misses where a unit of the same model held the prefix under another identity (another rung's RoPE/YaRN settings, cache types, mmproj, LoRA or block size); each logs a WRN naming the fields that differ |
+| `auto_cache_restore_side_only_total` | restores that loaded only a unit's side-state over the slot's own cells (restore mode 2) |
+| `auto_cache_skipped_shared_total` | tasks with a shared prompt prefix (decision tasks) that the cache neither restores nor saves (a WRN at most once a minute) |
+| `auto_cache_evict_bound_exceeded_total` | eviction passes that left the store above a cap because every remaining unit has a live child, is pinned or was just written |
 | `auto_cache_save_root_total` / `auto_cache_save_delta_total` | whole snapshots / delta nodes written |
 | `auto_cache_save_whole_fallback_total` | saves that would have been deltas, written whole because the memory type cannot write deltas (included in the root count) |
 | `auto_cache_save_bytes_total` | state bytes written by published saves |
@@ -311,7 +371,7 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_save_deferred_bytes_total` | positional bytes those saves left in the cache to copy later |
 | `auto_cache_save_deferred_pending` (gauge) | deferred captures still owing positional bytes |
 | `auto_cache_save_deferred_host_bytes` (gauge) | side-state held by those captures |
-| `auto_cache_save_site_requested_total{site=...}` / `auto_cache_save_site_published_total{site=...}` | units each save site decided to write / of those, published. `site` is `reclaim`, `idle`, `shutdown`, `cache_idle`, `system_node`, `prompt_node` or `response_node`. Requested minus published is what that site lost (failed, orphaned, abandoned or dropped); a deferred idle flush is counted once, when it is taken |
+| `auto_cache_save_site_requested_total{site=...}` / `auto_cache_save_site_published_total{site=...}` | units each save site decided to write / of those, published. `site` is `reclaim`, `idle`, `shutdown`, `cache_idle`, `system_node`, `prompt_node`, `response_node` or `prefill_checkpoint`. Requested minus published is what that site lost (failed, orphaned, abandoned or dropped); a deferred idle flush is counted once, when it is taken |
 
 A miss includes conversations no cache could have held, so read it next to `auto_cache_evicted_total`:
 misses that climb with evictions mean the store is too small.
@@ -339,7 +399,8 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   `on` adds one per turn that brings at least a block of new prompt.
 - The side-state copy stays on the request's critical path, and with `--no-slot-save-defer` (or a class
   with nothing positional) the whole copy does. It lands in ordinary (pageable) host memory; staging in
-  pinned memory may copy faster on a GPU and is not measured yet. A reclaim save gains nothing from the
+  pinned memory may copy faster on a GPU and is not measured yet (`bench-d2h-pinned`, built with the
+  tests, measures it on a card). A reclaim save gains nothing from the
   deferred copy (the new request frees the cells at once, which forces it).
 - The system node is placed from the chat template for every template (the boundary is checked over
   all of `models/templates` by `test-chat-preamble`). The first chat request with a new system prompt
@@ -381,3 +442,16 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   changes it every turn and defeats the cache.
 - One store, one cap: `--slot-save-max-mb` is enforced over the whole directory by whichever instance
   saves, so give every pool sharing it the same value.
+- Prefill checkpoints: on a model with a draft (MTP or a draft model) a checkpoint usually has no `.dft`
+  sidecar, because the draft lags the target mid-prefill, so a prefill resumed from one drafts cold until
+  its first response. A checkpoint is durable only once published: one still waiting for its deferred
+  copy (about 10 s during a busy prefill) is lost with the process. Generation is not checkpointed.
+- Restore mode 2 (side-state only) covers the recurrent and hybrid classes on text units. The k-pool
+  indexer classes (GLM-5 next, Qwen3.8-Flash-Next), sliding windows, DeepSeek-V4 and media units restore
+  whole, as before.
+- The eviction is least-recently-used over leaves (a node with a live child is never evicted). There is no
+  value model yet: a store-wide system node or a prompt node that has become a leaf ages out like any
+  other unit unless restores keep touching it, or it is pinned.
+- A client that disconnects is noticed within about a second while the server prefills or generates for
+  it; before this build a disconnected client's task was cancelled only once no other request was
+  producing results, so a busy server kept prefilling for nobody.
