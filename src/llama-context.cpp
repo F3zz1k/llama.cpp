@@ -2945,6 +2945,15 @@ public:
         return size_read;
     }
 
+    void skip(size_t size) override {
+        if (size > size_left) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+        file->seek(size, SEEK_CUR);
+        size_read += size;
+        size_left -= size;
+    }
+
 private:
     llama_file * file;
     size_t size_read = 0;
@@ -3649,6 +3658,11 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL) && (!memory || !memory->state_can_skip_positional())) {
+        // refused before anything is read, so the sequence is untouched
+        LLAMA_LOG_ERROR("%s: this memory type cannot load the side-state alone\n", __func__);
+        return 0;
+    }
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4461,6 +4475,10 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+bool llama_memory_can_skip_positional(llama_memory_t mem) {
+    return mem != nullptr && mem->state_can_skip_positional();
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

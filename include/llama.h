@@ -829,6 +829,10 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Whether a sequence load with LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL is supported: hybrid (attention
+    // plus recurrent) and recurrent-only memory
+    LLAMA_API bool llama_memory_can_skip_positional(llama_memory_t mem);
+
     //
     // State / sessions
     //
@@ -943,6 +947,14 @@ extern "C" {
 // Do not clear the destination sequence before loading; append the loaded cells to the existing
 // sequence. Used to compose a base snapshot with incremental deltas loaded in position order.
 #define LLAMA_STATE_SEQ_FLAGS_NO_CLEAR 4
+
+// Read a sequence state that holds everything, but apply only its side-state (recurrent state): the
+// positional K/V of the append-only attention cache is read past, and the destination sequence keeps its
+// own positional cells untouched. For a sequence that already holds the same tokens' attention, so a node
+// further back restores without moving the attention back onto the device. Only memory types for which
+// llama_memory_can_skip_positional() is true accept it; the others fail the load without touching the
+// sequence.
+#define LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL 8
 
     typedef uint32_t llama_state_seq_flags;
 

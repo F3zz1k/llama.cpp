@@ -49,5 +49,16 @@ public:
     // bytes read so far
     virtual size_t n_bytes() = 0;
 
+    // read past `size` bytes without using them (counted in n_bytes() like a read). The default reads them
+    // into a scratch buffer; a reader over a file seeks instead
+    virtual void skip(size_t size) {
+        uint8_t buf[4096];
+        while (size > 0) {
+            const size_t n = size < sizeof(buf) ? size : sizeof(buf);
+            read(buf, n);
+            size -= n;
+        }
+    }
+
     void read_string(std::string & str);
 };

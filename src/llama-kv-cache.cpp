@@ -2297,6 +2297,96 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
+void llama_kv_cache::state_skip(llama_io_read_i & io) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return; // a cache that shares another one's cells writes nothing
+    }
+
+    uint32_t n_stream_cur;
+    io.read(&n_stream_cur, sizeof(n_stream_cur));
+    if (n_stream_cur != n_stream) {
+        throw std::runtime_error("n_stream mismatch");
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        uint32_t cell_count;
+        io.read(&cell_count, sizeof(cell_count));
+        if (cell_count == 0) {
+            continue;
+        }
+        if (cell_count > v_cells[s].size()) {
+            throw std::runtime_error("failed to skip kv cache state: more cells than the cache holds");
+        }
+
+        // cell metadata, as state_write_meta wrote it
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            llama_pos pos;
+            uint32_t  n_seq_id;
+            io.read(&pos,      sizeof(pos));
+            io.read(&n_seq_id, sizeof(n_seq_id));
+            if (has_cell_ext()) {
+                io.skip(sizeof(llama_kv_cell_ext));
+            }
+            if (n_seq_id > n_seq_max) {
+                throw std::runtime_error("failed to skip kv cache state: invalid seq_id count");
+            }
+            io.skip((size_t) n_seq_id * sizeof(llama_seq_id));
+        }
+
+        // the data, as state_write_data wrote it; the shape checks mirror state_read_data
+        uint32_t v_trans_ref;
+        uint32_t n_layer_ref;
+        io.read(&v_trans_ref, sizeof(v_trans_ref));
+        io.read(&n_layer_ref, sizeof(n_layer_ref));
+        if (n_layer_ref != layers.size() || (bool) v_trans_ref != v_trans) {
+            throw std::runtime_error("failed to skip kv cache state: layer count or V layout mismatch");
+        }
+
+        for (const auto & layer : layers) {
+            const auto * k = layer.k_stream[s];
+            int32_t  type_ref;
+            uint64_t row_ref;
+            io.read(&type_ref, sizeof(type_ref));
+            io.read(&row_ref,  sizeof(row_ref));
+            if (type_ref != (int32_t) k->type || row_ref != ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il))) {
+                throw std::runtime_error("failed to skip kv cache state: key type or row size mismatch");
+            }
+            io.skip((size_t) cell_count * row_ref);
+        }
+
+        for (const auto & layer : layers) {
+            const auto * v = layer.v_stream[s];
+            if (!v) {
+                continue;
+            }
+            int32_t type_ref;
+            io.read(&type_ref, sizeof(type_ref));
+            if (type_ref != (int32_t) v->type) {
+                throw std::runtime_error("failed to skip kv cache state: value type mismatch");
+            }
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+            if (!v_trans) {
+                uint64_t row_ref;
+                io.read(&row_ref, sizeof(row_ref));
+                if (row_ref != ggml_row_size(v->type, n_embd_v_gqa)) {
+                    throw std::runtime_error("failed to skip kv cache state: value row size mismatch");
+                }
+                io.skip((size_t) cell_count * row_ref);
+            } else {
+                uint32_t el_ref;
+                uint32_t n_embd_ref;
+                io.read(&el_ref,     sizeof(el_ref));
+                io.read(&n_embd_ref, sizeof(n_embd_ref));
+                if (el_ref != ggml_type_size(v->type) || n_embd_ref != n_embd_v_gqa) {
+                    throw std::runtime_error("failed to skip kv cache state: value element size mismatch");
+                }
+                io.skip((size_t) n_embd_v_gqa * cell_count * el_ref);
+            }
+        }
+    }
+}
+
 void llama_kv_cache::state_read_sinfo(
         llama_io_read_i & io,
            llama_seq_id   seq_id,

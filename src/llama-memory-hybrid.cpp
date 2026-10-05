@@ -204,6 +204,15 @@ void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id 
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL) {
+        // the attention part is positional: read past it and leave the sequence's own cells as they are
+        GGML_ASSERT(seq_id >= 0 && "skipping the positional state needs a single sequence");
+        GGML_ASSERT((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && "a partial state holds no positional part");
+        mem_attn->state_skip(io);
+        mem_recr->state_read(io, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL);
+        return;
+    }
+
     const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
 
     if (read_attn) {

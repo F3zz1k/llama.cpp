@@ -156,6 +156,10 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // read past a single sequence's state as state_write wrote it (cell metadata, then K and V per layer),
+    // checking its shape like state_read does, without touching the cache. Throws on a mismatch
+    void state_skip(llama_io_read_i & io) const;
+
     void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const override;
 
     //
