@@ -101,6 +101,7 @@ different content (a whole unit and a delta) under one name.
 | `--slot-save-max-mb N` / `--slot-save-max-count N` | 0 (unlimited) | least-recently-used eviction caps for the whole directory |
 | `--slot-restore-min-tokens N` | 0 | skip a restore shorter than `N` tokens and prefill instead |
 | `--slot-save-staging-mb N` | 1024 | host memory a save may hold between its copy off the device and its write by the background writer; `0` writes every save on the server thread (see below) |
+| `--slot-save-defer` / `--no-slot-save-defer` | on | copy only the side-state off the device at a save and the positional K/V later (see "Deferred positional copy"); needs the background writer |
 
 ### When a node is written (checkpoint triggers)
 
@@ -193,6 +194,50 @@ takes its slot, costs that request the copy only, not the write.
 - **Synchronous mode.** `--slot-save-staging-mb 0` runs the publish on the server thread, as builds
   before the writer did, now with the same `fdatasync` calls.
 
+### Deferred positional copy
+
+With `--slot-save-defer` (the default) the capture copies less. A sequence's state has two kinds of
+bytes, and the memory class says which is which, never the model:
+
+- **Positional K/V**: the cells of an append-only attention cache (no sliding window), the part a range
+  save filters by position. Nothing but a change to that cache can alter them: the next tokens go into
+  free cells, never into occupied ones.
+- **Side-state**: everything else. A recurrent fold, a sliding window (its cells are reused as the window
+  moves), DeepSeek-V4's compressed caches and state, cell metadata.
+
+The capture copies the side-state at once and only records where the positional bytes are. They are
+copied later on the server thread, in capture order, and handed to the writer as before:
+
+- **at idle**, 64 MiB per wakeup of the server loop, pausing while the staging is full, so a request that
+  arrives meanwhile is served first;
+- **trickled** while the server is busy, 8 MiB per loop iteration, once a copy has waited 10 s (a long
+  generation does not hold a unit back);
+- **at once**, before anything can change those cells. The engine calls a flush hook from every cache
+  operation that frees, overwrites or moves cells (`seq_rm`, `seq_keep`, `clear`, a cross-stream
+  `seq_cp`, `seq_add` and `seq_div` (a context shift), a state load that replaces the sequence, and
+  freeing the context). The server also forces the copies before a restore into the slot, before sleep,
+  at shutdown, and when a capture or a waiting request needs the writer to get past them. A forced
+  remainder that fits in the staging budget is copied into host memory without waiting for the writer;
+  a larger one is streamed to the writer like a stage-1 save. A removal above the captured range (a
+  rejected draft) does not force anything.
+
+The unit is byte-identical to one copied at the capture, so nothing in the store changes. What changes
+is when the request pays: a prompt or system node captured while a prompt prefills no longer delays
+that request's first token by the attention copy, only by the side-state. A conversation saved when
+another request takes its slot gains nothing (the new request frees those cells at once, which forces
+the copy). The engine reads the device only through `ggml_backend_tensor_get`, so it behaves the same on
+every backend; on CPU the deferred copy is a `memcpy`.
+
+Classes and what they defer: plain attention (`llama`), the global layers of iSWA (`gemma3`), the
+attention of hybrids (`qwen35`, `qwen3.8`, Flash-Next's indexer cache too), DSA, MSA and the MTP draft's
+attention cache defer; recurrent-only models and DeepSeek-V4 defer nothing and copy everything at the
+capture, as before. A class whose saves fall back to whole roots (delta probe NO) is not deferred either.
+
+Side-state held by deferred captures counts against `--slot-save-staging-mb` on its own
+(`auto_cache_save_deferred_host_bytes`); when it would not fit, older captures are copied first, and a
+capture whose side-state alone exceeds the budget is copied at once. So the host memory the cache holds
+is at most twice the budget plus the ring.
+
 Every published save logs one line with its timings, for example:
 
 ```
@@ -204,7 +249,10 @@ auto-save: persisted 65280 tokens to .../auto-...-65280.bin (root, 268431436 B: 
 `capture d2h` is what the request waited for (the target state, the draft state, the logits copy);
 `queue-wait` is how long the unit sat behind earlier saves; `write`, `fdatasync`, `publish` (the
 renames under the store lock, and the directory sync) and `evict` (the LRU and the reconcile) ran on
-the writer. `mode` is `staged`, `streamed` or `sync`.
+the writer. `mode` is `staged`, `streamed`, `sync` or `deferred`. A deferred save adds
+`positional N B copied T ms after the capture (copy C ms, how)`: `capture d2h` is then the side-state
+only, `C` is the deferred copy, and `how` is `idle`, `trickle`, `forced` (a cache mutation or a restore),
+`wait` (a capture or request needed the writer), `sleep` or `shutdown`.
 
 ## Seeing hits and misses
 
@@ -248,6 +296,11 @@ Per request, `timings` in the response says where the prompt came from:
 | `auto_cache_save_shutdown_abandoned_total` | queued saves abandoned at the shutdown deadline |
 | `auto_cache_save_staging_bytes` (gauge) | host bytes held by saves copied and not yet written |
 | `auto_cache_save_queue_depth` (gauge) | saves queued or being written |
+| `auto_cache_save_deferred_total` | saves whose positional K/V was copied after the capture |
+| `auto_cache_save_deferred_forced_total` | times a cache mutation forced a pending deferred copy |
+| `auto_cache_save_deferred_bytes_total` | positional bytes those saves left in the cache to copy later |
+| `auto_cache_save_deferred_pending` (gauge) | deferred captures still owing positional bytes |
+| `auto_cache_save_deferred_host_bytes` (gauge) | side-state held by those captures |
 | `auto_cache_save_site_requested_total{site=...}` / `auto_cache_save_site_published_total{site=...}` | units each save site decided to write / of those, published. `site` is `reclaim`, `idle`, `shutdown`, `cache_idle`, `system_node`, `prompt_node` or `response_node`. Requested minus published is what that site lost (failed, orphaned, abandoned or dropped); a deferred idle flush is counted once, when it is taken |
 
 A miss includes conversations no cache could have held, so read it next to `auto_cache_evicted_total`:
@@ -274,9 +327,10 @@ curl -s localhost:8080/completion -d '{"prompt":"...","n_predict":16,"cache_prom
   writer, unless the staging is full and the writer busy, when the capture also waits for the writer
   (see "Staging budget"). The default `cold` prompt node adds at most one capture per conversation start;
   `on` adds one per turn that brings at least a block of new prompt.
-- The copy off the device stays on the request's critical path. It lands in ordinary (pageable) host
-  memory; staging in pinned memory may copy faster on a GPU and is not measured yet. Moving the copy
-  itself off the first token needs the cells to be copied lazily after the node, which is not done.
+- The side-state copy stays on the request's critical path, and with `--no-slot-save-defer` (or a class
+  with nothing positional) the whole copy does. It lands in ordinary (pageable) host memory; staging in
+  pinned memory may copy faster on a GPU and is not measured yet. A reclaim save gains nothing from the
+  deferred copy (the new request frees the cells at once, which forces it).
 - The system node is placed from the chat template for every template (the boundary is checked over
   all of `models/templates` by `test-chat-preamble`). The first chat request with a new system prompt
   or tool set pays for the template renders that find it: about four times one render of the request,
