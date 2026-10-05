@@ -1370,6 +1370,16 @@ struct server_slot {
     // span, n_tokens - 1 block-aligned down). Saved through auto_save_slot_if_useful, so it is a delta on
     // the deepest saved node under --slot-save-incremental. -1 = not armed.
     int32_t prompt_save_pos = -1;
+    // --- periodic prefill checkpoints (--slot-save-prefill-interval) ---
+    // The positions (ascending, each a multiple of the interval, moved down to a chunk start when it would
+    // split a media chunk) at which this prefill stops its batch and publishes a node, armed at prompt start;
+    // ckpt_save_idx is the next one to reach. Each node is saved through auto_save_slot_if_useful, so it is a
+    // delta on the previous one under --slot-save-incremental and the true whole state there for every class.
+    std::vector<int32_t> ckpt_save_pos;
+    size_t               ckpt_save_idx = 0;
+    // a prefill that counted as cold for the prompt node has not reached the end of its prompt yet: a resend
+    // that continues it on this slot (a client disconnect, a timeout) still counts as cold
+    bool                 cold_prefill_open = false;
 
     // --- KV restore-reuse (logits sidecar) ---
     // Full-vocab logits of this slot's most recently sampled token, captured at sample time
@@ -4025,6 +4035,7 @@ private:
         // test hooks (environment, read once): slow the writer down, fail the k-th .meta rename
         int64_t                 test_delay_ms  = 0;
         int64_t                 test_fail_meta = 0;
+        int64_t                 test_prefill_delay_ms = 0; // LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS
         int64_t                 n_publishes    = 0;
         int64_t                 reap_age_s     = 600;
         int64_t                 shutdown_ms    = 90 * 1000;
@@ -4067,6 +4078,7 @@ private:
         aw.chunk          = std::clamp<size_t>(aw.budget / 2, 4096, AW_MAX_CHUNK);
         aw.test_delay_ms  = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_DELAY_MS", 0);
         aw.test_fail_meta = aw_env_i64("LLAMA_TEST_SLOT_SAVE_FAIL_META_AT", 0);
+        aw.test_prefill_delay_ms = aw_env_i64("LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS", 0);
         aw.reap_age_s     = aw_env_i64("LLAMA_TEST_SLOT_SAVE_TMP_REAP_AGE_S", 600);
         aw.shutdown_ms    = aw_env_i64("LLAMA_TEST_SLOT_SAVE_SHUTDOWN_DEADLINE_MS", AW_SHUTDOWN_DEADLINE_MS);
         aw.stall_ms       = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS", AW_STALL_MS);
@@ -8290,6 +8302,21 @@ private:
                 auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_PROMPT_NODE);
                 slot.prompt_save_pos = -1;
             }
+            // periodic prefill checkpoints: the same mechanism every --slot-save-prefill-interval tokens
+            while (slot.ckpt_save_idx < slot.ckpt_save_pos.size() &&
+                   slot.ckpt_save_pos[slot.ckpt_save_idx] <= slot.prompt.n_tokens()) {
+                if (slot.ckpt_save_pos[slot.ckpt_save_idx] == slot.prompt.n_tokens()) {
+                    SLT_INF(slot, "auto-save: prefill checkpoint at %d of %d prompt tokens\n",
+                            slot.prompt.n_tokens(), slot.task->n_tokens());
+                    auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_PREFILL_CKPT);
+                }
+                slot.ckpt_save_idx++;
+            }
+            if (aw.test_prefill_delay_ms > 0) {
+                // test hook (LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS): slow every prefill batch down so a test can
+                // interrupt a prefill between two checkpoints
+                std::this_thread::sleep_for(std::chrono::milliseconds(aw.test_prefill_delay_ms));
+            }
         }
         // ===== end MID-PREFILL BASE =====================================================
     }
@@ -9119,6 +9146,10 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // for the periodic checkpoints: did this task restore from disk, and how much did the slot hold
+                        const bool    restored_now = slot.n_auto_restored_pending > 0;
+                        const int32_t n_resident   = (int32_t) slot.prompt.n_tokens();
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
                         auto_restore_account(slot, n_past);
@@ -9139,6 +9170,10 @@ private:
                         // idle-flush [0,B) sub-range checkpoint this replaces).
                         slot.ctx_save_pos    = -1;
                         slot.prompt_save_pos = -1;
+                        slot.ckpt_save_pos.clear();
+                        slot.ckpt_save_idx   = 0;
+                        const bool cold_prefill_was_open = slot.cold_prefill_open;
+                        slot.cold_prefill_open = false;
                         if (auto_cache_enabled() &&
                             slot.task->need_sampling() &&               // generative only (not embed/rerank; keeps the can_split path)
                             slot.alora_invocation_start <= 0 &&         // aLoRA caching bound (mirror the auto-restore gate)
@@ -9208,6 +9243,19 @@ private:
                             // it: anything closer is a prefix that the system node already covers for every
                             // request that could reuse it, and would only cost a second save on a cold first
                             // prompt with a short first message.
+                            // A prefill that resumes an interrupted one counts as cold too (--slot-save-prefill-interval
+                            // only, so the default behaviour is unchanged): the prompt that was cut short never reached
+                            // its prompt node. Recognised by (a) this slot still holding all of an unfinished cold
+                            // prefill, (b) a reuse that ends exactly on a periodic checkpoint (a multiple of the
+                            // interval), or (c) a reuse that already reaches into the last user message, which only a
+                            // checkpoint inside it (or a warm slot that prefilled part of it) can give.
+                            const int32_t interval = params_base.slot_save_prefill_interval;
+                            const int32_t user_pos = spans.last_user_message_pos();
+                            const bool    resumed  = interval > 0 && n_past > 0 && (
+                                    (cold_prefill_was_open && !restored_now && n_past == n_resident) ||
+                                    n_past % interval == 0 ||
+                                    (user_pos > 0 && n_past > user_pos));
+                            const bool    is_cold  = n_past < std::max(B, params_base.slot_save_min_tokens) || resumed;
                             if (params_base.slot_save_node_prompt != COMMON_SLOT_SAVE_NODE_PROMPT_OFF) {
                                 const int     floor    = std::max(B, params_base.slot_save_min_tokens);
                                 const int32_t user_end = spans.last_user_message_end();
@@ -9221,7 +9269,7 @@ private:
                                 const auto    ok       = [&](int32_t x) {
                                     const bool want = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
                                                       ? n_past + B <= x
-                                                      : n_past < floor;
+                                                      : is_cold;
                                     const bool past_sys = slot.ctx_save_pos <= 0 || x >= slot.ctx_save_pos + B;
                                     return want && past_sys && x >= floor && x < n_prompt && n_past < x;
                                 };
@@ -9229,6 +9277,38 @@ private:
                                     slot.prompt_save_pos = B_p;
                                 } else if (B_p != B_al && ok(B_al)) {
                                     metrics.n_auto_node_media_skipped++; // only the media cut stopped it
+                                }
+                            }
+
+                            // --- PERIODIC PREFILL CHECKPOINTS (--slot-save-prefill-interval, default off) ---
+                            // Every multiple of the interval strictly between the reuse and the end of the prompt,
+                            // at or above the save floor. Like the nodes above, a checkpoint is the true whole state
+                            // at its position, so it is sound for every memory class, and it is cut where the
+                            // previous cell is text (a position inside or right after a media chunk moves down to
+                            // the chunk's start; one that then falls at or below the reuse or the previous
+                            // checkpoint is dropped). A position the system or the prompt node already takes is not
+                            // armed twice.
+                            if (interval > 0) {
+                                const int32_t floor = std::max(B, params_base.slot_save_min_tokens);
+                                int32_t       prev  = n_past;
+                                for (int64_t p = ((int64_t) n_past / interval + 1) * interval; p < n_prompt; p += interval) {
+                                    const int32_t c = cut_down((int32_t) p);
+                                    if (c < floor || c <= prev || c == slot.ctx_save_pos || c == slot.prompt_save_pos) {
+                                        if (c != (int32_t) p && p >= floor) {
+                                            metrics.n_auto_node_media_skipped++;
+                                        }
+                                        continue;
+                                    }
+                                    slot.ckpt_save_pos.push_back(c);
+                                    prev = c;
+                                }
+                                if (params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_COLD && is_cold) {
+                                    slot.cold_prefill_open = true; // cleared when the prompt is done
+                                }
+                                if (!slot.ckpt_save_pos.empty()) {
+                                    SLT_INF(slot, "auto-save: %zu prefill checkpoint(s) armed every %d tokens, first at %d (reuse %d of %d)%s\n",
+                                            slot.ckpt_save_pos.size(), interval, slot.ckpt_save_pos.front(), n_past, n_prompt,
+                                            resumed ? ", resuming an interrupted prefill" : "");
                                 }
                             }
                         }
@@ -9411,6 +9491,11 @@ private:
                             (slot.prompt_save_pos > 0 && slot.prompt.n_tokens() == slot.prompt_save_pos)) {
                             break;
                         }
+                        // the same for the periodic prefill checkpoints (empty unless --slot-save-prefill-interval)
+                        if (slot.ckpt_save_idx < slot.ckpt_save_pos.size() &&
+                            slot.prompt.n_tokens() == slot.ckpt_save_pos[slot.ckpt_save_idx]) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -9457,6 +9542,7 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+                        slot.cold_prefill_open = false; // the prompt this prefill was for is complete
 
                         GGML_ASSERT(batch.size() > 0);
 

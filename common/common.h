@@ -748,6 +748,10 @@ struct common_params {
     bool    slot_save_node_response = false; // save the conversation as soon as each response completes
     bool    slot_save_node_tool     = false; // same, but only for responses that end in tool calls
     bool    slot_save_on_reclaim    = true;  // save a slot's conversation before a different one takes the slot
+    // periodic prefill checkpoint: while a prompt prefills, publish a node every N tokens (at each multiple of N),
+    // so an interrupted long prefill resumes from the last one and a request that diverges inside a long message
+    // restores to within N tokens of the divergence. 0 = off (default)
+    int32_t slot_save_prefill_interval = 0;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

@@ -913,12 +913,14 @@ enum auto_save_site : uint8_t {
     AUTO_SAVE_SITE_SYSTEM_NODE,   // mid-prefill, at the end of the system prompt
     AUTO_SAVE_SITE_PROMPT_NODE,   // mid-prefill, at the end of the user message
     AUTO_SAVE_SITE_RESPONSE_NODE, // --slot-save-node-response / --slot-save-node-tool
+    AUTO_SAVE_SITE_PREFILL_CKPT,  // --slot-save-prefill-interval, mid-prefill every N tokens
     AUTO_SAVE_SITE_COUNT,
 };
 
 inline const char * auto_save_site_name(int site) {
     static const char * const names[AUTO_SAVE_SITE_COUNT] = {
         "reclaim", "idle", "shutdown", "cache_idle", "system_node", "prompt_node", "response_node",
+        "prefill_checkpoint",
     };
     return site >= 0 && site < AUTO_SAVE_SITE_COUNT ? names[site] : "unknown";
 }

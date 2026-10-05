@@ -995,6 +995,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.slot_restore_min_tokens > params.slot_save_context_min_tokens) {
         throw std::invalid_argument("--slot-restore-min-tokens must be <= --slot-save-context-min-tokens");
     }
+    // a checkpoint every N tokens: N below one block would publish units the index cannot even key apart
+    if (params.slot_save_prefill_interval < 0) {
+        throw std::invalid_argument("--slot-save-prefill-interval must be >= 0");
+    }
+    if (params.slot_save_prefill_interval > 0 && params.slot_save_prefill_interval < params.slot_save_block) {
+        throw std::invalid_argument("--slot-save-prefill-interval must be 0 or >= --slot-save-block");
+    }
     // idle-delay flush is inert without the master switch (auto_idle_flush_enabled() gates on
     // auto_cache_enabled()); reject an explicit --slot-save-idle-seconds without --slot-save-auto
     // rather than silently ignoring it. The default (unset) is left alone so plain servers still run.
@@ -3836,6 +3843,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_save_on_reclaim = value;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_ON_RECLAIM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-prefill-interval"}, "N",
+        string_format("auto disk cache: while a prompt prefills, publish a node every N tokens (at each multiple of N "
+                      "past the save floor), so a long prefill that is interrupted (a timeout, a disconnect, a crash) "
+                      "resumes from the last node, and a request that changes the end of a long message restores to "
+                      "within N tokens of the change. Each node is a delta on the previous one under "
+                      "--slot-save-incremental (a whole snapshot without it, or on a model that cannot write deltas). "
+                      "Must be 0 or at least --slot-save-block (default: %d, 0 = off)", params.slot_save_prefill_interval),
+        [](common_params & params, int value) {
+            params.slot_save_prefill_interval = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_PREFILL_INTERVAL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
