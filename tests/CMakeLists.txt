@@ -264,6 +264,31 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-${model}" --expect-deferred ${expect})
         set_tests_properties(test-state-deferred-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
     endforeach()
+    # k-pool memory classes: a sequence's output must not depend on another sequence sharing a unified cache
+    # (regression cases of the glm5next branch's k-pool fixes 625fbcbad and 525a329bb, as a behaviour test);
+    # llama-dense is the plain-attention control
+    llama_build(test-kpool-unified.cpp)
+    foreach(model glm5-next-moe qwen4exp-moe llama-dense)
+        llama_test(test-kpool-unified NAME test-kpool-unified-${model} LABEL main ARGS -m "${MODEL_DIR}/${model}.gguf")
+        set_tests_properties(test-kpool-unified-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # Restore mode 2 (LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL): only the side-state is loaded over the sequence's own
+    # positional cells. The second field says whether the memory class supports it (1) or must refuse it (0).
+    llama_build(test-state-skip-positional.cpp)
+    set(STATE_SKIP_CLASSES
+        "llama-dense|0" "gemma3-dense|0" "mamba-dense|1" "qwen35-dense|1" "glm5-next-moe|0" "qwen4exp-moe|0"
+        "glm-dsa-moe|0" "deepseek4-moe|0")
+    foreach(case ${STATE_SKIP_CLASSES})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 expect)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/skip-${model}")
+        llama_test(test-state-skip-positional NAME test-state-skip-positional-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/skip-${model}" --expect-supported ${expect})
+        set_tests_properties(test-state-skip-positional-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # Not a test: device-to-host copy bandwidth into pageable versus pinned host memory (run by hand on a drained card)
+    llama_build(bench-d2h-pinned.cpp)
     # A first decode right after a prompt-node-sized prefill (a ubatch padded past the pooled rows): the
     # k-pool indexer's pad entries re-pool cells of the captured sequence, so that cache must not defer
     foreach(model glm5-next-moe qwen4exp-moe)
