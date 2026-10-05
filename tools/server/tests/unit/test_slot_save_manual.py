@@ -140,8 +140,9 @@ def test_manual_round_trip_continues_like_cold(name, spec):
             elif name == "llama-dense":
                 assert t["prompt_n"] <= 1, t   # plain attention trims one token and re-decodes it
             # gemma3-dense: a sliding-window state past one window cannot rewind by one token and the
-            # logits sidecar covers only the FULL and RS classes, so the exact resend re-prefills (a
-            # known limit, the same before this endpoint moved to upstream's format); still equal to cold
+            # manual endpoint writes the logits sidecar only for the FULL, RS and NO classes (the automatic
+            # cache writes it for every class), so the exact resend re-prefills (a known limit of the
+            # manual endpoint, the same before it moved to upstream's format); still equal to cold
         else:
             assert t["cache_n"] >= n_saved - 1, t
             assert t["prompt_n"] <= len(TAIL) + 1, t

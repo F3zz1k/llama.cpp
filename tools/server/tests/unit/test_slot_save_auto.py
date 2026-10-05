@@ -175,7 +175,11 @@ def test_text_only_meta_byte_identical():
 
     # exact emitted filenames (identity-hash prefix, then the fp_model-salted block-chain hash
     # and the token count — a drift in any of them shows up here first)
-    assert sorted(os.listdir(CACHE_DIR)) == sorted(EMITTED_SHA256)
+    # (plus the unit's .logits sidecar, written for every memory class since 2026-10-05; not part of the
+    # frozen format, so only its presence is checked)
+    files = sorted(os.listdir(CACHE_DIR))
+    assert [n for n in files if not n.endswith(".logits")] == sorted(EMITTED_SHA256)
+    assert [n for n in files if n.endswith(".logits")] == [n + ".logits" for n in EMITTED_SHA256 if n.endswith(".bin")]
     # the sha comparison below is against the frozen fixture, so it only carries meaning while
     # both files are readable by this build: name a version bump for what it is first
     for name in FIXTURE_SHA256:
