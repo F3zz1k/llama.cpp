@@ -833,6 +833,10 @@ extern "C" {
     // plus recurrent) and recurrent-only memory
     LLAMA_API bool llama_memory_can_skip_positional(llama_memory_t mem);
 
+    // Whether a sequence load with LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE is supported: hybrid (attention plus
+    // recurrent) memory
+    LLAMA_API bool llama_memory_can_skip_side(llama_memory_t mem);
+
     //
     // State / sessions
     //
@@ -955,6 +959,15 @@ extern "C" {
 // llama_memory_can_skip_positional() is true accept it; the others fail the load without touching the
 // sequence.
 #define LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL 8
+
+// The complement of SKIP_POSITIONAL: apply only the positional K/V of the attention cache and read past the
+// side-state (recurrent state), leaving the destination sequence's side-state as it was. For the inner nodes
+// of a composed chain (a root, then deltas loaded with NO_CLEAR): each node carries the whole side-state at
+// its own end, and only the last node's is wanted, so the earlier ones are read past instead of being moved
+// onto the device and then overwritten. The last node must then be loaded without this flag. Only memory
+// types for which llama_memory_can_skip_side() is true accept it; the others fail the load without touching
+// the sequence. Cannot be combined with SKIP_POSITIONAL.
+#define LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE 16
 
     typedef uint32_t llama_state_seq_flags;
 

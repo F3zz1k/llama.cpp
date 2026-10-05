@@ -69,6 +69,10 @@ public:
     // a recurrent state has nothing positional: SKIP_POSITIONAL reads it whole
     bool state_can_skip_positional() const override { return true; }
 
+    // read past a single sequence's state as state_write wrote it (cell metadata, then the r/s rows per layer),
+    // checking its shape like state_read does, without touching the cache. Throws on a mismatch
+    void state_skip(llama_io_read_i & io) const;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)

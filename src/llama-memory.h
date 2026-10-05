@@ -140,6 +140,12 @@ struct llama_memory_i {
     virtual bool state_can_skip_positional() const {
         return false;
     }
+
+    // whether state_read accepts LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE (apply the positional K/V and read past the
+    // side-state); a memory type that does not override this refuses the flag
+    virtual bool state_can_skip_side() const {
+        return false;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

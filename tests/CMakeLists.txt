@@ -287,6 +287,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/skip-${model}" --expect-supported ${expect})
         set_tests_properties(test-state-skip-positional-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
     endforeach()
+    # The inner nodes of a composed chain (LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE): only the positional K/V is loaded and
+    # the side-state is read past, the tip's side-state being the one the slot keeps. Second field as above.
+    llama_build(test-state-skip-side.cpp)
+    set(STATE_SKIP_SIDE_CLASSES
+        "llama-dense|0" "gemma3-dense|0" "mamba-dense|0" "qwen35-dense|1" "glm5-next-moe|0" "qwen4exp-moe|0"
+        "deepseek4-moe|0")
+    foreach(case ${STATE_SKIP_SIDE_CLASSES})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 expect)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/skip-side-${model}")
+        llama_test(test-state-skip-side NAME test-state-skip-side-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/skip-side-${model}" --expect-supported ${expect})
+        set_tests_properties(test-state-skip-side-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
     # Not a test: device-to-host copy bandwidth into pageable versus pinned host memory (run by hand on a drained card)
     llama_build(bench-d2h-pinned.cpp)
     # A first decode right after a prompt-node-sized prefill (a ubatch padded past the pooled rows): the

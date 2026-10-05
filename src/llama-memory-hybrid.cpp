@@ -213,6 +213,22 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         return;
     }
 
+    if (flags & LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE) {
+        // apply the attention part and read past the recurrent part: the sequence's recurrent state stays as it
+        // was until a later load without this flag (the last node of a chain) replaces it
+        GGML_ASSERT(seq_id >= 0 && "skipping the side-state needs a single sequence");
+        GGML_ASSERT((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && "a partial state holds only side-state");
+        const llama_state_seq_flags fa = flags & ~LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE;
+        mem_attn->state_read(io, seq_id, fa);
+        try {
+            mem_recr->state_skip(io);
+        } catch (...) {
+            mem_attn->state_clear(seq_id);
+            throw;
+        }
+        return;
+    }
+
     const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
 
     if (read_attn) {

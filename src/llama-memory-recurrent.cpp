@@ -893,6 +893,71 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 }
 
+void llama_memory_recurrent::state_skip(llama_io_read_i & io) const {
+    uint32_t cell_count;
+    io.read(&cell_count, sizeof(cell_count));
+    if (cell_count > size) {
+        throw std::runtime_error("failed to skip recurrent state: more cells than the cache holds");
+    }
+
+    // cell metadata, as state_write_meta wrote it for a single sequence (no seq ids)
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        llama_pos pos;
+        uint32_t  n_seq_id;
+        io.read(&pos,      sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+        if (n_seq_id != 0) {
+            throw std::runtime_error("failed to skip recurrent state: not a single-sequence state");
+        }
+    }
+
+    // the data, as state_write_data wrote it; the shape checks mirror state_read_data
+    uint32_t s_trans;
+    uint32_t n_layer;
+    io.read(&s_trans, sizeof(s_trans));
+    io.read(&n_layer, sizeof(n_layer));
+    if (n_layer != hparams.n_layer() || s_trans != 0) {
+        throw std::runtime_error("failed to skip recurrent state: layer count or s layout mismatch");
+    }
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) {
+            continue;
+        }
+        int32_t  type_ref;
+        uint64_t row_ref;
+        io.read(&type_ref, sizeof(type_ref));
+        io.read(&row_ref,  sizeof(row_ref));
+        if (type_ref != (int32_t) r_l[il]->type || row_ref != ggml_row_size(r_l[il]->type, hparams.n_embd_r())) {
+            throw std::runtime_error("failed to skip recurrent state: r type or row size mismatch");
+        }
+        io.skip((size_t) cell_count * row_ref);
+
+        if (p_l[il] != nullptr) {
+            uint64_t p_row_ref;
+            io.read(&p_row_ref, sizeof(p_row_ref));
+            if (p_row_ref != ggml_row_size(p_l[il]->type, hparams.ple_conv_state())) {
+                throw std::runtime_error("failed to skip recurrent state: ple row size mismatch");
+            }
+            io.skip((size_t) cell_count * p_row_ref);
+        }
+    }
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (s_l[il] == nullptr) {
+            continue;
+        }
+        int32_t  type_ref;
+        uint64_t row_ref;
+        io.read(&type_ref, sizeof(type_ref));
+        io.read(&row_ref,  sizeof(row_ref));
+        if (type_ref != (int32_t) s_l[il]->type || row_ref != ggml_row_size(s_l[il]->type, hparams.n_embd_s())) {
+            throw std::runtime_error("failed to skip recurrent state: s type or row size mismatch");
+        }
+        io.skip((size_t) cell_count * row_ref);
+    }
+}
+
 void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {

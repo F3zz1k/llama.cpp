@@ -75,6 +75,8 @@ public:
     // the k-pool indexer mirrors the attention cells and is rewritten by the pooled scatter, so it cannot be
     // kept while a side-state is loaded under it: a skip-positional load is refused (the base class accepts it)
     bool state_can_skip_positional() const override { return false; }
+    // its state_read re-pools the indexer from the whole loaded state, so the inner-node skip is refused too
+    bool state_can_skip_side() const override { return false; }
 
     void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const override;
 
