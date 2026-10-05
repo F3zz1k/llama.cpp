@@ -700,7 +700,8 @@ static void slot_save_enforce_limits(const std::string & dir,
                                      int32_t max_count, int64_t max_bytes,
                                      const std::string & just_written,
                                      bool & oversized,
-                                     uint64_t * n_evicted = nullptr) {
+                                     uint64_t * n_evicted = nullptr,
+                                     uint64_t * n_bound_exceeded = nullptr) {
     oversized = false;
     if (max_count <= 0 && max_bytes <= 0) {
         return; // both unlimited
@@ -1050,6 +1051,9 @@ static void slot_save_enforce_limits(const std::string & dir,
             if (!evict_leaf()) {
                 SRV_WRN("%s", "slot-save cache is over --slot-save-max-count but every remaining snapshot "
                               "has a live child delta; leaving it above the limit\n");
+                if (n_bound_exceeded) {
+                    (*n_bound_exceeded)++;
+                }
                 break;
             }
         }
@@ -1059,6 +1063,9 @@ static void slot_save_enforce_limits(const std::string & dir,
             if (!evict_leaf()) {
                 SRV_WRN("%s", "slot-save cache is over --slot-save-max-bytes but every remaining snapshot "
                               "has a live child delta; leaving it above the limit\n");
+                if (n_bound_exceeded) {
+                    (*n_bound_exceeded)++;
+                }
                 break;
             }
         }
@@ -1245,6 +1252,17 @@ struct auto_cache_index {
     // with indexed_files when files disappear (auto_index_drop_missing_locked), so a peer
     // evicting a rejected unit lets a later same-name re-create be examined afresh.
     std::unordered_set<std::string> rejected_files;
+    // Units of THIS model file that fail restore_compatible (another rung's RoPE/YaRN settings, other cache
+    // types, another mmproj, LoRA or block size). Never restored; kept only so a miss they would have
+    // served is reported as an identity miss (llamacpp:auto_cache_restore_miss_identity_total). Their
+    // boundary keys equal the live ones for the same tokens, since the chain is salted with the model and
+    // the mmproj only. Read once per file, like indexed_files.
+    struct foreign_unit {
+        std::vector<uint64_t> bhs;
+        std::string           why; // the identity fields that differ
+    };
+    std::unordered_map<std::string, foreign_unit> foreign_files;
+    std::unordered_map<uint64_t, uint32_t>        foreign_by_boundary; // boundary -> number of foreign units
     bool scanned = false;
     std::filesystem::file_time_type dir_mtime{};      // dir mtime as of the last scan
     std::chrono::steady_clock::time_point last_refresh{}; // throttle: skip stat storms in a burst
@@ -1355,6 +1373,11 @@ struct server_slot {
     // prompt-prefix tokens the RAM prompt cache (--cache-ram) brought into this slot for the current
     // task, beyond what the slot already held; accounted with the disk ones in auto_restore_account
     int32_t n_ram_loaded_pending = 0;
+    // the unit behind n_auto_restored_pending: its length, the files on its chain, and 1 = whole state loaded,
+    // 2 = side-state only (the slot's positional cells kept)
+    uint32_t disk_unit_pending  = 0;
+    uint32_t disk_nodes_pending = 0;
+    uint8_t  disk_mode_pending  = 0;
 
     // --- mid-prefill shared-context base save (Option A) ---
     // When > 0, this cold-prefilling slot is ARMED to whole-save the leading shared preamble
@@ -2135,6 +2158,7 @@ private:
     // (auto_metrics_fill).
     struct auto_save_counters {
         std::atomic<uint64_t> failed{0}, root{0}, delta{0}, bytes{0}, evicted{0}, draft{0}, draft_skipped{0};
+        std::atomic<uint64_t> bound_exceeded{0};
         std::atomic<uint64_t> queued{0}, streamed{0}, dropped_staging{0}, orphan_dropped{0}, shutdown_abandoned{0};
         std::atomic<uint64_t> admission_waits{0}, admission_wait_us{0};
         std::atomic<uint64_t> deferred{0}, deferred_forced{0}, deferred_bytes{0};
@@ -2168,6 +2192,8 @@ private:
         m.n_auto_save_delta              = aw_cnt.delta.load();
         m.n_auto_save_bytes              = aw_cnt.bytes.load();
         m.n_auto_cache_evicted          += aw_cnt.evicted.load();
+        m.n_auto_cache_bound_exceeded    = aw_cnt.bound_exceeded.load();
+        m.auto_delta_capable             = delta_capable == delta_cap::yes ? 1 : delta_capable == delta_cap::no ? 2 : 0;
         m.n_auto_save_draft              = aw_cnt.draft.load();
         m.n_auto_save_draft_skipped      = aw_cnt.draft_skipped.load();
         m.n_auto_save_queued             = aw_cnt.queued.load();
@@ -2206,6 +2232,14 @@ private:
         }
         const int32_t kept = std::max(0, std::min(n, n_past));
         slot.stats.n_prompt_cached_disk = (uint64_t) kept;
+        if (kept > 0) {
+            slot.stats.cache_disk_unit_n = slot.disk_unit_pending;
+            slot.stats.cache_disk_nodes  = slot.disk_nodes_pending;
+            slot.stats.cache_disk_mode   = slot.disk_mode_pending;
+            if (slot.disk_mode_pending == 2) {
+                metrics.n_auto_restore_side_only++;
+            }
+        }
         if (kept > 0) {
             metrics.n_auto_restore_hit++;
             metrics.n_auto_restore_tokens += (uint64_t) kept;
@@ -2339,12 +2373,15 @@ private:
     // save/restore soundness decision must use THIS, not n_swa: --swa-full enlarges the SWA cache but
     // does not disable masking, so saves stay windowed even when n_swa above has been zeroed.
     int32_t n_swa_mem = 0;
+    // the memory type can load a unit's side-state alone (LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL): restore mode 2
+    bool side_only_supported = false;
 
     // Candidates the current restore attempt passed over because the request diverges inside them
     // and this memory class cannot rewind into a snapshot (the "must extend" rule). Reset by the
     // restore site before its lookup, bumped by auto_index_lookup's filter and by the whole-prefix
     // gate in auto_restore_into_slot, read back to classify a miss.
     size_t auto_not_prefix_skips = 0;
+    int64_t auto_shared_last_wrn_ms = -1; // rate limit of the shared-prefix skip WRN
 
     // slots / clients
     std::vector<server_slot> slots;
@@ -2708,6 +2745,52 @@ private:
     // only ever keep-longer-inserts the same/new entries (auto_index_insert_locked), so it is safe to
     // call repeatedly for the cross-process refresh. Records the dir mtime so a refresh can cheaply
     // tell whether anything changed. CALLER MUST HOLD auto_idx.mtx.
+    // The identity fields in which a unit's fingerprint differs from the live one (restore_compatible's
+    // fields, grouped as an operator would name them), for the identity-miss WRN.
+    static std::string auto_fp_diff(const model_fp & d, const model_fp & live) {
+        std::string out;
+        const auto add = [&](bool differs, const char * what) {
+            if (differs) {
+                out += out.empty() ? what : std::string(", ") + what;
+            }
+        };
+        add(d.fp_n_vocab != live.fp_n_vocab || d.fp_n_ctx_train != live.fp_n_ctx_train || d.fp_n_embd != live.fp_n_embd ||
+            d.fp_n_layer != live.fp_n_layer || d.fp_rope_type != live.fp_rope_type, "model shape");
+        add(d.fp_cache_k != live.fp_cache_k || d.fp_cache_v != live.fp_cache_v, "KV cache types");
+        add(d.ctx_long_regime(live) != live.ctx_long_regime(live), "LongRoPE regime (-c on the other side of the original context)");
+        add(d.fp_kv_layout != live.fp_kv_layout, "KV layout (-fa, KV streams)");
+        add(d.fp_block != live.fp_block, "--slot-save-block");
+        add(d.fp_rope_scale != live.fp_rope_scale || d.fp_rope_base != live.fp_rope_base || d.fp_yarn_ext != live.fp_yarn_ext ||
+            d.fp_yarn_attn != live.fp_yarn_attn || d.fp_yarn_beta_fast != live.fp_yarn_beta_fast ||
+            d.fp_yarn_beta_slow != live.fp_yarn_beta_slow || d.fp_yarn_orig_ctx != live.fp_yarn_orig_ctx, "RoPE/YaRN settings");
+        add(d.fp_lora != live.fp_lora, "LoRA set");
+        add(d.fp_mmproj_loaded != live.fp_mmproj_loaded || d.fp_mmproj != live.fp_mmproj, "mmproj");
+        return out.empty() ? "unknown" : out;
+    }
+
+    // How many leading tokens of a text request a foreign-identity unit of this model covers (its deepest
+    // shared whole block), with the differing fields of one such unit. 0 when none does or the request
+    // carries media. CALLER MUST HOLD auto_idx.mtx.
+    int32_t auto_foreign_cover_locked(const server_tokens & req, std::string & why) {
+        if (auto_idx.foreign_by_boundary.empty() || req.has_media()) {
+            return 0;
+        }
+        const int B = params_base.slot_save_block;
+        const auto bhs = auto_block_hashes(req.get_cell_tokens(), {}, B, cur_fp.fp_model, cur_fp.fp_mmproj, nullptr);
+        for (size_t k = bhs.size(); k-- > 0; ) {
+            if (auto_idx.foreign_by_boundary.count(bhs[k])) {
+                for (const auto & [path, fu] : auto_idx.foreign_files) {
+                    if (std::find(fu.bhs.begin(), fu.bhs.end(), bhs[k]) != fu.bhs.end()) {
+                        why = fu.why;
+                        break;
+                    }
+                }
+                return (int32_t) (k + 1) * B;
+            }
+        }
+        return 0;
+    }
+
     void auto_index_scan_locked() {
         std::error_code mec;
         const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
@@ -2760,7 +2843,17 @@ private:
                 continue;
             }
             if (!fp.restore_compatible(cur_fp)) {
-                continue; // foreign model / requant / different KV geometry (invariant 3)
+                // foreign model / requant / different KV geometry (invariant 3). A unit of the same model
+                // under another identity is remembered for the identity-miss counter.
+                if (fp.fp_model == cur_fp.fp_model && !auto_idx.foreign_files.count(p)) {
+                    auto & fu = auto_idx.foreign_files[p];
+                    fu.bhs = auto_block_hashes(toks, media, params_base.slot_save_block, cur_fp.fp_model, cur_fp.fp_mmproj, nullptr);
+                    fu.why = auto_fp_diff(fp, cur_fp);
+                    for (uint64_t bh : fu.bhs) {
+                        auto_idx.foreign_by_boundary[bh]++;
+                    }
+                }
+                continue;
             }
             // rehash from the sidecar's cells + media records (media empty on v1 => the
             // text-only chain, bit-identical to what the writer keyed the file with). Only
@@ -2976,6 +3069,21 @@ private:
         }
         for (const auto & p : gone) {
             auto_idx.indexed_files.erase(p);
+        }
+        // foreign-identity units a peer evicted no longer explain a miss
+        for (auto it = auto_idx.foreign_files.begin(); it != auto_idx.foreign_files.end(); ) {
+            std::error_code ec;
+            if (!std::filesystem::exists(it->first, ec) || ec) {
+                for (uint64_t bh : it->second.bhs) {
+                    auto f = auto_idx.foreign_by_boundary.find(bh);
+                    if (f != auto_idx.foreign_by_boundary.end() && --f->second == 0) {
+                        auto_idx.foreign_by_boundary.erase(f);
+                    }
+                }
+                it = auto_idx.foreign_files.erase(it);
+            } else {
+                ++it;
+            }
         }
         // also forget parse-rejected units whose files a peer evicted, so a later
         // re-create under the same deterministic name is examined afresh.
@@ -3313,13 +3421,111 @@ private:
         return true;
     }
 
+    // Mode 2 (A2.3): load only the side-state of `cand` (its recurrent state at n_keep cells) into a slot that
+    // already holds the same n_keep tokens' positional K/V, then trim the slot to n_keep. The draft keeps its own
+    // positional cells too and gets the unit's carry-over when its .dft sidecar has one. Returns n_keep, or 0
+    // after dropping the slot when the load failed.
+    int auto_restore_side_only(server_slot & slot, const auto_cache_entry & cand, int n_keep) {
+        llama_tokens toks((size_t) n_keep);
+        size_t n_tok = 0;
+        const size_t nread = llama_state_seq_load_file_ext(ctx_tgt, cand.state_path.c_str(), slot.id,
+                                                           LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL,
+                                                           toks.data(), toks.size(), &n_tok);
+        const llama_pos p_keep = slot.prompt.tokens.pos_next((int64_t) n_keep);
+        bool ok = nread > 0 && n_tok == (size_t) n_keep;
+        // the attention cells past the unit, and the recurrent tail (now at n_keep - 1, so nothing to remove)
+        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p_keep, -1);
+        if (!ok) {
+            auto_restore_drop(slot);
+            metrics.n_auto_restore_failed++;
+            SLT_WRN(slot, "auto-restore: loading the side-state of %s failed; the slot was cleared, prefilling instead\n",
+                    cand.state_path.c_str());
+            return 0;
+        }
+        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, p_keep, -1)) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1); // a draft that cannot trim drafts cold
+        }
+        slot.prompt.tokens.keep_first(n_keep);
+        restore_finish(slot, &cand.state_path, (size_t) n_keep);
+        llama_pos tail = -1;
+        std::vector<uint8_t> st;
+        if (spec && ctx_dft && slot_draft_trailer_read(slot_draft_sidecar_path(cand.state_path), tail, st) &&
+            tail == llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id)) {
+            common_speculative_set_state(spec.get(), slot.id, st);
+        }
+        return n_keep;
+    }
+
+    // The memory class as the auto disk cache handles it, for /props (null when the cache is off). The delta
+    // probe runs at the first save, so its result is the gauge llamacpp:auto_cache_delta_capable instead.
+    json auto_cache_caps() const {
+        if (!auto_cache_enabled()) {
+            return json();
+        }
+        const char * seq_rm = "no";
+        switch (ctx_tgt_seq_rm_type) {
+            case COMMON_CONTEXT_SEQ_RM_TYPE_PART: seq_rm = "part"; break;
+            case COMMON_CONTEXT_SEQ_RM_TYPE_FULL: seq_rm = "full"; break;
+            case COMMON_CONTEXT_SEQ_RM_TYPE_RS:   seq_rm = "rs";   break;
+            default: break;
+        }
+        const char * node_prompt = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON  ? "on"
+                                 : params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_OFF ? "off" : "cold";
+        return json {
+            { "seq_rm",              seq_rm },                           // how the memory rewinds: part, full, rs or no
+            { "n_swa",               n_swa_mem },                        // sliding window the engine masks with
+            { "rewinds",             !restore_is_whole_prefix_only() },  // a longer unit restores trimmed to the request
+            { "side_only_restore",   side_only_supported },              // restore mode 2: side-state alone
+            { "logits_sidecar",      logits_sidecar_class() },           // exact resends emit with no decode
+            { "draft_sidecar",       ctx_dft != nullptr },
+            { "block",               params_base.slot_save_block },
+            { "incremental",         params_base.slot_save_incremental },
+            { "deferred",            params_base.slot_save_defer && params_base.slot_save_staging_mb > 0 },
+            { "node_prompt",         node_prompt },
+            { "prefill_interval",    params_base.slot_save_prefill_interval },
+        };
+    }
+
+    // How much of a raw in-memory match `n_past` the slot can actually keep, by the rule the prefill path
+    // applies after the restore site: a memory class that cannot rewind keeps a strict extension of its cells
+    // whole, and otherwise only what its window still covers or an in-memory context checkpoint at or below
+    // the divergence restores. The restore margin compares a disk unit against this, not the raw match
+    // (F3/A7): a hybrid slot that diverged inside its conversation keeps nothing past its last checkpoint, so
+    // a disk node just below the divergence beats it.
+    int32_t auto_usable_warm_reuse(const server_slot & slot, int32_t n_past, int32_t n_req) const {
+        if (n_past <= 0 || n_past >= (int32_t) slot.prompt.n_tokens() || !restore_is_whole_prefix_only()) {
+            return n_past;
+        }
+        const llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+        const bool      tail     = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                   ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        const bool      has_new  = n_past < n_req;
+        const llama_pos thold    = std::max<llama_pos>(0, pos_next - (tail ? 0 : n_swa) - (has_new ? 0 : 1));
+        const llama_pos pos_min  = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < thold) {
+            return n_past; // the window still covers the divergence (pos_min < 0: nothing held, nothing to lose)
+        }
+        int32_t best = 0;
+        for (const auto & cp : slot.prompt.checkpoints) {
+            if (cp.pos_max <= pos_next && (cp.pos_min == 0 || cp.pos_min < thold)) {
+                best = std::max<int32_t>(best, std::min<int32_t>(n_past, (int32_t) cp.n_tokens));
+            }
+        }
+        return best;
+    }
+
     // AUTO-RESTORE wrapper: byte-verify the candidate's persisted cells against the request prefix
     // and its media records against the request's live chunks (invariant 2), confirm the
     // fingerprint (invariant 3), then restore. Returns the verified prefix length actually
     // restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
     // `req` is the full request; `n_keep_mem` is the in-memory match to beat.
+    //
+    // `n_match` is how many leading cells the slot ALREADY holds for this request (the raw LCP, before any
+    // usable-reuse correction). When it reaches the whole unit, the unit is a whole prefix of the request
+    // and the memory type can load a side-state alone, the unit's side-state is loaded over the slot's own
+    // positional cells (mode 2, auto_restore_side_only) instead of the whole unit.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
-                               const server_tokens & req, int n_keep_mem) {
+                               const server_tokens & req, int n_keep_mem, int n_match = 0) {
         // read the small .meta sidecar (tokens + fp + media records) — never opens the multi-GB
         // state file (invariant 5).
         // the restore replaces this slot's cells: its deferred copies are emitted first, outside the lock
@@ -3463,6 +3669,27 @@ private:
         if (n_keep_disk < params_base.slot_restore_min_tokens) {
             return 0;
         }
+        // MODE 2: the slot already holds this unit's tokens (it diverged from the request only after them), so
+        // its positional K/V for [0, n_keep_disk) is the unit's own and only the side-state at that point is
+        // missing (a class that cannot rewind keeps its fold at the slot's end). Load just that, read past the
+        // unit's positional bytes, and trim the slot. Text units only, whole-prefix units only (the class rule
+        // already demands n_keep_disk == the unit's length), and a memory type that supports it.
+        if (side_only_supported && n_match >= n_keep_disk && n_keep_disk == (int) disk_toks.size() &&
+            restore_needs_whole_prefix(disk_toks.size()) && disk_media.empty() && !slot.prompt.tokens.has_media() &&
+            (int) slot.prompt.tokens.size() > n_keep_disk) {
+            const int r = auto_restore_side_only(slot, cand, n_keep_disk);
+            rd_lock.release();
+            if (r > 0) {
+                auto_touch_unit(cand.state_path);
+                slot.disk_unit_pending  = (uint32_t) disk_toks.size();
+                slot.disk_nodes_pending = 1; // only the tip's side-state is read
+                slot.disk_mode_pending  = 2;
+                SLT_INF(slot, "auto-restore: reused %d tokens from disk, side-state only, the slot's own %d positional cells kept (in-memory match was %d, usable %d), file=%s\n",
+                        n_keep_disk, n_keep_disk, n_match, n_keep_mem, cand.state_path.c_str());
+                return n_keep_disk;
+            }
+            return 0; // the slot was dropped on failure: the caller prefills (or tries a shorter candidate)
+        }
         // Build the root->tip chain of node .bin paths via the shared walker. Done BEFORE touching
         // the slot so any inconsistency (missing/corrupt/non-contiguous node) simply returns 0 for a
         // cold prefill, never disturbing the resident KV (invariant 4). `disk_toks` (the tip's full
@@ -3577,6 +3804,9 @@ private:
         for (const std::string & node_path : chain) {
             auto_touch_unit(node_path);
         }
+        slot.disk_unit_pending  = (uint32_t) disk_toks.size();
+        slot.disk_nodes_pending = (uint32_t) chain.size();
+        slot.disk_mode_pending  = 1;
         SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory match was %d), file=%s\n",
                 n_keep_disk, n_keep_mem, cand.state_path.c_str());
         return n_keep_disk;
@@ -5223,11 +5453,13 @@ private:
         if (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0) {
             bool oversized = false;
             uint64_t n_evicted = 0;
+            uint64_t n_bound   = 0;
             slot_save_enforce_limits(params_base.slot_save_path,
                                      params_base.slot_save_max_count,
                                      params_base.slot_save_max_bytes,
-                                     fname, oversized, &n_evicted);
-            aw_cnt.evicted += n_evicted;
+                                     fname, oversized, &n_evicted, &n_bound);
+            aw_cnt.evicted        += n_evicted;
+            aw_cnt.bound_exceeded += n_bound;
             if (oversized) {
                 published = false;
                 aw_mark_failed(job.hash);
@@ -6228,6 +6460,7 @@ private:
         // but keep a model-derived value for every save/restore soundness decision.
         n_swa      = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
         n_swa_mem  = llama_model_n_swa(model_tgt);   // what the ENGINE masks with — never 0 for an SWA model
+        side_only_supported = llama_memory_can_skip_positional(llama_get_memory(ctx_tgt));
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -8656,6 +8889,20 @@ private:
 
                             const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
 
+                            if (auto_cache_enabled() && slot.task->n_tokens_shared > 0) {
+                                // a shared prompt prefix (decision tasks): the parent and its children neither
+                                // restore nor save (need_sampling() is false for the parent), so say so
+                                metrics.n_auto_skipped_shared++;
+                                const int64_t now_ms = ggml_time_ms();
+                                if (auto_shared_last_wrn_ms < 0 || now_ms - auto_shared_last_wrn_ms >= 60 * 1000) {
+                                    auto_shared_last_wrn_ms = now_ms;
+                                    SLT_WRN(slot, "auto disk cache: a task with a shared prompt prefix (%d tokens) is neither restored nor saved "
+                                                  "(skipped so far = %" PRIu64 "; this line is rate-limited to one per minute, see "
+                                                  "llamacpp:auto_cache_skipped_shared_total)\n",
+                                            (int) slot.task->n_tokens_shared, metrics.n_auto_skipped_shared);
+                                }
+                            }
+
                             if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
@@ -8688,6 +8935,14 @@ private:
                                     // auto_index_lookup folds each chunk's identity into the boundary hashes.
                                     int n_restored = 0;
                                     auto_not_prefix_skips = 0;
+                                    // the margin gate compares a disk unit against what the slot can really keep:
+                                    // a class that cannot rewind keeps only a strict extension of its cells, or an
+                                    // in-memory context checkpoint at or below the divergence, not the raw LCP
+                                    const int32_t n_usable = auto_usable_warm_reuse(slot, n_past, (int32_t) input_tokens.size());
+                                    if (n_usable < n_past) {
+                                        SLT_DBG(slot, "auto-restore: the slot matches %d tokens but can keep only %d of them\n",
+                                                (int) n_past, n_usable);
+                                    }
                                     for (const auto & cand : auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
@@ -8700,7 +8955,7 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        const int restored = auto_restore_into_slot(slot, cand, input_tokens, (int) n_past);
+                                        const int restored = auto_restore_into_slot(slot, cand, input_tokens, n_usable, (int) n_past);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                         if (restored > 0) {
                                             n_restored = restored;
@@ -8722,8 +8977,22 @@ private:
                                         // from disk since the restore replaced the slot. auto_restore_account then
                                         // clamps it to the final n_past.
                                         slot.n_auto_restored_pending = std::max(n_restored, (int) n_past);
-                                    } else if ((int) input_tokens.size() >= n_past + params_base.slot_save_block) {
+                                    } else if ((int) input_tokens.size() >= n_usable + params_base.slot_save_block) {
                                         metrics.n_auto_restore_miss++;
+                                        {
+                                            // a unit of this model held more of the prefix under another identity
+                                            std::string why;
+                                            int32_t     cover = 0;
+                                            {
+                                                std::lock_guard<std::mutex> lk(auto_idx.mtx);
+                                                cover = auto_foreign_cover_locked(input_tokens, why);
+                                            }
+                                            if (cover >= n_usable + params_base.slot_save_block) {
+                                                metrics.n_auto_restore_miss_identity++;
+                                                SLT_WRN(slot, "auto-restore: miss, a unit of this model covers %d tokens of the prefix but was written under another identity (%s); it is never restored here\n",
+                                                        cover, why.c_str());
+                                            }
+                                        }
                                         if (auto_not_prefix_skips > 0) {
                                             // a snapshot of this prefix exists, but the request diverges inside it
                                             // and this class cannot rewind (FULL, RS, NO, or SWA past one window):
@@ -10292,6 +10561,7 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+        /* auto_cache_caps        */ impl->auto_cache_caps(),
     };
 }
 
@@ -10721,6 +10991,11 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         if (!tmpl_tools.empty()) {
             props["chat_template_tool_use"] = tmpl_tools;
         }
+    }
+
+    if (!meta.auto_cache_caps.is_null()) {
+        // the memory class as the auto disk cache sees it (docs/disk-cache.md, "Seeing hits and misses")
+        props["auto_cache"] = meta.auto_cache_caps;
     }
 
     if (meta.has_mtmd) {

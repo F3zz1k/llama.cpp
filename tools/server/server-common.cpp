@@ -106,6 +106,17 @@ json server_slot_stats::to_json() const {
         // the part of cache_n that came from the RAM prompt cache; cache_n minus both is the warm slot
         base["cache_ram_n"] = n_prompt_cached_ram;
     }
+    // where the reused prompt came from, in one field: "disk" and "ram" when either supplied it (a disk
+    // restore replaces the slot, so the two never mix), "warm" when only the resident slot did, "cold" when
+    // nothing was reused
+    base["cache_source"] = n_prompt_cached_disk > 0 ? "disk"
+                         : n_prompt_cached_ram  > 0 ? "ram"
+                         : n_prompt_cached      > 0 ? "warm" : "cold";
+    if (n_prompt_cached_disk > 0 && cache_disk_unit_n > 0) {
+        base["cache_disk_unit_n"] = cache_disk_unit_n; // the restored unit's length (cache_disk_n may trim it)
+        base["cache_disk_nodes"]  = cache_disk_nodes;  // files on its chain: 1 for a whole root
+        base["cache_disk_mode"]   = cache_disk_mode == 2 ? "side" : "whole";
+    }
 
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;

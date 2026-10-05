@@ -1625,6 +1625,26 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_auto_restore_not_prefix
         },
         {
+            "auto_cache_restore_miss_identity_total",
+            "Auto disk KV cache: misses where a unit of the same model held the prefix under another identity (a rung with other RoPE/YaRN settings, cache types, mmproj, LoRA or block size)",
+            (double) metrics.n_auto_restore_miss_identity
+        },
+        {
+            "auto_cache_restore_side_only_total",
+            "Auto disk KV cache: restores that loaded only a unit's side-state and kept the slot's own positional cells",
+            (double) metrics.n_auto_restore_side_only
+        },
+        {
+            "auto_cache_skipped_shared_total",
+            "Auto disk KV cache: tasks with a shared prompt prefix (n_tokens_shared, decision tasks) that the cache neither restores nor saves",
+            (double) metrics.n_auto_skipped_shared
+        },
+        {
+            "auto_cache_evict_bound_exceeded_total",
+            "Auto disk KV cache: eviction passes that left the store above a cap because every remaining unit has a live child or is pinned",
+            (double) metrics.n_auto_cache_bound_exceeded
+        },
+        {
             "auto_cache_restore_tokens_total",
             "Auto disk KV cache: prompt tokens restored from disk",
             (double) metrics.n_auto_restore_tokens
@@ -1769,6 +1789,10 @@ std::string server_task_result_metrics::to_metrics() {
             "auto_cache_save_deferred_pending",
             "Auto disk KV cache: deferred captures still owing positional bytes",
             (double) metrics.n_auto_save_deferred_pending
+        }, {
+            "auto_cache_delta_capable",
+            "Auto disk KV cache: the delta probe, 0 not probed yet (no save so far), 1 deltas, 2 whole roots only",
+            (double) metrics.auto_delta_capable
         }, {
             "auto_cache_save_deferred_host_bytes",
             "Auto disk KV cache: host bytes (side-state) held by deferred captures not yet emitted",

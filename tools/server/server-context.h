@@ -53,6 +53,9 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // the auto disk cache's capabilities for this model's memory class (null when the cache is off)
+    json auto_cache_caps;
 };
 
 enum server_state {
