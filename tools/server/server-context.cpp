@@ -4384,6 +4384,8 @@ private:
         bool                    defer          = false; // --slot-save-defer, with the writer running
         bool                    defer_idle     = true;  // test hook: false holds deferred copies until forced
         int64_t                 defer_trickle_ms = 10 * 1000; // a copy pending this long is trickled while busy
+        size_t                  defer_trickle_slice = 8u << 20; // ... this many bytes per AW_DEF_TRICKLE_PERIOD_US of busy time
+        int64_t                 trickle_last_us  = 0;    // the previous busy loop iteration (server thread)
         int64_t                 def_retry_ms   = -1;    // the idle emission found no staging room: retry then
         int64_t                 def_retry_step_ms = 0;  // ... after this delay, doubling while no room appears
     } aw;
@@ -4396,7 +4398,9 @@ private:
     static constexpr int64_t AW_STALL_MS             = 60 * 1000;  // a writer silent this long is treated as hung
     static constexpr int64_t AW_IDLE_RETRY_MS        = 200;        // a deferred idle flush re-checks this often
     static constexpr size_t  AW_DEF_IDLE_SLICE       = 64u << 20;  // deferred bytes emitted per idle wakeup
-    static constexpr size_t  AW_DEF_TRICKLE_SLICE    = 8u << 20;   // ... per busy loop iteration, once overdue
+    static constexpr size_t  AW_DEF_TRICKLE_SLICE    = 8u << 20;   // ... per AW_DEF_TRICKLE_PERIOD_US of busy time, once overdue
+    static constexpr int64_t AW_DEF_TRICKLE_PERIOD_US = 50 * 1000; // about one decode iteration
+    static constexpr size_t  AW_DEF_TRICKLE_MAX      = 1024u << 20; // at most this per loop iteration
     static constexpr int64_t AW_DEF_RETRY_MS         = 5;          // idle emission without staging room first re-checks after this
 
     static int64_t aw_env_i64(const char * name, int64_t def) {
@@ -4420,6 +4424,8 @@ private:
         aw.stall_ms       = aw_env_i64("LLAMA_TEST_SLOT_SAVE_WRITER_STALL_MS", AW_STALL_MS);
         aw.defer_idle       = aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_NO_IDLE", 0) == 0;
         aw.defer_trickle_ms = aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS", 10 * 1000);
+        aw.defer_trickle_slice = (size_t) std::max<int64_t>(1, aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_SLICE",
+                                                                          (int64_t) AW_DEF_TRICKLE_SLICE));
         if (aw_env_i64("LLAMA_TEST_SLOT_SAVE_DEFER_NO_HOOK", 0) != 0) {
             // test hook, the positive control: a mutation no longer forces a pending copy
             llama_state_deferred_set_hook_enabled(false);
@@ -4813,7 +4819,11 @@ private:
     //   - idle: the queue loop's idle wakeups emit AW_DEF_IDLE_SLICE at a time, pausing when the staging is
     //     full, so a task arriving meanwhile is served at once;
     //   - trickle: a copy still pending defer_trickle_ms after its capture gets AW_DEF_TRICKLE_SLICE per
-    //     busy loop iteration, so a long generation cannot hold a unit back indefinitely;
+    //     AW_DEF_TRICKLE_PERIOD_US of busy time, so a long generation cannot hold a unit back indefinitely.
+    //     The slice scales with the length of the loop iteration (capped at AW_DEF_TRICKLE_MAX): a prefill
+    //     iteration is one batch and takes seconds, and a fixed slice per iteration would hold a periodic
+    //     prefill checkpoint (a 1.2 GB delta at 16384 tokens on Qwen3.8-27B) back until the prefill ends,
+    //     so a crash during the prefill would find none of them on disk;
     //   - forced: before anything changes a referenced cell (the flush-on-mutate hook in the engine calls
     //     aw_def_flush_cb), when a capture or a task must wait for the writer, and before sleep, shutdown
     //     or a restore into the slot.
@@ -5139,13 +5149,19 @@ private:
 
     // busy loop: an overdue copy advances a little per iteration
     void aw_def_trickle() {
+        const int64_t now = ggml_time_us();
+        const int64_t dt  = aw.trickle_last_us > 0 ? now - aw.trickle_last_us : 0;
+        aw.trickle_last_us = now;
         if (aw.def.empty() || aw.defer_trickle_ms < 0) {
             return;
         }
-        if (ggml_time_us() - aw.def.front()->t_enq < aw.defer_trickle_ms * 1000) {
+        if (now - aw.def.front()->t_enq < aw.defer_trickle_ms * 1000) {
             return;
         }
-        aw_def_drive(/*blocking=*/false, AW_DEF_TRICKLE_SLICE, nullptr, "trickle");
+        // bytes per unit of busy time, not per iteration (see the stage-2 notes above)
+        const double periods = std::max(1.0, (double) dt / (double) AW_DEF_TRICKLE_PERIOD_US);
+        const size_t slice   = (size_t) std::min((double) AW_DEF_TRICKLE_MAX, periods * (double) aw.defer_trickle_slice);
+        aw_def_drive(/*blocking=*/false, std::max<size_t>(1, slice), nullptr, "trickle");
     }
 
     // teardown after the writer stopped: the captures are dropped (their jobs were abandoned)

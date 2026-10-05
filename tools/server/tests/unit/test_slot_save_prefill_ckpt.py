@@ -29,6 +29,7 @@ from utils import *
 # Test hooks read from the environment:
 #   LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS   every prefill batch sleeps this long (so a test can interrupt it)
 #   LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS   a deferred copy is trickled once it waited this long (default 10 s)
+#   LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_SLICE bytes trickled per 50 ms of busy time (default 8 MiB)
 # Prompts are token ids: the dummy vocab has no meaningful text tokenizer.
 
 
@@ -46,7 +47,8 @@ B = 16
 N = 64
 TOL = 2e-3
 SLOT_META_MAGIC = 0x544D4B4C  # "LKMT"
-HOOKS = ("LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS", "LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS")
+HOOKS = ("LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS", "LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS",
+         "LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_SLICE")
 
 # the dummy of every memory class the cache knows, with its architecture prefix (for the context override)
 CLASSES = {
@@ -656,3 +658,42 @@ def test_mtp_checkpoints_carry_the_draft(n_batch, tmp_path):
     cold_body = comp(ref, req)
     ref.stop()
     assert body["tokens"] == cold_body["tokens"]
+
+
+def _checkpoint_unit_bytes(name: str, tmp_path) -> int:
+    """the bytes one checkpoint unit of P carries through the deferred emission (its whole .bin: the
+    positional bytes copied late and the side-state copied at the capture)"""
+    cache = _cache("size")
+    s = _server(name, cache, str(tmp_path / "size.log"), n_batch=16)
+    s.start()
+    _req(s, P)
+    _settled(s)
+    s.stop()
+    return max(os.path.getsize(m[:-len(".meta")]) for m in _metas(cache))
+
+
+@pytest.mark.parametrize("name", ["llama-dense", "qwen35-dense"])
+def test_checkpoints_are_published_while_a_slow_prefill_continues(name, tmp_path, monkeypatch):
+    """A periodic checkpoint's deferred copy is trickled at a rate per unit of busy time, not a fixed slice
+    per loop iteration: a prefill iteration is one batch and can take seconds (a 4096-token batch is about
+    6 s on Qwen3.8-27B on one B70), so a per-iteration slice held every 1.2 GB checkpoint back until the
+    prefill ended and a crash during it found nothing on disk. Here a batch takes >= 250 ms (5 trickle
+    periods) and the trickle slice is a sixteenth of one checkpoint unit per period: by rate the
+    first checkpoints are on disk well before the prefill reaches 256; at one slice per iteration (the
+    defect, the positive control of this test) the first one would need 16 iterations of its own."""
+    per_ckpt = _checkpoint_unit_bytes(name, tmp_path)
+    cache = _cache("slow")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS", "250")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS", "0")
+    monkeypatch.setenv("LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_SLICE", str(max(1, per_ckpt // 16)))
+    log = str(tmp_path / "s.log")
+    s = _server(name, cache, log, n_batch=16)
+    s.start()
+    th, _ = _background(lambda: _req(s, P, timeout=120))
+    assert _wait(lambda: "prefill checkpoint at 256 " in _log(log), 60), "the prefill never reached 256"
+    published = _metric(s, "auto_cache_save_site_published_total", "prefill_checkpoint")
+    th.join(timeout=60)
+    _settled(s)
+    _kill(s)
+    assert published >= 2, f"only {published} checkpoint(s) published while the prefill ran (per checkpoint {per_ckpt} B)"
+    assert "trickle)" in _log(log), "no copy was finished by the trickle"

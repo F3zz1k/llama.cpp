@@ -114,8 +114,12 @@ Keep the number of checkpoints per prompt modest: `N` at least `n_ctx / 32` (the
 when `n_ctx / N` is above 32).
 
 A checkpoint captured while the prefill keeps running becomes durable once its deferred copy has been
-emitted, which during a busy prefill happens about 10 s after the capture (the trickle). The default is
-0 (off), which changes nothing: no extra batch breaks and no extra saves.
+emitted, which during a busy prefill starts about 10 s after the capture (the trickle, which moves bytes
+at a rate per second, so a prefill batch of several seconds carries a whole checkpoint's copy in one or
+two batches). A crash therefore loses at most the checkpoints captured in the last 10-20 s. Measured on
+Qwen3.8-27B (one B70, `N` = 16384, a 1.2 GB delta per checkpoint): see the fork's PERFORMANCE notes for
+the overhead per checkpoint. The default is 0 (off), which changes nothing: no extra batch breaks and no
+extra saves.
 
 **Context rungs** (the same model at several `-c`, e.g. 1 GPU at 131072 and 2 GPUs at 262144, or a
 lower-context vision variant beside the text one): point them at the same store. `-c` is not part of a
@@ -272,8 +276,10 @@ copied later on the server thread, in capture order, and handed to the writer as
 
 - **at idle**, 64 MiB per wakeup of the server loop, pausing while the staging is full, so a request that
   arrives meanwhile is served first;
-- **trickled** while the server is busy, 8 MiB per loop iteration, once a copy has waited 10 s (a long
-  generation does not hold a unit back);
+- **trickled** while the server is busy, once a copy has waited 10 s, at 8 MiB per 50 ms of busy time
+  (one decode iteration), scaled by the length of each loop iteration and capped at 1 GiB per iteration:
+  a long generation does not hold a unit back, and neither does a long prefill, whose iterations are
+  whole batches lasting seconds;
 - **at once**, before anything can change those cells. The engine calls a flush hook from every cache
   operation that frees, overwrites or moves cells (`seq_rm`, `seq_keep`, `clear`, a cross-stream
   `seq_cp`, `seq_add` and `seq_div` (a context shift), a state load that replaces the sequence, and
