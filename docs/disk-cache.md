@@ -203,7 +203,9 @@ bytes, and the memory class says which is which, never the model:
   save filters by position. Nothing but a change to that cache can alter them: the next tokens go into
   free cells, never into occupied ones.
 - **Side-state**: everything else. A recurrent fold, a sliding window (its cells are reused as the window
-  moves), DeepSeek-V4's compressed caches and state, cell metadata.
+  moves), DeepSeek-V4's compressed caches and state, the k-pool indexer cache of GLM-5 next and
+  Qwen3.8-Flash-Next (its pooled scatter rewrites rows of cells other sequences hold, padding included),
+  cell metadata.
 
 The capture copies the side-state at once and only records where the positional bytes are. They are
 copied later on the server thread, in capture order, and handed to the writer as before:
@@ -215,8 +217,12 @@ copied later on the server thread, in capture order, and handed to the writer as
 - **at once**, before anything can change those cells. The engine calls a flush hook from every cache
   operation that frees, overwrites or moves cells (`seq_rm`, `seq_keep`, `clear`, a cross-stream
   `seq_cp`, `seq_add` and `seq_div` (a context shift), a state load that replaces the sequence, and
-  freeing the context). The server also forces the copies before a restore into the slot, before sleep,
-  at shutdown, and when a capture or a waiting request needs the writer to get past them. A forced
+  freeing the context). A shift of cells another sequence shares forces the captures of every sequence on
+  them, and the K-shift itself forces every capture of the cache whichever slot was shifted: it ropes
+  every cell, the unshifted ones by 0, which changes keys under YaRN or a quantised K. A draft cache that
+  views the target's cells forces the target's captures. The server also forces the copies before a restore into the slot, before sleep,
+  at shutdown, and when a capture or a waiting request needs the writer to get past them (including a
+  slot reuse that waits for the queued delta covering the slot). A forced
   remainder that fits in the staging budget is copied into host memory without waiting for the writer;
   a larger one is streamed to the writer like a stage-1 save. A removal above the captured range (a
   rejected draft) does not force anything.
@@ -229,14 +235,18 @@ the copy). The engine reads the device only through `ggml_backend_tensor_get`, s
 every backend; on CPU the deferred copy is a `memcpy`.
 
 Classes and what they defer: plain attention (`llama`), the global layers of iSWA (`gemma3`), the
-attention of hybrids (`qwen35`, `qwen3.8`, Flash-Next's indexer cache too), DSA, MSA and the MTP draft's
-attention cache defer; recurrent-only models and DeepSeek-V4 defer nothing and copy everything at the
-capture, as before. A class whose saves fall back to whole roots (delta probe NO) is not deferred either.
+attention of hybrids (`qwen35`, `qwen3.8`), the attention (not the k-pool indexer) of `hybrid_idx`
+(GLM-5 next, Flash-Next), DSA, MSA and the MTP draft's attention cache defer; recurrent-only models and
+DeepSeek-V4 defer nothing and copy everything at the capture, as before. A class whose saves fall back to
+whole roots (delta probe NO, which is Flash-Next today) is not deferred by the server at all.
 
 Side-state held by deferred captures counts against `--slot-save-staging-mb` on its own
 (`auto_cache_save_deferred_host_bytes`); when it would not fit, older captures are copied first, and a
 capture whose side-state alone exceeds the budget is copied at once. So the host memory the cache holds
-is at most twice the budget plus the ring.
+is at most twice the budget plus the ring (stage 1: the budget plus the ring). The one exception is a
+copy forced inside a store-lock scope, which cannot wait for the writer: it is held over the budget until
+its job is emitted, and logged (`a forced deferred copy holds N B over the ... staging budget`). When the
+idle emission finds the staging full it retries after 5 ms, doubling up to 200 ms while no room appears.
 
 Every published save logs one line with its timings, for example:
 
