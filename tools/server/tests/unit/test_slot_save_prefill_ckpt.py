@@ -21,7 +21,11 @@ from utils import *
 #    resumes from what was published, by log line, and the resumed prompt still gets its cold prompt node;
 #  - a new question at the end of the same long user message restores the last checkpoint inside it;
 #  - off (absent or 0) publishes the same store, byte for byte, and no checkpoint;
-#  - the checkpoints respect the store's count cap like any other unit.
+#  - the checkpoints respect the store's count cap like any other unit, a delta chain included (the new delta
+#    that the cap cannot hold is not kept);
+#  - on a class that writes no deltas (or with --slot-save-incremental off), each whole checkpoint replaces the
+#    previous one of the same prefill, so one prefill keeps its deepest checkpoint only;
+#  - a warm reuse that happens to end on a multiple of N is not taken for a resumed prefill.
 # Test hooks read from the environment:
 #   LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS   every prefill batch sleeps this long (so a test can interrupt it)
 #   LLAMA_TEST_SLOT_SAVE_DEFER_TRICKLE_MS   a deferred copy is trickled once it waited this long (default 10 s)
@@ -226,9 +230,11 @@ def _cache(label: str) -> str:
 @pytest.mark.parametrize("name", list(CLASSES))
 def test_every_class_checkpoints_and_restores_within_n(name, tmp_path):
     """A cold 300-token prefill with N = 64 publishes units at exactly 64, 128, 192 and 256, each the true
-    state there: after a crash, a request that shares the first 200 tokens and then changes restores to
-    within N of the change (192 on a class that cannot rewind, up to 200 on plain attention), and its
-    output equals a cold prefill."""
+    state there. A class that writes deltas keeps all four (a root and a chain of deltas); a class that writes
+    whole units only keeps the deepest, each whole checkpoint replacing the previous one. After a crash, a
+    request that shares a prefix and then changes restores to within N of the change (on the deepest kept
+    checkpoint at or before it, up to the change itself on plain attention), and its output equals a cold
+    prefill."""
     cache = _cache("c")
     s = _server(name, cache, str(tmp_path / "s.log"))
     s.start()
@@ -236,25 +242,36 @@ def test_every_class_checkpoints_and_restores_within_n(name, tmp_path):
     _settled(s)
     assert _metric(s, "auto_cache_save_site_requested_total", "prefill_checkpoint") == 4
     assert _metric(s, "auto_cache_save_site_published_total", "prefill_checkpoint") == 4
+    deltas = _metric(s, "auto_cache_delta_capable") == 1
+    superseded = _metric(s, "auto_cache_prefill_checkpoint_superseded_total")
     _kill(s)
-    assert _units(cache) == [64, 128, 192, 256]
     log = _log(str(tmp_path / "s.log"))
     assert "4 prefill checkpoint(s) armed every 64 tokens, first at 64" in log
     for p in (64, 128, 192, 256):
         assert f"prefill checkpoint at {p} of 300 prompt tokens" in log
-    if name in ("llama-dense", "qwen35-dense"):
-        # delta-capable: a root and then a chain of deltas, each on the previous checkpoint
+    if deltas:
+        assert _units(cache) == [64, 128, 192, 256]
+        assert superseded == 0
+        # a root and then a chain of deltas, each on the previous checkpoint
         vs = [_version(m) for m in sorted(_metas(cache), key=_len)]
         assert vs[0] == 1 and all(v == 3 for v in vs[1:]), vs
+        div = 200
+    else:
+        assert _units(cache) == [256]
+        assert superseded == 3
+        assert "replaces the shallower whole checkpoint" in log
+        div = 280
+    if name in ("llama-dense", "qwen35-dense"):
+        assert deltas, f"{name} is expected to write deltas"
 
-    req = P[:200] + _toks(60, 5)
+    req = P[:div] + _toks(60, 5)
     r = _server(name, cache, str(tmp_path / "r.log"))
     r.start()
     body = _req(r, req)
     r.stop()
     t = body["timings"]
     disk = t.get("cache_disk_n", 0)
-    assert 192 <= disk <= 200 and 200 - disk < N, t
+    assert disk <= div and div - disk < N and disk >= (div // N) * N, t
     assert t["cache_n"] == disk, t
     _assert_equals_cold(name, req, body)
 
@@ -314,7 +331,9 @@ def test_crash_mid_prefill_resumes_from_the_last_checkpoint(name, tmp_path, monk
     s = _server(name, cache, str(tmp_path / "s.log"), n_batch=16, node_prompt="cold")
     s.start()
     th, _ = _background(lambda: _req(s, P, timeout=120))
-    assert _wait(lambda: len(_metas(cache)) >= 2, 60), "no checkpoint was published"
+    # (counted, not listed: a class without deltas keeps only its deepest whole checkpoint on disk)
+    assert _wait(lambda: _metric(s, "auto_cache_save_site_published_total", "prefill_checkpoint") >= 2, 60), \
+        "no checkpoint was published"
     _kill(s)
     th.join(timeout=10)
     units = _units(cache)
@@ -481,25 +500,154 @@ def test_new_question_in_the_same_long_message(name, tmp_path):
     _assert_equals_cold(name, second, body, extra)
 
 
-def test_checkpoints_respect_the_count_cap(tmp_path):
-    """The checkpoints are ordinary units: with --slot-save-max-count 3 a 600-token prefill (nine checkpoints)
-    leaves at most three units, and the chain left in the store still restores correctly."""
+def test_whole_checkpoints_keep_only_the_deepest(tmp_path):
+    """With --slot-save-incremental off every checkpoint is a whole unit of the prefix so far: a 600-token prefill
+    (nine checkpoints) publishes all nine, each replacing the previous one, and leaves only the deepest, which
+    restores correctly. (Without the replacement the store would hold 64 + 128 + ... + 576 tokens of whole units,
+    growing with the square of the prompt.)"""
     name = "llama-dense"
     cache = _cache("c")
     p = _toks(600, 3)
-    s = _server(name, cache, str(tmp_path / "s.log"), max_count=3, incr=False)
+    s = _server(name, cache, str(tmp_path / "s.log"), incr=False)
     s.start()
     _req(s, p)
     _settled(s)
     assert _metric(s, "auto_cache_save_site_published_total", "prefill_checkpoint") == 9
-    assert _metric(s, "auto_cache_evicted_total") >= 6
+    assert _metric(s, "auto_cache_prefill_checkpoint_superseded_total") == 8
     _kill(s)
-    units = _units(cache)
-    assert len(units) <= 3, units
-    req = p[:units[-1]] + _toks(30, 7)
-    r = _server(name, cache, str(tmp_path / "r.log"), max_count=3, incr=False)
+    assert _units(cache) == [576]
+    req = p[:590] + _toks(30, 7)
+    r = _server(name, cache, str(tmp_path / "r.log"), incr=False)
     r.start()
     body = _req(r, req)
     r.stop()
-    assert body["timings"].get("cache_disk_n", 0) == units[-1], body["timings"]
+    assert body["timings"].get("cache_disk_n", 0) >= 576, body["timings"]
     _assert_equals_cold(name, req, body)
+
+
+@pytest.mark.parametrize("name", ["llama-dense", "qwen35-dense"])
+def test_checkpoints_respect_the_count_cap_with_a_delta_chain(name, tmp_path):
+    """Under --slot-save-incremental the checkpoints form one delta chain, which is evictable only from its tip.
+    With --slot-save-max-count 3 a 600-token prefill (nine checkpoints) keeps the store at three units: once the
+    chain fills the cap, a new delta that only its own chain blocks is not kept (counted, with a WRN), and the
+    chain left in the store still restores correctly."""
+    cache = _cache("c")
+    p = _toks(600, 3)
+    s = _server(name, cache, str(tmp_path / "s.log"), max_count=3, incr=True)
+    s.start()
+    _req(s, p)
+    _settled(s)
+    assert _metric(s, "auto_cache_save_site_requested_total", "prefill_checkpoint") == 9
+    assert _metric(s, "auto_cache_save_site_published_total", "prefill_checkpoint") == 3
+    # each later checkpoint is a delta the cap cannot hold (or, queued on one of those, dropped with it)
+    assert _metric(s, "auto_cache_evict_bound_exceeded_total") >= 1
+    _kill(s)
+    units = _units(cache)
+    assert units == [64, 128, 192], units
+    assert "cannot hold this conversation's delta chain" in _log(str(tmp_path / "s.log"))
+    req = p[:200] + _toks(30, 7)
+    r = _server(name, cache, str(tmp_path / "r.log"), max_count=3, incr=True)
+    r.start()
+    body = _req(r, req)
+    r.stop()
+    assert body["timings"].get("cache_disk_n", 0) == 192, body["timings"]
+    _assert_equals_cold(name, req, body)
+
+
+def test_a_warm_reuse_on_a_multiple_of_n_is_not_a_resume(tmp_path):
+    """A request that reuses exactly 128 tokens (a multiple of N) of the slot's previous, finished prompt is a
+    normal warm reuse: it is not taken for a resumed prefill, so the cold prompt node is not armed for it."""
+    name = "llama-dense"
+    cache = _cache("c")
+    s = _server(name, cache, str(tmp_path / "s.log"), node_prompt="cold")
+    s.start()
+    _req(s, P[:150])
+    _settled(s)
+    before = _metric(s, "auto_cache_save_site_requested_total", "prompt_node")
+    body = _req(s, P[:128] + _toks(100, 9))
+    _settled(s)
+    after = _metric(s, "auto_cache_save_site_requested_total", "prompt_node")
+    _kill(s)
+    assert body["timings"]["cache_n"] == 128, body["timings"]
+    assert "resuming an interrupted prefill" not in _log(str(tmp_path / "s.log"))
+    assert after == before
+
+
+# --- a model with a draft (MTP) ---------------------------------------------------------------------------------
+MTP_MODEL = os.environ.get("LLAMA_TEST_MTP_MODEL", "")
+
+
+@pytest.mark.parametrize("n_batch", [32, 512])
+def test_mtp_checkpoints_carry_the_draft(n_batch, tmp_path):
+    """On the MTP test model (qwen35 with a draft-mtp head, a hybrid), every periodic checkpoint carries its
+    .dft draft sidecar, including when the prompt prefills in several batches, and a later request whose chain
+    runs through the checkpoints restores the draft warm, its output equal to the same request on a server
+    without the cache."""
+    if not os.path.isfile(MTP_MODEL):
+        pytest.skip("no MTP test model (LLAMA_TEST_MTP_MODEL)")
+    long = [((i * 13) % 97) + 10 for i in range(200)]
+    extra = [((i * 11) % 100) + 10 for i in range(16)]
+
+    def mtp_server(cache, log_path, idle):
+        s = ServerProcess()
+        s.model_hf_repo = None
+        s.model_hf_file = None
+        s.model_file = MTP_MODEL
+        s.spec_type = "draft-mtp"
+        s.spec_draft_n_max = 3
+        s.model_alias = "dummy"
+        s.n_ctx = 512
+        s.n_batch = n_batch
+        s.n_slots = 1
+        s.temperature = 0.0
+        s.server_metrics = True
+        s.log_path = log_path
+        if cache is None:
+            return s
+        s.slot_save_path = cache
+        s.slot_save_auto = True
+        s.slot_save_incremental = True
+        s.slot_save_block = B
+        s.slot_save_min_tokens = 0
+        s.slot_save_context_min_tokens = 100000
+        s.slot_restore_min_tokens = 0
+        s.slot_save_idle_seconds = idle
+        s.slot_save_node_prompt = "off"
+        s.slot_save_prefill_interval = 48
+        return s
+
+    def comp(srv, prompt):
+        res = srv.make_request("POST", "/completion", data={
+            "prompt": prompt, "n_predict": 8, "cache_prompt": True, "id_slot": 0,
+            "temperature": 0.0, "top_k": 1, "return_tokens": True})
+        assert res.status_code == 200, res.body
+        return res.body
+
+    cache = _cache("mtp")
+    s = mtp_server(cache, str(tmp_path / "s.log"), 1)
+    s.start()
+    gen = comp(s, long)["tokens"]
+    _wait(lambda: _metric(s, "auto_cache_save_site_published_total", "idle") >= 1, 30)
+    _settled(s)
+    s.stop()
+    units = _units(cache)
+    ckpts = [u for u in units if u % 48 == 0]
+    assert ckpts == [48, 96, 144, 192], units
+    for m in _metas(cache):
+        assert os.path.isfile(m[:-len(".meta")] + ".dft"), f"{m} has no .dft"
+
+    req = long + gen + extra
+    r = mtp_server(cache, str(tmp_path / "r.log"), -1)
+    r.start()
+    body = comp(r, req)
+    warm = _metric(r, "auto_cache_restore_draft_warm_total")
+    cold = _metric(r, "auto_cache_restore_draft_cold_total")
+    r.stop()
+    t = body["timings"]
+    assert t.get("cache_disk_n", 0) >= len(long) and t["cache_disk_nodes"] >= 5, t
+    assert warm == 1 and cold == 0, (warm, cold)
+    ref = mtp_server(None, None, -1)
+    ref.start()
+    cold_body = comp(ref, req)
+    ref.stop()
+    assert body["tokens"] == cold_body["tokens"]

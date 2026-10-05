@@ -701,8 +701,12 @@ static void slot_save_enforce_limits(const std::string & dir,
                                      const std::string & just_written,
                                      bool & oversized,
                                      uint64_t * n_evicted = nullptr,
-                                     uint64_t * n_bound_exceeded = nullptr) {
+                                     uint64_t * n_bound_exceeded = nullptr,
+                                     bool * chain_rejected = nullptr) {
     oversized = false;
+    if (chain_rejected) {
+        *chain_rejected = false;
+    }
     if (max_count <= 0 && max_bytes <= 0) {
         return; // both unlimited
     }
@@ -1046,9 +1050,48 @@ static void slot_save_enforce_limits(const std::string & dir,
         return true;
     };
 
+    // Nothing but the just-written unit is evictable. When it is a DELTA, every other counted unit is an ancestor
+    // of it (or of a pinned node): every other lineage still has an evictable tip. The cap then cannot hold this
+    // conversation's chain together with what must stay, which is the chain's version of a single unit larger than
+    // the byte cap, and it is answered the same way: the just-written delta is deleted and the save rejected, so
+    // the store stays within its caps (a long run of periodic prefill checkpoints under --slot-save-incremental is
+    // the case that reaches this; its chain then ends at the deepest node the cap holds). A whole root keeps the
+    // old behaviour: it is published and the store stays above the limit, with a WRN.
+    auto reject_just_written_delta = [&]() -> bool {
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (!alive[i] || units[i].state_path != just_written) {
+                continue;
+            }
+            if (units[i].parent_id == 0 || units[i].pinned) {
+                return false;
+            }
+            remove_unit_files(units[i]);
+            alive[i] = 0;
+            total -= std::min(total, (uintmax_t) units[i].bytes);
+            count = (count > 0) ? count - 1 : 0;
+            const auto it = child_count.find(parent_key(units[i]));
+            if (it != child_count.end() && it->second > 0) {
+                it->second--;
+            }
+            if (chain_rejected) {
+                *chain_rejected = true;
+            }
+            return true;
+        }
+        return false;
+    };
+
     if (max_count > 0) {
         while (count > (size_t) max_count) {
             if (!evict_leaf()) {
+                if (reject_just_written_delta()) {
+                    SRV_WRN("%s", "slot-save cache: --slot-save-max-count cannot hold this conversation's delta chain; "
+                                  "the new delta was not kept\n");
+                    if (n_bound_exceeded) {
+                        (*n_bound_exceeded)++;
+                    }
+                    continue;
+                }
                 SRV_WRN("%s", "slot-save cache is over --slot-save-max-count but every remaining snapshot "
                               "has a live child delta; leaving it above the limit\n");
                 if (n_bound_exceeded) {
@@ -1061,6 +1104,14 @@ static void slot_save_enforce_limits(const std::string & dir,
     if (max_bytes > 0) {
         while (total > (uintmax_t) max_bytes) {
             if (!evict_leaf()) {
+                if (reject_just_written_delta()) {
+                    SRV_WRN("%s", "slot-save cache: --slot-save-max-mb cannot hold this conversation's delta chain; "
+                                  "the new delta was not kept\n");
+                    if (n_bound_exceeded) {
+                        (*n_bound_exceeded)++;
+                    }
+                    continue;
+                }
                 SRV_WRN("%s", "slot-save cache is over --slot-save-max-bytes but every remaining snapshot "
                               "has a live child delta; leaving it above the limit\n");
                 if (n_bound_exceeded) {
@@ -1227,6 +1278,8 @@ struct auto_cache_entry {
     // unit at that key only when it agrees with the unit through its last indexed boundary, so a unit
     // met at a shallower key is left before its end. 0 = unknown (treated as possibly whole).
     uint64_t    deepest = 0;
+    // the unit holds media cells (a v2 or v4 .meta): the projector is identity for it (model_fp::fp_mmproj_loaded)
+    bool        has_media = false;
 };
 
 // boundary-hash -> best (longest) entry covering that prefix length. Touched by the
@@ -1283,6 +1336,8 @@ static constexpr int AUTO_REFRESH_MIN_MS = 1000;
 // by the cap behind longer divergent siblings sharing the same boundary bucket.
 static constexpr size_t AUTO_MAX_CANDIDATES_PER_BOUNDARY = 32;
 static constexpr size_t AUTO_MAX_RESTORE_ATTEMPTS        = 4;
+// --slot-save-prefill-interval: above this many checkpoints for a prompt that fills the context, warn at load
+static constexpr int32_t AUTO_CKPT_NODES_RECOMMENDED     = 32;
 
 // Forward-declared above slot_save_enforce_limits: expose only the delta-node fields so eviction can
 // resolve the tree without model_fp in scope. Leaves the outputs as a parentless root ([0,0) with no
@@ -1400,6 +1455,10 @@ struct server_slot {
     // delta on the previous one under --slot-save-incremental and the true whole state there for every class.
     std::vector<int32_t> ckpt_save_pos;
     size_t               ckpt_save_idx = 0;
+    // the last periodic checkpoint of this prefill that was published WHOLE (a class without deltas, or
+    // --slot-save-incremental off): the next whole checkpoint replaces it, so one prefill keeps one whole checkpoint
+    // (its deepest) instead of N, 2N, 3N, ... whose bytes would grow with the square of the prompt
+    std::string          ckpt_prev_whole;
     // a prefill that counted as cold for the prompt node has not reached the end of its prompt yet: a resend
     // that continues it on this slot (a client disconnect, a timeout) still counts as cold
     bool                 cold_prefill_open = false;
@@ -2161,7 +2220,7 @@ private:
     // (auto_metrics_fill).
     struct auto_save_counters {
         std::atomic<uint64_t> failed{0}, root{0}, delta{0}, bytes{0}, evicted{0}, draft{0}, draft_skipped{0};
-        std::atomic<uint64_t> bound_exceeded{0};
+        std::atomic<uint64_t> bound_exceeded{0}, ckpt_superseded{0};
         std::atomic<uint64_t> queued{0}, streamed{0}, dropped_staging{0}, orphan_dropped{0}, shutdown_abandoned{0};
         std::atomic<uint64_t> admission_waits{0}, admission_wait_us{0};
         std::atomic<uint64_t> deferred{0}, deferred_forced{0}, deferred_bytes{0};
@@ -2196,6 +2255,7 @@ private:
         m.n_auto_save_bytes              = aw_cnt.bytes.load();
         m.n_auto_cache_evicted          += aw_cnt.evicted.load();
         m.n_auto_cache_bound_exceeded    = aw_cnt.bound_exceeded.load();
+        m.n_auto_ckpt_superseded         = aw_cnt.ckpt_superseded.load();
         m.auto_delta_capable             = delta_capable == delta_cap::yes ? 1 : delta_capable == delta_cap::no ? 2 : 0;
         m.n_auto_save_draft              = aw_cnt.draft.load();
         m.n_auto_save_draft_skipped      = aw_cnt.draft_skipped.load();
@@ -2378,6 +2438,9 @@ private:
     int32_t n_swa_mem = 0;
     // the memory type can load a unit's side-state alone (LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL): restore mode 2
     bool side_only_supported = false;
+    // the memory type can load a unit's positional cells alone (LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE): a chain's inner
+    // nodes read past their side-states, which the tip's replaces
+    bool side_skip_supported = false;
 
     // Candidates the current restore attempt passed over because the request diverges inside them
     // and this memory class cannot rewind into a snapshot (the "must extend" rule). Reset by the
@@ -2859,7 +2922,7 @@ private:
                 }
                 continue;
             }
-            if (!fp.restore_compatible(cur_fp)) {
+            if (!fp.restore_compatible(cur_fp, !media.empty())) {
                 // foreign model / requant / different KV geometry (invariant 3). A unit of the same model
                 // under another identity is remembered for the identity-miss counter.
                 if (fp.fp_model == cur_fp.fp_model && !auto_idx.foreign_files.count(p)) {
@@ -2883,7 +2946,7 @@ private:
             // never drops it (protects a pinned base that shares a bucket with >32 divergent siblings).
             std::error_code pec;
             const bool pinned = std::filesystem::exists(p + ".pin", pec) && !pec;
-            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned, id, bhs.empty() ? 0 : bhs.back() };
+            auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned, id, bhs.empty() ? 0 : bhs.back(), !media.empty() };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
             }
@@ -2989,7 +3052,7 @@ private:
                     continue;
                 }
                 for (const auto_cache_entry & c : it->second) { // longest first within the boundary
-                    if (!c.fp.restore_compatible(cur_fp)) {
+                    if (!c.fp.restore_compatible(cur_fp, c.has_media)) {
                         continue; // invariant 3
                     }
                     if (!model_fp::fits_ctx(c.n_tokens, cur_fp)) {
@@ -3158,7 +3221,13 @@ private:
         size_t token_count = 0;
         size_t total_nread = 0;
         for (size_t i = 0; i < node_paths.size(); ++i) {
-            const llama_state_seq_flags flags = (i == 0) ? 0 : LLAMA_STATE_SEQ_FLAGS_NO_CLEAR;
+            llama_state_seq_flags flags = (i == 0) ? 0 : LLAMA_STATE_SEQ_FLAGS_NO_CLEAR;
+            // every node carries the whole side-state at its own end and the next node's replaces it, so an inner
+            // node needs only its positional cells: its side-state is read past instead of moved to the device.
+            // The tip loads whole. A periodic-checkpoint chain of K nodes reads one side-state instead of K.
+            if (side_skip_supported && i + 1 < node_paths.size()) {
+                flags |= LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE;
+            }
             size_t node_token_count = 0;
             const size_t nread = llama_state_seq_load_file_ext(
                 ctx_tgt, node_paths[i].c_str(), slot.id, flags,
@@ -3316,7 +3385,7 @@ private:
         }
         // The same identity gate as the auto restore. Capacity needs no check here: the
         // state is already loaded, and llama_state_seq refused it if it did not fit.
-        if (!disk_fp.restore_compatible(cur_fp)) {
+        if (!disk_fp.restore_compatible(cur_fp, /*has_media=*/true)) {
             err = "snapshot fingerprint mismatch (model, projector or KV geometry changed)";
             return false;
         }
@@ -3404,7 +3473,7 @@ private:
             }
             // Every hop is checked on its own against the live context, so a chain can never
             // mix identities. Capacity follows from the tip's (a parent is a strict prefix of it).
-            if (!parent_fp.restore_compatible(cur_fp)) {
+            if (!parent_fp.restore_compatible(cur_fp, !parent_media.empty())) {
                 return false; // fingerprint drift on the parent -> cold prefill
             }
             // contiguity: the parent must end exactly where its child begins.
@@ -3494,6 +3563,7 @@ private:
             { "n_swa",               n_swa_mem },                        // sliding window the engine masks with
             { "rewinds",             !restore_is_whole_prefix_only() },  // a longer unit restores trimmed to the request
             { "side_only_restore",   side_only_supported },              // restore mode 2: side-state alone
+            { "inner_side_skipped",  side_skip_supported },              // a chain's inner nodes load positional cells only
             { "logits_sidecar",      logits_sidecar_class() },           // exact resends emit with no decode
             { "draft_sidecar",       ctx_dft != nullptr },
             { "block",               params_base.slot_save_block },
@@ -3566,7 +3636,7 @@ private:
                             &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
             return 0; // invariant 4
         }
-        if (!disk_fp.restore_compatible(cur_fp)) {
+        if (!disk_fp.restore_compatible(cur_fp, !disk_media.empty())) {
             return 0; // invariant 3
         }
         if (!model_fp::fits_ctx(disk_toks.size(), cur_fp)) {
@@ -4008,6 +4078,23 @@ private:
         job->parent_id      = is_node ? parent_id : 0;
         job->parent_hi      = is_node ? parent_hi : 0;
         job->parent_fname   = is_node ? auto_state_filename(parent_id, parent_hi) : std::string();
+        // Periodic prefill checkpoints of a class that writes no deltas (or with --slot-save-incremental off) are each a
+        // whole unit of the prefix so far, so a prefill of L tokens would write N + 2N + ... + L. Each whole checkpoint
+        // replaces the previous one of the same prefill once it is published: the deepest is kept (a resume, or a new
+        // question at the end of the same long message, needs only that one). Nothing can parent on these units, since
+        // this instance writes no deltas.
+        if (site == AUTO_SAVE_SITE_PREFILL_CKPT) {
+            // (a root written before the delta probe ran counts too: if the next checkpoint turns out to be a delta on
+            // it, the record is cleared there and nothing is replaced)
+            if (!is_node && (delta_capable != delta_cap::yes || !params_base.slot_save_incremental)) {
+                if (!slot.ckpt_prev_whole.empty() && slot.ckpt_prev_whole != job->fname) {
+                    job->supersedes = slot.ckpt_prev_whole;
+                }
+                slot.ckpt_prev_whole = job->fname;
+            } else {
+                slot.ckpt_prev_whole.clear();
+            }
+        }
         job->bin.n_expected = hdr + n_payload;
 
         // 2) logits sidecar (FULL and RS, and only when the captured distribution provably belongs to this
@@ -4239,6 +4326,7 @@ private:
         aw_mode     mode      = aw_mode::sync;
         auto_save_site site   = AUTO_SAVE_SITE_RECLAIM;
         std::vector<std::pair<int, auto_save_site>> shadowed; // saves skipped because this job covers them
+        std::string supersedes;                    // a whole periodic checkpoint of the same prefill this one replaces
         size_t      reserved  = 0;                 // staged budget still held by this job
         bool        done      = false;
         bool        published = false;             // set with done: the unit is in the store
@@ -4336,6 +4424,22 @@ private:
             // test hook, the positive control: a mutation no longer forces a pending copy
             llama_state_deferred_set_hook_enabled(false);
             SRV_WRN("%s", "auto disk cache: TEST HOOK: the flush-on-mutate hook is disabled\n");
+        }
+        if (params_base.slot_save_prefill_interval > 0) {
+            // Each checkpoint is a unit with the whole side-state at its end (about 150 MB per node on a 27B gated
+            // delta net), and a delta chain is evictable only from its tip, so the node count of one prefill is the
+            // cost to watch: n_ctx / N nodes for a prompt that fills the context.
+            const int32_t n_ctx_seq = (int32_t) llama_n_ctx_seq(ctx_tgt);
+            const int32_t n_nodes   = n_ctx_seq / params_base.slot_save_prefill_interval;
+            if (n_nodes > AUTO_CKPT_NODES_RECOMMENDED) {
+                SRV_WRN("auto disk cache: --slot-save-prefill-interval %d gives up to %d checkpoints for a prompt that fills "
+                        "this context (%d tokens); each carries the whole side-state, so consider N >= %d "
+                        "(n_ctx / %d)\n", params_base.slot_save_prefill_interval, n_nodes, n_ctx_seq,
+                        n_ctx_seq / AUTO_CKPT_NODES_RECOMMENDED, AUTO_CKPT_NODES_RECOMMENDED);
+            } else {
+                SRV_INF("auto disk cache: periodic prefill checkpoints every %d tokens, up to %d per prompt\n",
+                        params_base.slot_save_prefill_interval, n_nodes);
+            }
         }
         auto_reap_dead_temps();
         if (aw.budget == 0) {
@@ -5461,27 +5565,45 @@ private:
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto_cache_entry e{ fname, (uint32_t) job.toks->size(), job.fp, /*pinned=*/false, /*id=*/job.hash,
-                                /*deepest=*/ job.kb < job.bhs.size() ? job.bhs[job.kb] : 0 };
+                                /*deepest=*/ job.kb < job.bhs.size() ? job.bhs[job.kb] : 0, /*has_media=*/ !job.media.empty() };
             for (size_t i = 0; i <= job.kb && i < job.bhs.size(); ++i) {
                 auto_index_insert_locked(job.bhs[i], e);
             }
             auto_idx.indexed_files.insert(fname);
         }
         const int64_t t_e0 = ggml_time_us();
+        if (!job.supersedes.empty()) {
+            // the previous whole checkpoint of this prefill: this deeper one replaces it (a pinned one stays)
+            std::error_code sec;
+            if (!std::filesystem::exists(job.supersedes + ".pin", sec) && std::filesystem::exists(job.supersedes, sec)) {
+                std::filesystem::remove(job.supersedes, sec);
+                std::filesystem::remove(slot_meta_sidecar_path(job.supersedes), sec);
+                std::filesystem::remove(slot_logits_sidecar_path(job.supersedes), sec);
+                std::filesystem::remove(slot_draft_sidecar_path(job.supersedes), sec);
+                aw_cnt.ckpt_superseded++;
+                SRV_INF("auto disk cache: prefill checkpoint %s replaces the shallower whole checkpoint %s\n",
+                        fname.c_str(), job.supersedes.c_str());
+            }
+        }
         if (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0) {
             bool oversized = false;
             uint64_t n_evicted = 0;
             uint64_t n_bound   = 0;
+            bool chain_rejected = false;
             slot_save_enforce_limits(params_base.slot_save_path,
                                      params_base.slot_save_max_count,
                                      params_base.slot_save_max_bytes,
-                                     fname, oversized, &n_evicted, &n_bound);
+                                     fname, oversized, &n_evicted, &n_bound, &chain_rejected);
             aw_cnt.evicted        += n_evicted;
             aw_cnt.bound_exceeded += n_bound;
             if (oversized) {
                 published = false;
                 aw_mark_failed(job.hash);
                 auto_save_note_failure(job.slot_id, "snapshot is larger than --slot-save-max-mb", job.toks->size());
+            } else if (chain_rejected) {
+                published = false;
+                aw_mark_failed(job.hash);
+                auto_save_note_failure(job.slot_id, "the store cap cannot hold this conversation's delta chain", job.toks->size());
             }
         }
         aw_progress();
@@ -5924,7 +6046,7 @@ private:
                 // The restore gate: a parent saved by another rung of this model is a valid
                 // parent, because n_ctx is not identity and both rungs name units alike. Whether
                 // the link resolves by name is checked below, after the strict-prefix test.
-                if (!disk_fp.restore_compatible(cur_fp)) {
+                if (!disk_fp.restore_compatible(cur_fp, !disk_media.empty())) {
                     continue; // invariant 3
                 }
                 // STRICT prefix of the CELL tokens (media cells LLAMA_TOKEN_NULL on both sides):
@@ -6478,7 +6600,8 @@ private:
         // but keep a model-derived value for every save/restore soundness decision.
         n_swa      = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
         n_swa_mem  = llama_model_n_swa(model_tgt);   // what the ENGINE masks with — never 0 for an SWA model
-        side_only_supported = llama_memory_can_skip_positional(llama_get_memory(ctx_tgt));
+        side_only_supported = params_base.slot_restore_selective && llama_memory_can_skip_positional(llama_get_memory(ctx_tgt));
+        side_skip_supported = params_base.slot_restore_selective && llama_memory_can_skip_side(llama_get_memory(ctx_tgt));
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -9448,8 +9571,9 @@ private:
                         }
 
                         // for the periodic checkpoints: did this task restore from disk, and how much did the slot hold
-                        const bool    restored_now = slot.n_auto_restored_pending > 0;
-                        const int32_t n_resident   = (int32_t) slot.prompt.n_tokens();
+                        const bool    restored_now  = slot.n_auto_restored_pending > 0;
+                        const int32_t n_resident    = (int32_t) slot.prompt.n_tokens();
+                        const int32_t restored_unit = restored_now ? (int32_t) slot.disk_unit_pending : -1;
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
@@ -9473,6 +9597,7 @@ private:
                         slot.prompt_save_pos = -1;
                         slot.ckpt_save_pos.clear();
                         slot.ckpt_save_idx   = 0;
+                        slot.ckpt_prev_whole.clear();
                         const bool cold_prefill_was_open = slot.cold_prefill_open;
                         slot.cold_prefill_open = false;
                         if (auto_cache_enabled() &&
@@ -9547,14 +9672,17 @@ private:
                             // A prefill that resumes an interrupted one counts as cold too (--slot-save-prefill-interval
                             // only, so the default behaviour is unchanged): the prompt that was cut short never reached
                             // its prompt node. Recognised by (a) this slot still holding all of an unfinished cold
-                            // prefill, (b) a reuse that ends exactly on a periodic checkpoint (a multiple of the
-                            // interval), or (c) a reuse that already reaches into the last user message, which only a
-                            // checkpoint inside it (or a warm slot that prefilled part of it) can give.
+                            // prefill, (b) a disk restore of a whole unit (not trimmed) whose length is a multiple of the
+                            // interval, which is what a periodic checkpoint is (any other unit ends there only by
+                            // coincidence, about once in N/block system nodes, at the cost of one extra node), or
+                            // (c) a reuse that already reaches into the last user message, which only a checkpoint
+                            // inside it (or a warm slot that prefilled part of it) can give. A warm or RAM reuse that
+                            // happens to end on a multiple of N is not a resume.
                             const int32_t interval = params_base.slot_save_prefill_interval;
                             const int32_t user_pos = spans.last_user_message_pos();
                             const bool    resumed  = interval > 0 && n_past > 0 && (
                                     (cold_prefill_was_open && !restored_now && n_past == n_resident) ||
-                                    n_past % interval == 0 ||
+                                    (restored_now && restored_unit == n_past && n_past % interval == 0) ||
                                     (user_pos > 0 && n_past > user_pos));
                             const bool    is_cold  = n_past < std::max(B, params_base.slot_save_min_tokens) || resumed;
                             if (params_base.slot_save_node_prompt != COMMON_SLOT_SAVE_NODE_PROMPT_OFF) {

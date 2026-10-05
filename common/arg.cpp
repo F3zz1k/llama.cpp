@@ -3749,6 +3749,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_RESTORE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-restore-selective"},
+        {"--no-slot-restore-selective"},
+        "auto disk cache: let a restore load only the part of a unit it needs on hybrid (attention plus recurrent) "
+        "models: the recurrent state alone when the slot already holds the unit's attention cells, and only the "
+        "attention cells of a delta chain's inner nodes, whose recurrent states the last node replaces. Disable to "
+        "load every unit whole (default: enabled)",
+        [](common_params & params, bool value) {
+            params.slot_restore_selective = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_RESTORE_SELECTIVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-save-idle-seconds"}, "N",
         string_format("flush a slot's warm KV to the auto disk cache after N seconds of idleness, "
                       "so a lone request survives a crash and is visible to peer instances without "

@@ -1640,6 +1640,11 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_auto_skipped_shared
         },
         {
+            "auto_cache_prefill_checkpoint_superseded_total",
+            "Auto disk KV cache: whole periodic prefill checkpoints removed because a deeper one of the same prefill replaced them",
+            (double) metrics.n_auto_ckpt_superseded
+        },
+        {
             "auto_cache_evict_bound_exceeded_total",
             "Auto disk KV cache: eviction passes that left the store above a cap because every remaining unit has a live child or is pinned",
             (double) metrics.n_auto_cache_bound_exceeded

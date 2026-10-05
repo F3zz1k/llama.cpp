@@ -204,6 +204,30 @@ def test_divergence_inside_the_slot_restores_the_side_state_only(name, tmp_path)
     _assert_equals_cold(name, req, body)
 
 
+def test_selective_restore_can_be_switched_off(tmp_path):
+    """--no-slot-restore-selective: every unit loads whole. The divergence of the mode 2 test then restores the node
+    at 288 whole (no side-state-only load), a chain restores without skipping its inner side-states, and both outputs
+    equal a cold prefill."""
+    name = "qwen35-dense"
+    cache = _cache()
+    s = _server(name, cache, str(tmp_path / "s.log"), node_prompt="cold", interval=64)
+    s.slot_restore_selective = False
+    s.start()
+    caps = s.make_request("GET", "/props").body["auto_cache"]
+    assert caps["side_only_restore"] is False and caps["inner_side_skipped"] is False, caps
+    _req(s, P)
+    _settled(s)
+    req = P[:290] + _toks(30, 4)
+    body = _req(s, req)
+    _settled(s)
+    side = _metric(s, "auto_cache_restore_side_only_total")
+    s.stop()
+    t = body["timings"]
+    assert side == 0
+    assert t.get("cache_disk_n") == 288 and t["cache_disk_mode"] == "whole" and t["cache_disk_nodes"] > 1, t
+    _assert_equals_cold(name, req, body)
+
+
 def test_side_only_restore_keeps_working_across_turns(tmp_path):
     """Mode 2 leaves a normal slot behind: after it, the conversation continues warm, and a second divergence
     restores a side-state again; every turn equals a cold prefill."""
@@ -357,6 +381,8 @@ def test_props_reports_the_memory_class(name, tmp_path):
     caps = props["auto_cache"]
     got = (caps["seq_rm"], caps["n_swa"], caps["rewinds"], caps["side_only_restore"], int(probed))
     assert got == (seq_rm, n_swa, rewinds, side_only, delta), got
+    # a chain's inner nodes load their positional cells only: hybrid (attention plus recurrent) memory
+    assert caps["inner_side_skipped"] is (name == "qwen35-dense"), caps
     assert caps["logits_sidecar"] is True and caps["prefill_interval"] == 64 and caps["block"] == B
 
 

@@ -752,6 +752,10 @@ struct common_params {
     // so an interrupted long prefill resumes from the last one and a request that diverges inside a long message
     // restores to within N tokens of the divergence. 0 = off (default)
     int32_t slot_save_prefill_interval = 0;
+    // selective restore loads (default on): a restore loads only the part of a unit it needs, the side-state alone
+    // when the slot already holds the unit's positional cells (restore mode 2) and only the positional cells of a
+    // composed chain's inner nodes (their side-states are overwritten by the tip's). Off = every unit loads whole.
+    bool    slot_restore_selective = true;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

@@ -415,12 +415,15 @@ struct model_fp {
     uint32_t fp_yarn_beta_slow  = 0; // bit-pattern of yarn_beta_slow
     uint32_t fp_yarn_orig_ctx   = 0; // yarn_orig_ctx (int)
     uint64_t fp_lora       = 0; // hash of active LoRA-set ids+scales (0 if none)
-    // refuse cross-shape restores: 1 if the server was launched with --mmproj (mctx != nullptr),
-    // else 0. The auto-cache only ever persists text-only prefixes, but mmproj-aware rope (M-RoPE)
-    // and projector wiring CAN alter the text KV layout, so we conservatively REFUSE to cross-load
-    // a text-only-server snapshot into an mmproj server (or vice-versa) — they get disjoint stores.
-    // Removing this bit later would require proving the text KV layout is identical across the two
-    // deployment shapes.
+    // 1 if the server was launched with --mmproj (mctx != nullptr), else 0. Identity for a unit that
+    // holds MEDIA cells only (restore_compatible's has_media): a text-only unit's K/V does not depend on
+    // whether a projector is loaded. Text cells are decoded by the language model alone, their positions
+    // come from the token index (pos[0], replicated over every M-RoPE section by the batch allocator,
+    // src/llama-batch.cpp, the same with or without a projector), and the projector only produces the
+    // embeddings of media chunks. A text unit therefore restores across a rung with and a rung without
+    // --mmproj (A18, 2026-10-05; tests/unit/test_slot_save_mmproj_identity.py checks it on gemma3 both
+    // ways against a cold prefill). The bit stays in the .meta and in identity_hash, so the file names
+    // are unchanged and each rung keeps writing under its own prefix.
     uint32_t fp_mmproj_loaded   = 0;
     // gguf-header hash of the loaded --mmproj file (0 on a text-only server); see
     // mmproj_header_fingerprint. Catches projector swap, requantization and dimension
@@ -480,7 +483,9 @@ struct model_fp {
     // chain, the incremental-save parent-find and the manual /slots media restore. A delta may
     // therefore be written onto a unit another rung saved; the chain stays resolvable because both
     // rungs name units by the same identity_hash.
-    bool restore_compatible(const model_fp & live) const {
+    // `has_media`: the unit holds media cells. Only then do the projector fields (fp_mmproj_loaded,
+    // fp_mmproj) take part, see fp_mmproj_loaded.
+    bool restore_compatible(const model_fp & live, bool has_media) const {
         return fp_model == live.fp_model && fp_n_vocab == live.fp_n_vocab &&
                fp_n_ctx_train == live.fp_n_ctx_train && fp_n_embd == live.fp_n_embd &&
                fp_n_layer == live.fp_n_layer && fp_rope_type == live.fp_rope_type &&
@@ -490,8 +495,8 @@ struct model_fp {
                fp_rope_base == live.fp_rope_base && fp_yarn_ext == live.fp_yarn_ext &&
                fp_yarn_attn == live.fp_yarn_attn && fp_yarn_beta_fast == live.fp_yarn_beta_fast &&
                fp_yarn_beta_slow == live.fp_yarn_beta_slow && fp_yarn_orig_ctx == live.fp_yarn_orig_ctx &&
-               fp_lora == live.fp_lora && fp_mmproj_loaded == live.fp_mmproj_loaded &&
-               fp_mmproj == live.fp_mmproj;
+               fp_lora == live.fp_lora &&
+               (!has_media || (fp_mmproj_loaded == live.fp_mmproj_loaded && fp_mmproj == live.fp_mmproj));
     }
 
     // Capacity half of a restore: a unit of `n_cells` cells fits the live context. A unit from a
@@ -990,6 +995,7 @@ struct server_metrics {
     uint64_t n_auto_restore_side_only      = 0; // restores that loaded only the side-state and kept the slot's positional cells
     uint64_t n_auto_skipped_shared         = 0; // tasks with a shared prompt prefix (n_tokens_shared) the cache neither restores nor saves
     uint64_t n_auto_cache_bound_exceeded   = 0; // eviction passes that left the store above a cap (nothing evictable)
+    uint64_t n_auto_ckpt_superseded        = 0; // whole prefill checkpoints removed because a deeper one of the same prefill replaced them
     int32_t  auto_delta_capable            = 0; // the delta probe: 0 not probed yet, 1 deltas, 2 whole roots only
     uint64_t n_auto_restore_tokens         = 0; // tokens restored from disk and kept by the prompt
     uint64_t n_auto_restore_discarded      = 0; // restores whose tokens a later n_past clamp threw away (counted as misses)
