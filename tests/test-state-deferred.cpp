@@ -8,8 +8,11 @@
 //            odd-sized pieces: equal to the immediate unit, and the hook never fired. Root and delta.
 //   above    a seq_rm of positions past the captured range: the hook must NOT fire (it is range-precise).
 //   for each mutation that can change or free captured cells (rm-tail, rm-all, clear, keep, add, div,
-//   load-seq, load-file, load-whole, cp-stream, free, callback): capture, mutate, overwrite what the
-//   mutation freed, emit: equal to the immediate unit, and the hook fired first.
+//   shift-other, add-shared, load-seq, load-file, load-whole, cp-stream, free, callback): capture, mutate,
+//   overwrite what the mutation freed, emit: equal to the immediate unit, and the hook fired first.
+//   shift-other shifts a DIFFERENT sequence: the K-shift graph still ropes the captured cells (by 0, which
+//   is not the identity under YaRN, see --yarn), and add-shared shifts a sequence that shares the captured
+//   cells through a same-stream seq_cp.
 //   positive control: the same with the hook disabled (llama_state_deferred_set_hook_enabled(false)) must
 //   give a DIFFERENT unit for every mutation that overwrites captured data, so the equality above is not
 //   vacuous. It only applies when the class defers anything (a class with no positional cells copies all
@@ -42,18 +45,27 @@ struct opts {
     int n_more  = 48;   // tokens decoded after the capture
     int expect_deferred = -1; // -1: do not check
     uint32_t n_ubatch = 64;
+    bool yarn = false;        // YaRN rope scaling: a rope by 0 then scales K (mscale), so it is not the identity
 };
 static opts g_o;
 
 static llama_context * make_ctx(llama_model * model, uint32_t n_seq_max, bool unified) {
     auto cp = llama_context_default_params();
-    cp.n_ctx           = 1024;
-    cp.n_batch         = 1024;
+    // room for the largest scenario: keep grows seq 0 to 2N next to the captured N, plus the decodes after
+    const uint32_t n_need = 2u * (3u * g_o.n_node + g_o.n_more + 128u);
+    cp.n_ctx           = std::max<uint32_t>(1024, (n_need + 255u) / 256u * 256u);
+    cp.n_batch         = cp.n_ctx;
     cp.n_ubatch        = g_o.n_ubatch;
     cp.n_seq_max       = n_seq_max;
     cp.kv_unified      = unified;
     cp.n_threads       = 4;
     cp.n_threads_batch = 4;
+    if (g_o.yarn) {
+        cp.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+        cp.rope_freq_scale   = 0.25f;
+        cp.yarn_ext_factor   = 1.0f;
+        cp.yarn_orig_ctx     = 256;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "failed to create a context\n");
@@ -159,6 +171,10 @@ struct mutation {
     // (add, div) only rotates keys in place where the class re-ropes its cache, so its control is reported
     // but not required (measured: glm5-next's div leaves the captured bytes as they were)
     bool overwrites;
+    // the hook must fire; false where the mutation only changes the captured bytes in some configurations
+    // (shift-other ropes them by 0: a change under YaRN, a no-op that needs no force for plain f16 K, and
+    // nothing at all for a class whose K-shift does not rope, as glm5-next measured)
+    bool must_force = true;
 };
 
 int main(int argc, char ** argv) {
@@ -172,6 +188,7 @@ int main(int argc, char ** argv) {
         else if (a == "--more")            g_o.n_more = std::atoi(next());
         else if (a == "--ubatch")          g_o.n_ubatch = std::atoi(next());
         else if (a == "--expect-deferred") g_o.expect_deferred = std::atoi(next());
+        else if (a == "--yarn")            g_o.yarn = true;
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
     }
 
@@ -191,14 +208,15 @@ int main(int argc, char ** argv) {
 
     std::mt19937 rng(1234);
     std::uniform_int_distribution<int> dis(0, n_vocab - 1);
-    const int n_all = g_o.n_node + g_o.n_more + 64;
+    const int n_all = 2 * g_o.n_node + g_o.n_more + 64; // keep grows seq 0 to 2N
     std::vector<llama_token> toks(n_all), other(n_all);
     for (auto & t : toks)  t = dis(rng);
     for (auto & t : other) t = dis(rng);
 
     const int N  = g_o.n_node;
     const int LO = g_o.n_lo;
-    printf("model %s  node %d  delta lo %d  more %d\n", g_o.model.c_str(), N, LO, g_o.n_more);
+    printf("model %s  node %d  delta lo %d  more %d  ubatch %u%s\n", g_o.model.c_str(), N, LO, g_o.n_more, g_o.n_ubatch,
+           g_o.yarn ? "  yarn" : "");
 
     // ---- append: root and delta captures, the context keeps decoding, then emission
     size_t n_def_root = 0, n_total_root = 0;
@@ -324,6 +342,31 @@ int main(int argc, char ** argv) {
             const int p = llama_memory_seq_pos_max(mem(c), seq) + 1; // the next decode applies the shift
             decode(c, other, p, p + 1, seq);
             return true; }, false },
+        { "shift-other", true, false, [&](llama_context * c, int seq) {
+            // a context shift of the OTHER sequence (seq 0), as the server does on another slot: the K-shift
+            // graph ropes the captured cells too (by 0)
+            const int a = N / 4, b = N / 2;
+            if (!llama_memory_can_shift(mem(c)) || b - a < 1) {
+                return false;
+            }
+            (void) seq;
+            if (!llama_memory_seq_rm(mem(c), 0, a, b)) {
+                return false; // a class that cannot rewind cannot context-shift either
+            }
+            llama_memory_seq_add(mem(c), 0, b, -1, -(b - a));
+            decode(c, other, N - (b - a), N - (b - a) + 1, 0); // applies the K-shift
+            return true; }, g_o.yarn, g_o.yarn },
+        { "add-shared", true, false, [&](llama_context * c, int seq) {
+            // seq 0 takes the captured cells by a same-stream copy, then shifts: the shared cells move and
+            // are re-roped for both sequences
+            if (!llama_memory_can_shift(mem(c))) {
+                return false;
+            }
+            llama_memory_seq_rm(mem(c), 0, -1, -1);
+            llama_memory_seq_cp(mem(c), seq, 0, -1, -1);
+            llama_memory_seq_add(mem(c), 0, LO, -1, 5);
+            decode(c, other, N + 5, N + 6, 0); // applies the K-shift
+            return true; }, false },
         { "load-seq", false, false, [&](llama_context * c, int seq) {
             return llama_state_seq_set_data(c, other_seq.data(), other_seq.size(), seq) > 0; }, true },
         { "load-file", false, false, [&](llama_context * c, int seq) {
@@ -362,7 +405,7 @@ int main(int argc, char ** argv) {
             if (hook) {
                 printf("  %-10s forced %u: %s (%zu differing bytes)\n", m.name, forced, nd == 0 ? "EQUAL" : "DIFF ", nd);
                 CHECK(nd == 0, "%s: the deferred unit differs from the immediate one by %zu bytes", m.name, nd);
-                if (deferring) {
+                if (deferring && m.must_force) {
                     CHECK(forced >= 1, "%s: the hook did not force the pending capture", m.name);
                 }
             }

@@ -264,6 +264,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-${model}" --expect-deferred ${expect})
         set_tests_properties(test-state-deferred-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
     endforeach()
+    # A first decode right after a prompt-node-sized prefill (a ubatch padded past the pooled rows): the
+    # k-pool indexer's pad entries re-pool cells of the captured sequence, so that cache must not defer
+    foreach(model glm5-next-moe qwen4exp-moe)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-pad-${model}")
+        llama_test(test-state-deferred NAME test-state-deferred-pad-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-pad-${model}" --expect-deferred 1
+                 --node 513 --lo 511 --more 5 --ubatch 512)
+        set_tests_properties(test-state-deferred-pad-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # YaRN: the K-shift graph's rope by 0 scales every key, so shifting ANY sequence changes captured cells
+    file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-yarn-llama-dense")
+    llama_test(test-state-deferred NAME test-state-deferred-yarn-llama-dense LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-yarn-llama-dense" --expect-deferred 1 --yarn)
+    set_tests_properties(test-state-deferred-yarn-llama-dense PROPERTIES FIXTURES_REQUIRED generate-models)
     # DeepSeek-V4: chains long enough for HCA rows (ratio 128) to be written by deltas starting past row
     # 0, at block-aligned and unaligned starts, across a rung where the HCA cache size itself changes,
     # and with an MTP-style rollback whose drafts complete an HCA block
