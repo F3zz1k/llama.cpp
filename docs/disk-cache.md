@@ -117,9 +117,12 @@ A checkpoint captured while the prefill keeps running becomes durable once its d
 emitted, which during a busy prefill starts about 10 s after the capture (the trickle, which moves bytes
 at a rate per second, so a prefill batch of several seconds carries a whole checkpoint's copy in one or
 two batches). A crash therefore loses at most the checkpoints captured in the last 10-20 s. Measured on
-Qwen3.8-27B (one B70, `N` = 16384, a 1.2 GB delta per checkpoint): see the fork's PERFORMANCE notes for
-the overhead per checkpoint. The default is 0 (off), which changes nothing: no extra batch breaks and no
-extra saves.
+Qwen3.8-27B (one Arc Pro B70 on PCIe Gen3 x4, f16 KV, MTP on, a cold 100k-token prompt, `N` = 16384,
+six checkpoints of 1.14 GB positional each): each checkpoint was on disk 16-25 s after its capture
+while the prefill continued, and the first token came 2.4 s later than with the interval off (164.9 s
+against 162.5 s, two runs each), about 0.4 s per checkpoint, which is the device-to-host copy of its
+positional bytes. The default is 0 (off), which changes nothing: no extra batch breaks and no extra
+saves.
 
 **Context rungs** (the same model at several `-c`, e.g. 1 GPU at 131072 and 2 GPUs at 262144, or a
 lower-context vision variant beside the text one): point them at the same store. `-c` is not part of a
