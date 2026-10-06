@@ -3709,14 +3709,27 @@ private:
             // No block-boundary clamp here: the whole snapshot is the only legal restore length.
             // Refuse BEFORE the multi-GB read so the candidate loop falls through to a SHORTER snapshot
             // that IS a whole prefix of this request (e.g. the mid-prefill context base).
-            if (v != disk_toks.size()) {
+            // [RS_RING_SERIALIZE] exception for pure recurrent models: llama_state_seq_write now
+            // persists the FULL rollback ring (the live row + n_rs_seq depth snapshots per tensor), so
+            // a text-only snapshot whose LAST d tokens (1 <= d <= llama_n_rs_seq) diverge from the
+            // request can still be restored and rewound by exactly d with one partial seq_rm after the
+            // load — the recurrent sub-memory arms a pending rollback that the next decode consumes.
+            // This is the systematic generation-suffix mismatch: the saved prompt ends in the turn-open
+            // tokens, which re-render differently once the turn becomes history (verified N-1 of N).
+            // Deeper divergence stays a hard reject as before. Hybrid models are excluded: their
+            // attention half keeps only what it persisted, so partial rewind there is not sound.
+            const uint32_t ring = llama_n_rs_seq(ctx_tgt);
+            const bool ring_rewind_ok = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                                        disk_media.empty() && ring > 0 && v < disk_toks.size() &&
+                                        disk_toks.size() - v <= (size_t) ring;
+            if (v != disk_toks.size() && !ring_rewind_ok) {
                 auto_not_prefix_skips++;
                 SLT_DBG(slot, "auto-restore: snapshot is not a whole prefix of the request "
                               "(verified %zu of %zu snapshot tokens; request %zu, seq_rm_type = %d, n_swa = %d) - skipping %s\n",
                         v, disk_toks.size(), req.size(), (int) ctx_tgt_seq_rm_type, n_swa_mem, cand.state_path.c_str());
                 return 0;
             }
-            n_keep_disk = (int) disk_toks.size();
+            n_keep_disk = (int) v; // == disk_toks.size() on an exact whole-prefix match
         } else {
             // Reached for the ONE class restore_is_whole_prefix_only() rejects: PART with
             // n_swa_mem == 0 (plain attention), which supports per-token partial seq_rm. NO used to
@@ -3833,6 +3846,31 @@ private:
                 metrics.n_auto_restore_failed++;
                 return 0;
             }
+        }
+        // [RS_RING_SERIALIZE] tail-divergent RS snapshot: rewind the loaded plane by d = N - v
+        // tokens using the rollback ring that the dump now carries. One partial seq_rm does it:
+        // the recurrent sub-memory arms a single-use pending rollback (depth <= n_rs_seq) and
+        // rewinds cell.pos to v-1; the attention sub-memory drops cells [v, N). The next decode
+        // consumes the pending rollback — its gather reads depth-d snapshots that never saw the
+        // divergent tail, exactly the state needed before position v. Text-only by gate above.
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+            disk_media.empty() && v < disk_toks.size()) {
+            slot.prompt.tokens.keep_first(v);
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, (llama_pos) v, -1)) {
+                // ring too shallow or already armed — cannot rewind below the loaded position,
+                // so the restore is unusable: drop it and cold-prefill instead (invariant 4).
+                SLT_WRN(slot, "auto-restore: ring rewind by %zu tokens failed; clearing restored state\n",
+                        disk_toks.size() - v);
+                auto_restore_drop(slot);
+                return 0;
+            }
+            // the anchor checkpoint built by do_slot_restore describes the PRE-rewind plane
+            // (pos_max = N-1) — stale after the rewind. These models resume this request through
+            // the live armed rollback, not through an anchor, so drop it rather than let a wrong
+            // pos_max leak into later checkpoint searches or eviction guards.
+            slot.prompt.checkpoints.clear();
+            SLT_INF(slot, "auto-restore: rewound %zu token(s) via rollback ring (verified %zu of %zu snapshot tokens)\n",
+                    disk_toks.size() - v, v, disk_toks.size());
         }
         // SWA models (PART seq_rm, n_swa > 0): the downstream checkpoint search refuses any
         // checkpoint whose pos_max exceeds the request's pos_next, and a fresh process has no
