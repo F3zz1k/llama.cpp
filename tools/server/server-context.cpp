@@ -4983,6 +4983,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
+            server_task_message_delimiters(task, ctx_server.vocab, data, chat_session.has_template()); // fork: auto disk cache
             server_task_preamble_end(task, *meta, ctx_server.vocab, data, prompt, inputs.size()); // fork: auto disk cache
 
             // OAI-compat

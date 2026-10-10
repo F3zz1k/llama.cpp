@@ -358,5 +358,6 @@ bool mmproj_header_fingerprint(const std::string & path, uint64_t & out);
 struct server_context_meta;
 struct server_task;
 void server_props_disk_cache(const server_context_meta & meta, json & props);
+void server_task_message_delimiters(server_task & task, const llama_vocab * vocab, const json & data, bool has_template);
 void server_task_preamble_end(server_task & task, const server_context_meta & meta, const llama_vocab * vocab,
                               const json & data, const json & prompt, size_t n_inputs);

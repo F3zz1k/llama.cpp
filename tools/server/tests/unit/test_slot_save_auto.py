@@ -23,12 +23,22 @@ server = ServerPreset.tinyllama2()
 # fixtures/golden-v1/SHA256SUMS updated with it. The version word is asserted directly below
 # so that bump reports itself instead of surfacing as an opaque sha mismatch or, worse, as a
 # restore test that quietly cold-prefills.
-STATE_SEQ_VERSION = 3          # must track LLAMA_STATE_SEQ_VERSION in include/llama.h
+#
+# Version 3 -> 4 (upstream 21079106, #28498, merged 2026-10-10) was not recaptured but converted, because
+# the capture is a GPU (SYCL) one and its K/V numbers are what the GPU check below compares. The bump
+# changes exactly two things in this file: the version word, and two uint32 fields (n_rot_k, n_rot_v)
+# that llama_kv_cache::state_write_data now writes after (v_trans, n_layer), here at byte 6060. An f16
+# K/V cache has no attention rotation, so both are 0. Checked on CPU: the version 3 unit main-patched
+# emits for GOLDEN_REQUEST, converted this way, equals the version 4 unit the merged build emits in
+# every byte outside the K and V rows (same length, same per-layer type and row size; the rows differ
+# because CPU arithmetic changed between the two builds), and the fixture's bytes before its first K
+# row equal the CPU unit's.
+STATE_SEQ_VERSION = 4          # must track LLAMA_STATE_SEQ_VERSION in include/llama.h
 STATE_SEQ_MAGIC   = 0x67677371 # LLAMA_STATE_SEQ_MAGIC ("ggsq")
 FIXTURE_DIR = "./fixtures/golden-v1"
 FIXTURE_SHA256 = {
     "auto-f414107cff91a49e-5efede8f57f0c198-377.bin":
-        "b5c5f419ef0ad9d609c1c92e64850e2d79f69102a02182c4ef2dc66d827cc9ba",
+        "88a5adb5c770f4fc1b9269f8ee23e4fad8b349df89d5636d2da0daecbf5c3ed0",
     "auto-f414107cff91a49e-5efede8f57f0c198-377.bin.meta":
         "ecbac54e17454e180c4b50abe0845822996cbca207df95719f6e0a9328f54f90",
 }
@@ -68,6 +78,10 @@ EMITTED_CHAIN_HASH = 0xa028e20ed7d8f6b7
 # backend, each taken with this build's predecessor on that backend (the CPU one from main-patched
 # 593c2d0d7, re-emitted unchanged by every later CPU build). The .meta carries no numbers and must
 # match exactly on every backend.
+# The CPU capture predates STATE_SEQ_VERSION 4, and the CPU K/V values changed with the 2026-10-10 upstream
+# merge as well, so it no longer matches any build: it must be recaptured on the machine it came from. The
+# GPU entry is the converted fixture (see above), which a SYCL build emits only if its arithmetic is
+# unchanged; it has not been run on a GPU since the conversion.
 EMITTED_BIN_SHA256_PER_BACKEND = {
     "gpu-sycl": FIXTURE_SHA256["auto-f414107cff91a49e-5efede8f57f0c198-377.bin"],
     "cpu":      "c97f4c568102edae478b21e7ac7937e2a437e0e76e8f9410a313d59f0ebc8cc7",

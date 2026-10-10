@@ -1044,8 +1044,9 @@
     // Bookkeeping after a KV state has been loaded into `slot` (prompt tokens already set), shared by
     // the auto-cache restore and both manual /slots formats: marks the slot just-restored, drops the
     // previous task's checkpoints, synthesises the FULL-class checkpoint and re-arms the regenerate
-    // logits from `sidecar_path` when one is given.
-    void restore_finish(server_slot & slot, const std::string * sidecar_path, size_t token_count) {
+    // logits from `sidecar_path` when one is given. `synth_ckpt` false: the caller restores the slot's own
+    // checkpoints instead (a manual /slots file that carries them), so no FULL-class checkpoint is made.
+    void restore_finish(server_slot & slot, const std::string * sidecar_path, size_t token_count, bool synth_ckpt = true) {
         slot.just_restored = true;
 
         // Drop the previous task's checkpoints UNCONDITIONALLY, for every class, before any synth
@@ -1075,7 +1076,7 @@
         // NOTE at the acceptance predicate documents. The same reasoning forbids extending the SWA
         // synth in auto_restore_into_slot to RS.
         // SWA gets its own synth there (it is a real window start, not a tail).
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        if (synth_ckpt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
             const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             if (ckpt_pos_min >= 0) {
@@ -4456,32 +4457,25 @@
         }
     }
 
-    // process_single_task(), SLOT_RESTORE: after upstream's load
+    // process_single_task(), SLOT_RESTORE: after upstream's load. The checkpoints the save appended to the
+    // file (load_slot_checkpoints) are the ones the slot held when it was saved, so a restore that loaded
+    // them keeps exactly those: the restored slot is the saved one, and saving it again writes the same
+    // file, as upstream's restore does. Only a file without them (written before upstream #26004, or with
+    // an appendix that was ignored) gets the checkpoint synthesised at the restored position, which stands
+    // in for the ones it could not carry.
     void manual_restore_finish(server_slot * slot, const std::string & filepath, bool has_saved_ckpts) {
-        // checkpoints the save appended to the file (load_slot_checkpoints) describe this state, so they
-        // survive restore_finish's clear, which is there to drop a previous task's checkpoints
         std::list<common_prompt_checkpoint> saved;
         if (has_saved_ckpts) {
             saved = std::move(slot->prompt.checkpoints);
         }
 
         // fork: restore flags, FULL/SWA checkpoints and the logits sidecar (see restore_finish)
-        restore_finish(*slot, &filepath, slot->prompt.tokens.size());
-        restore_swa_checkpoint(*slot);
-
-        if (saved.empty()) {
+        restore_finish(*slot, &filepath, slot->prompt.tokens.size(), /*synth_ckpt=*/!has_saved_ckpts);
+        if (!has_saved_ckpts) {
+            restore_swa_checkpoint(*slot);
             return;
         }
-        // the checkpoint synthesised at the restored position follows the saved ones unless the saved
-        // list already reaches that position; the cap is the one load_slot_checkpoints applied
-        for (auto & cur : slot->prompt.checkpoints) {
-            if (cur.pos_max > saved.back().pos_max) {
-                saved.push_back(std::move(cur));
-            }
-        }
-        while (saved.size() > (size_t) std::max(params_base.n_ctx_checkpoints, 0)) {
-            saved.pop_front();
-        }
+        // restore_finish dropped the list (it is there for a previous task's checkpoints)
         slot->prompt.checkpoints = std::move(saved);
     }
 

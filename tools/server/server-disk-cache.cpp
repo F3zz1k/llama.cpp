@@ -943,6 +943,29 @@ void server_props_disk_cache(const server_context_meta & meta, json & props) {
     }
 }
 
+// handle_completions_impl(): a prompt rendered without a chat template (a raw /completion prompt) takes
+// its message spans from the request's own role delimiters, "message_delimiters". Upstream read that field
+// for every request until #30210 moved the delimiters into common_chat_session, which only a chat request
+// has; the system node and the prompt node of such a prompt are placed from these spans (docs/disk-cache.md),
+// as are upstream's prefill checkpoints at user messages, as they were before that change.
+void server_task_message_delimiters(server_task & task, const llama_vocab * vocab, const json & data, bool has_template) {
+    if (has_template) {
+        return;
+    }
+    const json delims = json_value(data, "message_delimiters", json::array());
+    common_chat_msg_delimiters delimiters;
+    if (delims.is_array()) {
+        for (const auto & d : delims) {
+            if (!d.is_object()) {
+                continue;
+            }
+            delimiters.add(common_chat_role_from_string(d.value("role", std::string())), d.value("delimiter", std::string()));
+        }
+    }
+    delimiters.tokenize(vocab);
+    task.params.message_spans = task.tokens.find_message_spans(delimiters);
+}
+
 // handle_completions_impl(): the system node's position for a single string prompt
 void server_task_preamble_end(server_task & task, const server_context_meta & meta, const llama_vocab * vocab,
                               const json & data, const json & prompt, size_t n_inputs) {
