@@ -1,7 +1,8 @@
 // fork-only: Test 10 of the save/load suite as it ran in test-save-load-state.cpp until the fork moved it
 // here, so the upstream file stays as upstream has it. Incremental delta compose (the disk KV cache's base
 // + delta chain), run after the same baseline as there. The harness below (status, logits comparison,
-// generation, baseline and main) is copied from test-save-load-state.cpp and keeps its arguments and defaults.
+// generation, baseline and main) is copied from test-save-load-state.cpp and keeps its arguments and defaults
+// (only the baseline's dump file is renamed, so the two tests can run in parallel).
 
 #include "arg.h"
 #include "common.h"
