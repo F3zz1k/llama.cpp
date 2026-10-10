@@ -8,7 +8,10 @@ llama_add_compile_flags()
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
+include(fork-sources.cmake) # fork
+
 set(LLAMA_CORE_SOURCES
+    ${LLAMA_CORE_FORK_SOURCES} # fork
     llama.cpp
     llama-adapter.cpp
     llama-arch.cpp
@@ -21,7 +24,6 @@ set(LLAMA_CORE_SOURCES
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
-    llama-state-deferred.cpp
     llama-kv-cache.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp
