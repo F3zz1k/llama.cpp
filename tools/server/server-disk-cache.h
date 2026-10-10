@@ -144,6 +144,109 @@ struct slot_fp_record {
 // the target position the blob belongs to, so a restore only applies it to a tail that ends there.
 static constexpr uint32_t SLOT_DRAFT_TRAILER_MAGIC = 0x44465431; // "DFT1"
 
+// the auto disk cache's state of a server_slot (a base of it)
+struct server_slot_disk_cache {
+    // idle-delay flush: cleared each time the slot is released (a fresh idle period begins), set
+    // once its warm KV has been flushed to the auto disk cache, so the timed idle wake attempts the
+    // flush at most once per idle period (auto_save_slot_if_useful's dedup covers any re-attempt).
+    bool auto_idle_flushed = false;
+    // the idle flush found the staging full and the writer busy: it is retried (at auto_idle_retry_ms, once
+    // the writer is idle) instead of being given up for the idle period. Cleared when the slot is released.
+    bool    auto_idle_deferred = false;
+    int64_t auto_idle_retry_ms = -1;
+    // a new task whose prefix the background writer still holds waits for its publish without blocking the
+    // other slots: the task stays STARTED, and this is when its wait began (us), -1 when not waiting
+    int64_t aw_pending_t0_us = -1;
+
+    bool just_restored  = false; // set on disk slot-restore; one-shot, gates restored-slot KV reuse
+    // tokens the auto disk cache restored for the current task, not yet accounted as hit or discard
+    // (auto_restore_account consumes it where n_prompt_cached is final)
+    int32_t n_auto_restored_pending = 0;
+    // prompt-prefix tokens the RAM prompt cache (--cache-ram) brought into this slot for the current
+    // task, beyond what the slot already held; accounted with the disk ones in auto_restore_account
+    int32_t n_ram_loaded_pending = 0;
+    // the unit behind n_auto_restored_pending: its length, the files on its chain, and 1 = whole state loaded,
+    // 2 = side-state only (the slot's positional cells kept)
+    uint32_t disk_unit_pending  = 0;
+    uint32_t disk_nodes_pending = 0;
+    uint8_t  disk_mode_pending  = 0;
+
+    // --- mid-prefill shared-context base save (Option A) ---
+    // When > 0, this cold-prefilling slot is ARMED to whole-save the leading shared preamble
+    // [0, ctx_save_pos) as a deduplicated base: ctx_save_pos is the block-aligned first-user
+    // boundary B_ctx. The prefill loop CLAMPS the batch exactly there (never crossing it), and the
+    // post-decode hook in update_slots() whole-saves [0, B_ctx) at the instant the slot is resident
+    // at exactly B_ctx: the true whole state there, so the save is recurrent-/SWA-/dense-correct.
+    // One-shot: armed once per task at prompt start, cleared (-> -1) after the save so the slot then
+    // prefills [B_ctx, N) normally. -1 = not armed (no boundary / warm restore / small preamble).
+    int32_t ctx_save_pos = -1;
+    // --- mid-prefill prompt node (--slot-save-node-prompt) ---
+    // Same mechanism at a second position: the end of the last user message, exactly (without a user
+    // span, n_tokens - 1 block-aligned down). Saved through auto_save_slot_if_useful, so it is a delta on
+    // the deepest saved node under --slot-save-incremental. -1 = not armed.
+    int32_t prompt_save_pos = -1;
+    // --- periodic prefill checkpoints (--slot-save-prefill-interval) ---
+    // The positions (ascending, each a multiple of the interval, moved down to a chunk start when it would
+    // split a media chunk) at which this prefill stops its batch and publishes a node, armed at prompt start;
+    // ckpt_save_idx is the next one to reach. Each node is saved through auto_save_slot_if_useful, so it is a
+    // delta on the previous one under --slot-save-incremental and the true whole state there for every class.
+    std::vector<int32_t> ckpt_save_pos;
+    size_t               ckpt_save_idx = 0;
+    // the last periodic checkpoint of this prefill that was published WHOLE (a class without deltas, or
+    // --slot-save-incremental off): the next whole checkpoint replaces it, so one prefill keeps one whole checkpoint
+    // (its deepest) instead of N, 2N, 3N, ... whose bytes would grow with the square of the prompt
+    std::string          ckpt_prev_whole;
+    // a prefill that counted as cold for the prompt node has not reached the end of its prompt yet: a resend
+    // that continues it on this slot (a client disconnect, a timeout) still counts as cold
+    bool                 cold_prefill_open = false;
+
+    // --- KV restore-reuse (logits sidecar) ---
+    // Full-vocab logits of this slot's most recently sampled token, captured at sample time
+    // (only populated for the FULL and RS classes when --slot-save-path is set, see
+    // logits_sidecar_class(); plain attention rewinds by one token instead). Serialized to the
+    // <state>.logits sidecar on SLOT_SAVE so a later exact-prompt "regenerate" can emit the first
+    // token WITHOUT re-decoding into the (un-rewindable) restored recurrent state.
+    std::vector<float> logits_last;     // size n_vocab when valid, else empty
+    // Token count of the prompt-state that `logits_last` corresponds to (i.e. the slot's KV/token
+    // length at the moment of capture). Used to BIND the captured distribution to a specific state:
+    // a sidecar is only written when this equals the saved snapshot's token_count, so a stale
+    // distribution (e.g. left over from a prior task, or skipped on a spec-decode step) can never
+    // be serialized against a mismatched state. -1 = no valid capture.
+    int32_t logits_last_n_tokens = -1;
+    // Logits loaded from a sidecar at SLOT_RESTORE, consumed once by the restore-continue path.
+    std::vector<float> restored_logits; // size n_vocab when a valid sidecar was loaded, else empty
+    // the token count those logits follow: a restore that is then trimmed (a plain-attention or whole-window
+    // SWA unit rewound to a shorter request) must not emit from the unit's logits
+    int32_t restored_logits_n = -1;
+
+    // the cache's part of server_slot::reset()
+    void reset_disk_cache() {
+        // one-shot; never carry restored sidecar logits into a non-restore request.
+        // NOTE: logits_last is deliberately NOT cleared here: it is the slot's running
+        // "last sampled distribution" and must survive into the idle state so a subsequent
+        // SLOT_SAVE can serialize it.
+        restored_logits.clear();
+
+        // Same one-shot rule for the restore flag, so it can outlive at most ONE task. Its consumers
+        // sit behind guards a task can miss entirely (cache_prompt == false forces n_past = 0, which
+        // skips the consume), and reset() runs from release(), i.e. AFTER the consumers of the task
+        // that owns the restore. A manual /slots restore is not a processing task and never reaches
+        // release(), so the flag still survives from that endpoint into the next request, which is
+        // what the regenerate fast-path relies on.
+        just_restored = false;
+        n_auto_restored_pending = 0;
+        n_ram_loaded_pending    = 0;
+    }
+
+    // the cache's part of server_slot::release(), when the slot goes idle
+    void release_disk_cache() {
+        auto_idle_flushed  = false; // fresh idle period: eligible for a timed idle flush again
+        auto_idle_deferred = false;
+        auto_idle_retry_ms = -1;
+        aw_pending_t0_us   = -1;
+    }
+};
+
 // One in-memory index entry: the longest snapshot that reaches a given block
 // boundary. Mirrors slot_save_unit's mtime LRU semantics for reconciliation.
 struct auto_cache_entry {
