@@ -79,6 +79,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_ARCTIC,           "arctic"           },
     { LLM_ARCH_DEEPSEEK,         "deepseek"         },
     { LLM_ARCH_DEEPSEEK2,        "deepseek2"        },
+    { LLM_ARCH_INSTELLA_MOE,     "instella-moe"     }, // fork: InstellaMoE
     { LLM_ARCH_DEEPSEEK2OCR,     "deepseek2-ocr"    },
     { LLM_ARCH_DEEPSEEK32,       "deepseek32"       },
     { LLM_ARCH_DEEPSEEK4,        "deepseek4"        },
@@ -128,6 +129,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_OPENAI_MOE,       "gpt-oss"          },
     { LLM_ARCH_LFM2,             "lfm2"             },
     { LLM_ARCH_LFM2MOE,          "lfm2moe"          },
+    { LLM_ARCH_INKLING,          "inkling"          }, // fork: Inkling
     { LLM_ARCH_DREAM,            "dream"            },
     { LLM_ARCH_SMALLTHINKER,     "smallthinker"     },
     { LLM_ARCH_LLADA,            "llada"            },
@@ -158,10 +160,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
-    { LLM_ARCH_INKLING,          "inkling"          },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
-    { LLM_ARCH_INSTELLA_MOE,     "instella-moe"     },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -1159,6 +1159,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_JAMBA:
         case LLM_ARCH_FALCON_H1:
+        case LLM_ARCH_INKLING: // fork: Inkling
         case LLM_ARCH_PLAMO2:
         case LLM_ARCH_GRANITE_HYBRID:
         case LLM_ARCH_LFM2:
@@ -1175,7 +1176,6 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_MINIMAX_01:
-        case LLM_ARCH_INKLING:
             return true;
         default:
             return false;
@@ -1224,13 +1224,14 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MAMBA2:
         case LLM_ARCH_JAMBA:
         case LLM_ARCH_FALCON_H1:
+        case LLM_ARCH_INKLING: // fork: Inkling
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_INSTELLA_MOE: // fork: InstellaMoE
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_HY_V4:
         case LLM_ARCH_DOTS3NOTE:
-        case LLM_ARCH_INSTELLA_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
@@ -1245,7 +1246,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
-        case LLM_ARCH_INKLING:
         case LLM_ARCH_QWEN3TTS:
             return false;
         default:

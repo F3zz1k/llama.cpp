@@ -131,8 +131,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "HYV3ForCausalLM": "hunyuan",
     "HYV4ForCausalLM": "hy_v4",
     "IQuestCoderForCausalLM": "llama",
-    "InklingForConditionalGeneration": "inkling",
-    "InstellaMoEForCausalLM": "deepseek",
+    "InklingForConditionalGeneration": "inkling",  # fork: Inkling
+    "InstellaMoEForCausalLM": "deepseek",  # fork: InstellaMoE
     "InternLM2ForCausalLM": "internlm",
     "InternLM3ForCausalLM": "internlm",
     "JAISLMHeadModel": "jais",
@@ -325,7 +325,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "GraniteSpeechPlusForConditionalGeneration": "granite",
     "HunYuanVLForConditionalGeneration": "hunyuan",
     "Idefics3ForConditionalGeneration": "smolvlm",
-    "InklingForConditionalGeneration": "inkling",
+    "InklingForConditionalGeneration": "inkling",  # fork: Inkling
     "InternVisionModel": "internvl",
     "JanusForConditionalGeneration": "januspro",
     "KimiK25ForConditionalGeneration": "kimivl",

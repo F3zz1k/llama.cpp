@@ -935,7 +935,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
-        case PROJECTOR_TYPE_INKLING:
+        case PROJECTOR_TYPE_INKLING: // fork: Inkling
             {
                 builder = std::make_unique<clip_graph_inkling>(ctx, img);
             } break;
@@ -1430,7 +1430,7 @@ struct clip_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
-                case PROJECTOR_TYPE_INKLING:
+                case PROJECTOR_TYPE_INKLING: // fork: Inkling
                     {
                         if (is_vision) {
                             hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
@@ -2384,7 +2384,7 @@ struct clip_model_loader {
 
 
         switch (model.proj_type) {
-            case PROJECTOR_TYPE_INKLING:
+            case PROJECTOR_TYPE_INKLING: // fork: Inkling
                 {
                     if (model.modality == CLIP_MODALITY_VISION) {
                         model.inkling_hmlp_layers.resize(hparams.n_layer);
@@ -4190,7 +4190,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
     projector_type proj = ctx->proj_type();
 
     switch (proj) {
-        case PROJECTOR_TYPE_INKLING:
+        case PROJECTOR_TYPE_INKLING: // fork: Inkling
             {
                 if (ctx->model.modality == CLIP_MODALITY_AUDIO) {
                     // One dMel row is one soft audio token.
@@ -5366,13 +5366,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
-        case PROJECTOR_TYPE_INKLING: // inp_raw is the only graph input
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN2A:
         case PROJECTOR_TYPE_QWEN3A:
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_ULTRAVOX:
+        case PROJECTOR_TYPE_INKLING: // fork: Inkling. inp_raw is the only graph input
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_VOXTRAL:
         case PROJECTOR_TYPE_MERALION:
@@ -6030,7 +6030,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     switch (ctx->model.proj_type) {
-        case PROJECTOR_TYPE_INKLING:
+        case PROJECTOR_TYPE_INKLING: // fork: Inkling
             return ctx->model.modality == CLIP_MODALITY_AUDIO
                 ? ctx->model.inkling_dmel_final_norm_w->ne[0]
                 : ctx->model.inkling_hmlp_final_norm_w->ne[0];

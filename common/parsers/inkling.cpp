@@ -84,6 +84,7 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
         // each call is its own block (role opener + bare name echo + JSON section);
         // force_tool_calls=true makes the JSON section required so a pure-text answer fails the
         // block cleanly; parallel calls are separate blocks, hence repeat + parallel=false
+        p.require_object_args = true;
         auto tool_section = p.standard_json_tools(
             INVOKE_TOOL, END_MESSAGE, inputs.tools, /* parallel_tool_calls = */ false,
             /* force_tool_calls = */ true,
@@ -94,8 +95,7 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
             /* call_id_key       = */ "",
             /* gen_call_id_key   = */ "",
             /* parameters_order  = */ {},
-            /* accept_openai_wrapper = */ false,
-            /* require_object_args   = */ true);
+            /* accept_openai_wrapper = */ false);
         // the name-echo scan must stop at any block marker: a greedy until(INVOKE_TOOL) returns
         // NEED_MORE_INPUT mid-stream, which choice() treats as a match and shadows the text branch
         auto tool_block = p.optional(p.literal(MSG_MODEL)) +

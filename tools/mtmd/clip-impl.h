@@ -375,7 +375,7 @@
 #define TN_A_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"
 #define TN_A_FFN_POST_NORM_1 "%s.blk.%d.ffn_post_norm_1.%s"
 
-// Inkling hMLP vision and dMel audio towers.
+// fork: Inkling hMLP vision and dMel audio towers.
 #define TN_INKLING_HMLP_LINEAR     "v.hmlp.%d.linear.weight"
 #define TN_INKLING_HMLP_NORM       "v.hmlp.%d.norm.weight"
 #define TN_INKLING_HMLP_FINAL_NORM "v.hmlp.final_norm.weight"
@@ -450,7 +450,7 @@
 struct clip_ctx;
 
 enum projector_type {
-    PROJECTOR_TYPE_INKLING,
+    PROJECTOR_TYPE_INKLING, // fork: Inkling
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
     PROJECTOR_TYPE_LDP,
@@ -519,7 +519,7 @@ enum projector_type {
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
-    { PROJECTOR_TYPE_INKLING,           "inkling" },
+    { PROJECTOR_TYPE_INKLING,           "inkling" }, // fork: Inkling
     { PROJECTOR_TYPE_MLP,               "mlp" },
     { PROJECTOR_TYPE_LDP,               "ldp" },
     { PROJECTOR_TYPE_LDPV2,             "ldpv2"},

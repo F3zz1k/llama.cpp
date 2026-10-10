@@ -342,6 +342,9 @@ class ModelBase:
 
         if (quant_config := self.hparams.get("quantization_config")) and isinstance(quant_config, dict):
             quant_method = quant_config.get("quant_method")
+            if quant_method == "modelopt":  # fork: Inkling
+                from .fork_modelopt import reject_stacked_nvfp4_experts
+                reject_stacked_nvfp4_experts(self.model_tensors)
 
             def dequant_bitnet(weight: Tensor, scale: Tensor) -> Tensor:
                 weight = weight.view(torch.uint8)
@@ -565,20 +568,6 @@ class ModelBase:
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
-                # Stacked-expert NVFP4 checkpoints (e.g. Inkling-NVFP4) store experts as
-                # w13_weight/w2_weight with .scale/.scale2/.input_amax/.original_shape
-                # auxiliaries; the main tensors do not end in .weight, so the NVFP4 path
-                # below would silently skip them. Reject them with a clear error.
-                stacked_expert_aux = [
-                    n for n in self.model_tensors
-                    if n.endswith((".scale2", ".input_amax", ".original_shape"))
-                ]
-                if stacked_expert_aux:
-                    raise NotImplementedError(
-                        "This checkpoint stores quantized experts in the stacked ModelOpt NVFP4 layout "
-                        f"({len(stacked_expert_aux)} auxiliary tensors like {stacked_expert_aux[0]!r}), "
-                        "which is not supported yet. Convert from the unquantized (BF16) checkpoint instead."
-                    )
                 # Mixed-precision ModelOpt models: NVFP4 tensors are handled by
                 # _generate_nvfp4_tensors; FP8 tensors have 1D weight_scale and
                 # are dequantized here. k/v scale tensors are unused.

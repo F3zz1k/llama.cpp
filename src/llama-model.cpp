@@ -194,6 +194,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek(params);
         case LLM_ARCH_DEEPSEEK2:
             return new llama_model_deepseek2(params);
+        case LLM_ARCH_INSTELLA_MOE: // fork: InstellaMoE
+            return new llama_model_instella_moe(params);
         case LLM_ARCH_DEEPSEEK2OCR:
             return new llama_model_deepseek2ocr(params);
         case LLM_ARCH_DEEPSEEK32:
@@ -202,8 +204,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
-        case LLM_ARCH_INSTELLA_MOE:
-            return new llama_model_instella_moe(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -304,6 +304,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
             return new llama_model_lfm2moe(params);
+        case LLM_ARCH_INKLING: // fork: Inkling
+            return new llama_model_inkling(params);
         case LLM_ARCH_SMALLTHINKER:
             return new llama_model_smallthinker(params);
         case LLM_ARCH_GROVEMOE:
@@ -350,8 +352,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_step35(params);
         case LLM_ARCH_SPARK2_5:
             return new llama_model_spark2_5(params);
-        case LLM_ARCH_INKLING:
-            return new llama_model_inkling(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2187,8 +2187,9 @@ void llama_model::print_info() const {
 
         if (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK2OCR ||
                 arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA ||
+                arch == LLM_ARCH_INSTELLA_MOE || // fork: InstellaMoE
                 arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_MISTRAL4 ||
-                arch == LLM_ARCH_HY_V4 || arch == LLM_ARCH_INSTELLA_MOE) {
+                arch == LLM_ARCH_HY_V4) {
             LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
             LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
             LLAMA_LOG_INFO("%s: n_lora_kv             = %d\n",     __func__, hparams.n_lora_kv);
@@ -3053,6 +3054,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MAMBA:
         case LLM_ARCH_MAMBA2:
         case LLM_ARCH_JAMBA:
+        case LLM_ARCH_INKLING: // fork: Inkling
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
@@ -3067,7 +3069,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
-        case LLM_ARCH_INKLING:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -3087,6 +3088,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_INSTELLA_MOE: // fork: InstellaMoE
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
@@ -3114,7 +3116,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
-        case LLM_ARCH_INSTELLA_MOE:
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope

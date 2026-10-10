@@ -28,6 +28,7 @@ add_library(mtmd
             clip-model.h
             clip-graph.h
             models/models.h
+            models/inkling.cpp # fork: Inkling
             models/cogvlm.cpp
             models/conformer.cpp
             models/deepseek4v.cpp
@@ -43,7 +44,6 @@ add_library(mtmd
             models/granite4-vision.cpp
             models/hunyuanvl.cpp
             models/internvl.cpp
-            models/inkling.cpp
             models/kimivl.cpp
             models/kimik25.cpp
             models/nemotron-v2-vl.cpp

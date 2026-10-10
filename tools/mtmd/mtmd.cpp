@@ -631,7 +631,7 @@ struct mtmd_context {
         projector_type proj = clip_get_projector_type(ctx_v);
 
         switch (proj) {
-            case PROJECTOR_TYPE_INKLING:
+            case PROJECTOR_TYPE_INKLING: // fork: Inkling
                 {
                     // renderer opens each image part with <|content_image|>; block framing comes from the template
                     img_beg = "<|content_image|>";
@@ -942,7 +942,7 @@ struct mtmd_context {
 
         // set preprocessor
         switch (proj) {
-            case PROJECTOR_TYPE_INKLING:
+            case PROJECTOR_TYPE_INKLING: // fork: Inkling
                 {
                     // <|content_audio_input|> ... <|audio_end|>, matching the renderer's audio framing
                     aud_beg = "<|content_audio_input|>";
