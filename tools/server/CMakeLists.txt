@@ -13,10 +13,15 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-disk-cache-common.cpp # fork: auto disk cache
+    server-disk-cache-common.h
+    server-disk-cache.cpp # fork: auto disk cache
+    server-disk-cache.h
     server-decision.cpp
     server-decision.h
     server-context.cpp
     server-context.h
+    server-context-disk-cache.inc # fork: auto disk cache
     server-stream.cpp
     server-stream.h
     server-tools.cpp
