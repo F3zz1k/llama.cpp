@@ -4554,7 +4554,7 @@ server_context_meta server_context::get_meta() const {
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
-    server_context_meta meta {
+    return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
         /* model_aliases          */ impl->model_aliases,
@@ -4590,7 +4590,12 @@ server_context_meta server_context::get_meta() const {
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
     };
-    impl->meta_fill(meta); // fork: auto disk cache
+}
+
+// fork: auto disk cache
+server_context_meta server_context::get_meta_disk_cache() const {
+    server_context_meta meta = get_meta();
+    impl->meta_fill(meta);
     return meta;
 }
 
@@ -4689,10 +4694,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
-            server_task_preamble_end(task, *meta, ctx_server.vocab, data, prompt, inputs.size()); // fork: auto disk cache
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
+            server_task_preamble_end(task, *meta, ctx_server.vocab, data, prompt, inputs.size()); // fork: auto disk cache
 
             // OAI-compat
             task.params.res_type          = res_type;

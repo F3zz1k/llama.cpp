@@ -5093,7 +5093,7 @@
         }
     }
 
-    // server_context::get_meta(): the cache's fields of the meta, set after upstream's positional initialiser
+    // server_context::get_meta_disk_cache(): the cache's fields of the meta, which get_meta() leaves at their defaults
     void meta_fill(server_context_meta & meta) const {
         meta.fp_mmproj       = fp_mmproj;
         meta.auto_cache_caps = auto_cache_caps();
