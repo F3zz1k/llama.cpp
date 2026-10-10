@@ -38,6 +38,9 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_MINERVA           = 27,
     LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM     = 28,
     LLAMA_VOCAB_PRE_TYPE_GPT4O             = 29,
+    // fork-only pre-types live at 1000+ so upstream growth never collides with them; the value is
+    // never persisted (GGUF stores the tokenizer.ggml.pre string), so renumbering is safe
+    LLAMA_VOCAB_PRE_TYPE_INKLING           = 1000, // fork: Inkling
     LLAMA_VOCAB_PRE_TYPE_SUPERBPE          = 30,
     LLAMA_VOCAB_PRE_TYPE_TRILLION          = 31,
     LLAMA_VOCAB_PRE_TYPE_BAILINGMOE        = 32,
@@ -69,9 +72,6 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_SPARK2_5          = 58,
     LLAMA_VOCAB_PRE_TYPE_UFAKZEKA          = 59,
     LLAMA_VOCAB_PRE_TYPE_MMBERT            = 60,
-    // fork-only pre-types live at 1000+ so upstream growth never collides with them; the value is
-    // never persisted (GGUF stores the tokenizer.ggml.pre string), so renumbering is safe
-    LLAMA_VOCAB_PRE_TYPE_INKLING           = 1000,
 };
 
 struct LLM_KV;

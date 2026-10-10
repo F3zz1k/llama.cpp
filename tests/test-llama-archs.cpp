@@ -146,6 +146,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
     } else if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_INSTELLA_MOE // fork: InstellaMoE
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_DOTS3NOTE
@@ -154,8 +155,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_HY_V4
-            || arch == LLM_ARCH_INSTELLA_MOE) {
+            || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
@@ -230,6 +230,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
     } else if (arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_INSTELLA_MOE // fork: InstellaMoE
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_DOTS3NOTE
@@ -238,8 +239,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_HY_V4
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_INSTELLA_MOE) {
+            || arch == LLM_ARCH_MISTRAL4) {
         // GLM5 next MLA is nope only, the cache row is the compressed latent alone.
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(512) : uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
@@ -371,6 +371,22 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
     }
 
+    if (arch == LLM_ARCH_INKLING) { // fork: Inkling
+        // Read unconditionally by llama_model_inkling::load_arch_hparams, which
+        // then GGML_ASSERTs shortconv_kernel > 1, d_rel > 0, both rel extents > 0
+        // and logit_scale_denom != 0, so none of these can be left out.
+        ms.add_kv(LLM_KV_INKLING_D_REL,               uint32_t(16));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT,          uint32_t(8));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,      uint32_t(4));
+        ms.add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,    uint32_t(3));
+        ms.add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT,   uint32_t(1));
+        ms.add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM,   16.0f);
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_N_FLOOR, uint32_t(n_ctx));
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_ALPHA,   0.0f);
+        ms.add_kv(LLM_KV_INKLING_UNPADDED_VOCAB_SIZE, n_vocab);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        1.0f);
+    }
+
     if (arch == LLM_ARCH_DEEPSEEK4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,          uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,            uint32_t(32));
@@ -444,21 +460,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (arch == LLM_ARCH_BAILINGMOE3) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   std::vector<float>({0.0f, 4.0f}));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
-    }
-    if (arch == LLM_ARCH_INKLING) {
-        // Read unconditionally by llama_model_inkling::load_arch_hparams, which
-        // then GGML_ASSERTs shortconv_kernel > 1, d_rel > 0, both rel extents > 0
-        // and logit_scale_denom != 0, so none of these can be left out.
-        ms.add_kv(LLM_KV_INKLING_D_REL,               uint32_t(16));
-        ms.add_kv(LLM_KV_INKLING_REL_EXTENT,          uint32_t(8));
-        ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,      uint32_t(4));
-        ms.add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,    uint32_t(3));
-        ms.add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT,   uint32_t(1));
-        ms.add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM,   16.0f);
-        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_N_FLOOR, uint32_t(n_ctx));
-        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_ALPHA,   0.0f);
-        ms.add_kv(LLM_KV_INKLING_UNPADDED_VOCAB_SIZE, n_vocab);
-        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        1.0f);
     }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
