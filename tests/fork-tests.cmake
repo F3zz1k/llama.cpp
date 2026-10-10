@@ -5,6 +5,15 @@ llama_build(test-delta-bytes.cpp)
 llama_build_and_test(test-chat-preamble.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-spans.cpp)
 
+# fork: Inkling (the banded flash-attention bias ops)
+add_executable(test-flash-attn-bias test-flash-attn-bias.cpp)
+target_link_libraries(test-flash-attn-bias PRIVATE ggml)
+add_test(NAME test-flash-attn-bias COMMAND test-flash-attn-bias)
+
+add_executable(test-flash-attn-generic-hash test-flash-attn-generic-hash.cpp)
+target_link_libraries(test-flash-attn-generic-hash PRIVATE ggml)
+add_test(NAME test-flash-attn-generic-hash COMMAND test-flash-attn-generic-hash)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests use internal functions not exported with LLAMA_API (see the matching block in CMakeLists.txt)
     llama_build_and_test(test-server-tokens.cpp)
