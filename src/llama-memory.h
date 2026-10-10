@@ -122,9 +122,7 @@ struct llama_memory_i {
     // state write/read
     //
 
-    virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
-    virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
-
+    // fork: incremental and partial state loads (disk cache)
     // write only the cells whose position is in [p0, p1) (half-open); p0 < 0 => from the start,
     // p1 < 0 => to the end (both < 0 => the whole sequence). The default writes the whole sequence,
     // so a memory type that does not override this stays correct (just non-incremental). Bounded /
@@ -146,6 +144,9 @@ struct llama_memory_i {
     virtual bool state_can_skip_side() const {
         return false;
     }
+
+    virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
+    virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

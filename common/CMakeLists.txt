@@ -54,9 +54,11 @@ endif()
 set(TARGET llama-common)
 
 include(parsers/sources.cmake)
+include(fork-sources.cmake) # fork
 
 add_library(${TARGET}
     ${LLAMA_CHAT_PARSERS_SOURCES}
+    ${LLAMA_COMMON_FORK_SOURCES} # fork
     arg.cpp
     arg.h
     base64.hpp

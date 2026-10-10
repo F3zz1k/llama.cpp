@@ -1,0 +1,166 @@
+# fork-only test registrations, kept out of tests/CMakeLists.txt (which includes this file once, after its
+# internal-API block, so MODEL_DIR and the generate-models fixture are already defined).
+
+llama_build(test-delta-bytes.cpp)
+llama_build_and_test(test-chat-preamble.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-chat-spans.cpp)
+
+# fork: Inkling (the banded flash-attention bias ops)
+add_executable(test-flash-attn-bias test-flash-attn-bias.cpp)
+target_link_libraries(test-flash-attn-bias PRIVATE ggml)
+add_test(NAME test-flash-attn-bias COMMAND test-flash-attn-bias)
+
+add_executable(test-flash-attn-generic-hash test-flash-attn-generic-hash.cpp)
+target_link_libraries(test-flash-attn-generic-hash PRIVATE ggml)
+add_test(NAME test-flash-attn-generic-hash COMMAND test-flash-attn-generic-hash)
+
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # these tests use internal functions not exported with LLAMA_API (see the matching block in CMakeLists.txt)
+    llama_build_and_test(test-server-tokens.cpp)
+    target_include_directories(test-server-tokens PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-tokens PRIVATE server-context)
+    llama_build_and_test(test-slot-meta.cpp)
+    target_include_directories(test-slot-meta PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-slot-meta PRIVATE server-context)
+    llama_build_and_test(test-auto-hash.cpp)
+    target_include_directories(test-auto-hash PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-auto-hash PRIVATE server-context)
+
+    # Incremental delta compose (the disk KV cache's base + delta chain) after the same baseline as
+    # test-save-load-state, across all architectures, using the generated dummy models
+    llama_build(test-state-delta-compose.cpp)
+    llama_test(
+        test-state-delta-compose
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-state-delta-compose PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # Byte-level disk-cache chain checks: a whole root plus [p0, -1) range deltas composed with NO_CLEAR
+    # must give the same state blob (and bitwise-equal logits) as a whole restore, also into a context of
+    # another n_ctx and for a chain written at another n_ctx. One run per delta-capable memory class.
+    set(DELTA_BYTES_TMP "${CMAKE_CURRENT_BINARY_DIR}/test-delta-bytes-tmp")
+    set(DELTA_BYTES_CLASSES
+        llama-dense gemma3-dense qwen35-dense glm-dsa-moe deepseek32-moe hy_v4-moe
+        minimax-m3-moe dots3note-moe glm5-next-moe qwen4exp-moe)
+    foreach(model ${DELTA_BYTES_CLASSES})
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/${model}")
+        llama_test(test-delta-bytes NAME test-delta-bytes-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/${model}"
+                 --splits 130,200,300,401 --nctx-a 1024 --nctx-b 2048)
+        set_tests_properties(test-delta-bytes-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # Deferred capture (the background writer's stage 2): a unit whose positional K/V is copied later must be
+    # byte-identical to one captured at once, and every mutation of the captured cells must force the copy
+    # first (with a positive control that disables the hook). One run per memory class; the second field
+    # says whether the class has positional cells to defer (1) or copies everything at the capture (0).
+    llama_build(test-state-deferred.cpp)
+    set(STATE_DEFERRED_CLASSES
+        "llama-dense|1" "gemma3-dense|1" "mamba-dense|0" "qwen35-dense|1" "glm5-next-moe|1" "qwen4exp-moe|1"
+        "glm-dsa-moe|1" "deepseek32-moe|1" "hy_v4-moe|1" "minimax-m3-moe|1" "dots3note-moe|1" "deepseek4-moe|0")
+    foreach(case ${STATE_DEFERRED_CLASSES})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 expect)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-${model}")
+        llama_test(test-state-deferred NAME test-state-deferred-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-${model}" --expect-deferred ${expect})
+        set_tests_properties(test-state-deferred-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # k-pool memory classes: a sequence's output must not depend on another sequence sharing a unified cache
+    # (regression cases of the glm5next branch's k-pool fixes 625fbcbad and 525a329bb, as a behaviour test);
+    # llama-dense is the plain-attention control
+    llama_build(test-kpool-unified.cpp)
+    foreach(model glm5-next-moe qwen4exp-moe llama-dense)
+        llama_test(test-kpool-unified NAME test-kpool-unified-${model} LABEL main ARGS -m "${MODEL_DIR}/${model}.gguf")
+        set_tests_properties(test-kpool-unified-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # Restore mode 2 (LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL): only the side-state is loaded over the sequence's own
+    # positional cells. The second field says whether the memory class supports it (1) or must refuse it (0).
+    llama_build(test-state-skip-positional.cpp)
+    set(STATE_SKIP_CLASSES
+        "llama-dense|0" "gemma3-dense|0" "mamba-dense|1" "qwen35-dense|1" "glm5-next-moe|0" "qwen4exp-moe|0"
+        "glm-dsa-moe|0" "deepseek4-moe|0")
+    foreach(case ${STATE_SKIP_CLASSES})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 expect)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/skip-${model}")
+        llama_test(test-state-skip-positional NAME test-state-skip-positional-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/skip-${model}" --expect-supported ${expect})
+        set_tests_properties(test-state-skip-positional-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # The inner nodes of a composed chain (LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE): only the positional K/V is loaded and
+    # the side-state is read past, the tip's side-state being the one the slot keeps. Second field as above.
+    llama_build(test-state-skip-side.cpp)
+    set(STATE_SKIP_SIDE_CLASSES
+        "llama-dense|0" "gemma3-dense|0" "mamba-dense|0" "qwen35-dense|1" "glm5-next-moe|0" "qwen4exp-moe|0"
+        "deepseek4-moe|0")
+    foreach(case ${STATE_SKIP_SIDE_CLASSES})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 expect)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/skip-side-${model}")
+        llama_test(test-state-skip-side NAME test-state-skip-side-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/skip-side-${model}" --expect-supported ${expect})
+        set_tests_properties(test-state-skip-side-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # Not a test: device-to-host copy bandwidth into pageable versus pinned host memory (run by hand on a drained card)
+    llama_build(bench-d2h-pinned.cpp)
+    # A first decode right after a prompt-node-sized prefill (a ubatch padded past the pooled rows): the
+    # k-pool indexer's pad entries re-pool cells of the captured sequence, so that cache must not defer
+    foreach(model glm5-next-moe qwen4exp-moe)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-pad-${model}")
+        llama_test(test-state-deferred NAME test-state-deferred-pad-${model} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-pad-${model}" --expect-deferred 1
+                 --node 513 --lo 511 --more 5 --ubatch 512)
+        set_tests_properties(test-state-deferred-pad-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # YaRN: the K-shift graph's rope by 0 scales every key, so shifting ANY sequence changes captured cells
+    file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-yarn-llama-dense")
+    llama_test(test-state-deferred NAME test-state-deferred-yarn-llama-dense LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-yarn-llama-dense" --expect-deferred 1 --yarn)
+    set_tests_properties(test-state-deferred-yarn-llama-dense PROPERTIES FIXTURES_REQUIRED generate-models)
+    # DeepSeek-V4: chains long enough for HCA rows (ratio 128) to be written by deltas starting past row
+    # 0, at block-aligned and unaligned starts, across a rung where the HCA cache size itself changes,
+    # and with an MTP-style rollback whose drafts complete an HCA block
+    set(DELTA_BYTES_DSV4
+        "hca|--splits|100,256,300,700,1030,1500|--nctx-a|2048|--nctx-b|4096"
+        "hca-unaligned|--splits|127,128,129,383,384,385,1100|--nctx-a|2048|--nctx-b|1280|--ubatch|64"
+        "hca-rung|--splits|130,257,700|--nctx-a|1024|--nctx-b|40960"
+        "hca-rollback|--splits|300,638|--nctx-a|1024|--nctx-b|2048|--rs|3|--rollback|3")
+    foreach(case ${DELTA_BYTES_DSV4})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 case_name)
+        list(REMOVE_AT case_args 0)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deepseek4-${case_name}")
+        llama_test(test-delta-bytes NAME test-delta-bytes-deepseek4-${case_name} LABEL main
+            ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf" --tmp "${DELTA_BYTES_TMP}/deepseek4-${case_name}" ${case_args})
+        set_tests_properties(test-delta-bytes-deepseek4-${case_name} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+    # Fragmented and rollback compose paths: a chain composed while another sequence decodes between the
+    # nodes (and frees cells so nodes land in holes) is judged against a decode under the same
+    # interleaving; RS classes also compose a chain whose last node follows an MTP-style rollback.
+    set(DELTA_BYTES_FRAG
+        "llama-dense|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "llama-dense|holes|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37|--holes"
+        "gemma3-dense|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "qwen35-dense|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "qwen35-dense|holes|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37|--holes"
+        "glm-dsa-moe|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "glm5-next-moe|noise|--seqmax|2|--seq-a|0|--seq-b|1|--noise|37"
+        "qwen35-dense|rs|--rs|3|--rollback|2"
+        "glm5-next-moe|rs|--rs|3|--rollback|2"
+        "qwen4exp-moe|rs|--rs|3|--rollback|2")
+    foreach(case ${DELTA_BYTES_FRAG})
+        string(REPLACE "|" ";" case_args "${case}")
+        list(GET case_args 0 model)
+        list(GET case_args 1 case_name)
+        list(REMOVE_AT case_args 0 1)
+        file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/${model}-${case_name}")
+        llama_test(test-delta-bytes NAME test-delta-bytes-${model}-${case_name} LABEL main
+            ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/${model}-${case_name}"
+                 --splits 130,200,300,401 --nctx-a 1024 --nctx-b 2048 ${case_args})
+        set_tests_properties(test-delta-bytes-${model}-${case_name} PROPERTIES FIXTURES_REQUIRED generate-models)
+    endforeach()
+endif()

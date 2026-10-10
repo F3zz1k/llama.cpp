@@ -80,6 +80,8 @@ public:
     bool state_can_skip_side()       const override { return true; }
 
     void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags = 0) const override;
+    // the SKIP_POSITIONAL / SKIP_SIDE loads of state_read; false when flags asks for neither
+    bool state_read_skip(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     //
     // llama_memory_hybrid specific API

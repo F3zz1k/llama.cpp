@@ -166,13 +166,6 @@ void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id,
     kv_lid->state_write(io, seq_id, flags);
 }
 
-void llama_kv_cache_dsa::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
-    // both the MLA cache and the lightning-indexer key cache hold one append-only cell per position,
-    // so each takes the same [p0, p1) filter and a delta composes onto its base with NO_CLEAR
-    kv_mla->state_write_range(io, seq_id, p0, p1, flags);
-    kv_lid->state_write_range(io, seq_id, p0, p1, flags);
-}
-
 void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // the indexer top-k picks MLA cells BY INDEX, so the two caches must agree cell for cell. two
     // independent find_slot() calls agree only while both caches hold the same occupancy and head; adopt

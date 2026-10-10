@@ -194,38 +194,8 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
     mem_recr->state_write(io, seq_id, flags);
 }
 
-void llama_memory_hybrid::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        // the attention KV is append-only: write only the [p0, p1) delta
-        mem_attn->state_write_range(io, seq_id, p0, p1, flags);
-    }
-    // the recurrent state is a fixed-size fold of the whole prefix - always written whole
-    mem_recr->state_write(io, seq_id, flags);
-}
-
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (flags & LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL) {
-        // the attention part is positional: read past it and leave the sequence's own cells as they are
-        GGML_ASSERT(seq_id >= 0 && "skipping the positional state needs a single sequence");
-        GGML_ASSERT((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && "a partial state holds no positional part");
-        mem_attn->state_skip(io);
-        mem_recr->state_read(io, seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_SKIP_POSITIONAL);
-        return;
-    }
-
-    if (flags & LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE) {
-        // apply the attention part and read past the recurrent part: the sequence's recurrent state stays as it
-        // was until a later load without this flag (the last node of a chain) replaces it
-        GGML_ASSERT(seq_id >= 0 && "skipping the side-state needs a single sequence");
-        GGML_ASSERT((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && "a partial state holds only side-state");
-        const llama_state_seq_flags fa = flags & ~LLAMA_STATE_SEQ_FLAGS_SKIP_SIDE;
-        mem_attn->state_read(io, seq_id, fa);
-        try {
-            mem_recr->state_skip(io);
-        } catch (...) {
-            mem_attn->state_clear(seq_id);
-            throw;
-        }
+    if (state_read_skip(io, seq_id, flags)) { // fork: SKIP_POSITIONAL / SKIP_SIDE loads
         return;
     }
 
