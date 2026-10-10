@@ -58,6 +58,7 @@ class TensorNameMap:
             "embeddings.LayerNorm",       # bert
             "embeddings.norm",            # modern-bert
             "emb_ln",                     # nomic-bert
+            "model.embed_norm",           # fork: Inkling
             "transformer.norm",           # openelm
             "rwkv.blocks.0.pre_ln",       # rwkv
             "rwkv.blocks.0.pre_ln",       # rwkv6
@@ -65,7 +66,6 @@ class TensorNameMap:
             "model.layers.0.pre_norm",    # rwkv7
             "backbone.norm",              # wavtokenizer
             "model.embedding_norm",       # lfm2
-            "model.embed_norm",           # inkling
         ),
 
         # Position embeddings
@@ -84,12 +84,12 @@ class TensorNameMap:
             "word_embeddings_for_head",  # persimmon
             "lm_head.linear",            # phi2
             "output_layer",              # chatglm
+            "model.unembed",             # fork: Inkling
             "head",                      # rwkv
             "head.out",                  # wavtokenizer
             "model.lm_head",             # dflash
             "model.transformer.ff_out",  # llada
             "head.decoder",              # modern-bert
-            "model.unembed",             # inkling
         ),
         MODEL_TENSOR.DENSE_2_OUT: (
             "dense_2_out",  # embeddinggemma
@@ -2861,7 +2861,7 @@ class TensorNameMap:
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
-        MODEL_ARCH.INKLING: {
+        MODEL_ARCH.INKLING: {  # fork: Inkling
             MODEL_TENSOR.ATTN_NORM: (
                 "model.layers.{bid}.attn_norm",
             ),
