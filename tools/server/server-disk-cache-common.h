@@ -41,7 +41,7 @@ bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server
 // auto disk cache .meta sidecar (fingerprint + tokens + media identity records)
 //
 // The format layer of the automatic disk prompt/KV cache (--slot-save-auto; the
-// cache logic itself lives in server-context.cpp). It is defined here so the
+// cache logic itself lives in server-context-disk-cache.inc). It is defined here so the
 // parser (which reads untrusted on-disk bytes) links into a standalone
 // fuzz/unit test (tests/test-slot-meta.cpp).
 //

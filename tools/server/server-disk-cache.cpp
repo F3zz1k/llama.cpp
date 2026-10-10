@@ -805,10 +805,10 @@ void slot_save_enforce_limits(const std::string & dir,
 
 // The .meta sidecar format layer (model_fp, SLOT_META_* constants incl. the v3 delta-node
 // version, slot_meta_write/slot_meta_read) and the block chain hashing layer (auto_hash_mix/
-// auto_block_hashes: index keys and filenames, media-aware) live in server-common.{h,cpp} so the
-// parser of untrusted on-disk bytes and the hash algorithm link into standalone
-// unit tests (tests/test-slot-meta.cpp, tests/test-auto-hash.cpp). Everything
-// below is the cache logic proper and stays private to this translation unit.
+// auto_block_hashes: index keys and filenames, media-aware) live in server-disk-cache-common.{h,cpp}
+// so the parser of untrusted on-disk bytes and the hash algorithm link into standalone
+// unit tests (tests/test-slot-meta.cpp, tests/test-auto-hash.cpp). The cache logic
+// proper is server_context_impl's part in server-context-disk-cache.inc.
 // Block boundaries are the only resumable prefix lengths (vLLM-APC / SGLang-radix
 // granularity); we NEVER trust a hash alone (invariant 2): the caller byte-verifies
 // tokens before any restore.
