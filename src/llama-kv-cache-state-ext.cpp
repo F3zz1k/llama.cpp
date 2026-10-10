@@ -94,6 +94,13 @@ void llama_kv_cache::state_skip(llama_io_read_i & io) const {
         if (n_layer_ref != layers.size() || (bool) v_trans_ref != v_trans) {
             throw std::runtime_error("failed to skip kv cache state: layer count or V layout mismatch");
         }
+        uint32_t n_rot_k_ref;
+        uint32_t n_rot_v_ref;
+        io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
+        io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
+        if (n_rot_k_ref != n_rot_k || n_rot_v_ref != n_rot_v) {
+            throw std::runtime_error("failed to skip kv cache state: key or value rotation mismatch");
+        }
 
         for (const auto & layer : layers) {
             const auto * k = layer.k_stream[s];

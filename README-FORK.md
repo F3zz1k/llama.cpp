@@ -40,15 +40,13 @@ and misses, and the known limits.
 
 ## Upstream baseline
 
-`main-patched` currently carries upstream `master` at `836d57176`
-(2026-10-03), merged as `4310ec58c`. The previous baseline was `d7bd3bfca` (2026-08-28). That
-merge did not change the engine state-file format (`LLAMA_STATE_SEQ_VERSION` is still 3), but
-the same refresh changed how automatic cache units are named, so a store written by an earlier
-build should be purged at deploy (see the known limits in
-[`docs/disk-cache.md`](docs/disk-cache.md#known-limits)). The 2026-08-29 merge crossed the
-upstream state-file bump (`LLAMA_STATE_SEQ_VERSION` 2 -> 3); see
+`main-patched` currently carries upstream `master` at `1623d8ce` (2026-10-10). The previous
+baseline was `836d57176` (2026-10-03). **This merge crosses an upstream state-file bump
+(`LLAMA_STATE_SEQ_VERSION` 3 -> 4, upstream #28498, which writes the KV rotation after the layer
+count), so every unit in a disk store written by an earlier build is unreadable: purge the store at
+deploy.** Earlier bumps and what an operator has to do are in
 [`docs/kv-cache/README.md`](docs/kv-cache/README.md#engine-state-file-format-bin-and-upstream-version-bumps)
-for who that affects and what an operator has to do at deploy time.
+and the known limits in [`docs/disk-cache.md`](docs/disk-cache.md#known-limits).
 
 Everything else is stock llama.cpp: see the upstream [README.md](README.md) to build and
 run normally. This document only covers what the fork adds.
@@ -110,11 +108,45 @@ byte-identically — which is what normal multi-turn chat clients do. Same text 
 
 ---
 
+## Where the fork's code lives (read before an upstream merge)
+
+Upstream is absorbed with a **merge, never a rebase**. To keep those merges small, fork code lives in
+fork-owned files and upstream files carry only short hooks, each marked `// fork` (or `# fork`):
+
+| Area | Fork-owned files | Hooks left in upstream files |
+|---|---|---|
+| llama-server disk cache | `tools/server/server-disk-cache.{h,cpp}`, `server-disk-cache-common.{h,cpp}`, `server-context-disk-cache.inc` (members of `server_context_impl`, included once), `README-disk-cache.md` | one-line calls in `server-context.cpp`, `server-common.*`, `server-task.cpp`; `server_slot` inherits `server_slot_disk_cache` |
+| options and params | `common/arg-disk-cache.{h,cpp}`, `common/common-disk-cache.h`, `common/chat-preamble.{h,cpp}`, `common/fork-sources.cmake` | `common_params` inherits `common_params_disk_cache`; two calls in `arg.cpp` |
+| libllama state | `include/llama-fork.h`, `src/llama-context-state-ext.*`, `src/llama-kv-cache-state-ext.*`, `src/llama-memory-state-ext.cpp`, `src/llama-state-deferred.*`, `src/fork-sources.cmake` | one include in `llama.h`, short calls in the state readers |
+| mtmd media stubs | `tools/mtmd/mtmd-stub.h` | one include in `mtmd.h` |
+| tests | `tests/fork-tests.cmake`, the fork's own test files | one `include()` in `tests/CMakeLists.txt` |
+| Inkling, InstellaMoE | their model, parser and preprocessor files, `conversion/fork_modelopt.py` | list entries anchored next to an old upstream entry, never at a list tail |
+
+Rules that keep it that way:
+
+- Never add a fork line at the **tail of a list upstream appends to** (enum ends, name tables, the last
+  `case`, `sources.cmake`, test lists, the end of a struct). Anchor it next to an old upstream entry.
+- New fork logic goes into a fork-owned file with a one-line hook; a block of more than a few lines
+  inside an upstream function is a future conflict.
+- A struct upstream builds with a positional initialiser (`server_context_meta`,
+  `server_chat_params`) can only take fork fields at its end; keep them few.
+
+Textual conflicts are no longer the main risk; **silent semantic breaks are**. After each merge:
+
+1. Read upstream's diff of the state format (`git diff <old>..<new> -- src/llama-kv-cache*.cpp
+   src/llama-memory*.cpp include/llama.h`), and check `LLAMA_STATE_SEQ_VERSION`. The fork parses that
+   format itself (`state_skip`, positional capture, deferred copy); the 2026-10-10 merge needed
+   `state_skip` taught the new rotation fields, which only `test-state-skip-positional-*` caught.
+2. Check upstream API renames that fork files use but git cannot see (the 2026-10-10 merge: the chat
+   session refactor, #30210, moved parsing out of `task_params` and changed specialised template
+   handlers to return function pointers).
+3. Build CPU and SYCL, run `ctest` and `tools/server/tests/unit/test_slot_save*.py`, and compare with
+   the previous `main-patched` run.
+
 ## TODO / not done yet
 
-- **Code cleanup.** The auto-cache logic lives inline in the large `server-context.cpp`;
-  it should be extracted into its own translation unit. The internal index mutex is
-  currently uncontended (single-threaded) and only matters if saving is later threaded.
+- **Index mutex.** The internal index mutex is uncontended (single-threaded) and only matters if
+  saving is later threaded.
 - **A CI-sized M-RoPE vision fixture.** The pytest suite covers every cache code path with
   tinygemma3 (a normal-position vision model); M-RoPE models (Qwen-VL class) are validated
   on real hardware only. A tiny qwen2-vl GGUF would close that gap in CI.

@@ -1095,7 +1095,7 @@
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             if (slot_logits_read(*sidecar_path, nv, (uint32_t) token_count, slot.restored_logits)) {
                 slot.restored_logits_n = (int32_t) token_count;
-                SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) \u2014 regenerate fast-path armed\n", nv, token_count);
+                SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens), regenerate fast-path armed\n", nv, token_count);
             }
         }
     }
@@ -3919,8 +3919,8 @@
     // with the task still attached, just before release(); the save itself runs after release(), on the
     // idle slot, exactly like the idle flush. Off by default because a user who continues on the same
     // instance gains nothing from it: the idle flush and the reclaim save persist the conversation when
-    // that is useful, and they cover tool loops too. The tool variant parses the response once, and only
-    // when the request offered tools to call.
+    // that is useful, and they cover tool loops too. The tool variant parses the response once, with the
+    // request's chat session (a request that offered no tools parses to no tool calls).
     bool auto_save_after_response_wanted(const server_slot & slot) const {
         if (!auto_cache_enabled() || !slot.task || !slot.task->need_sampling()) {
             return false;
@@ -3928,12 +3928,14 @@
         if (params_base.slot_save_node_response) {
             return true;
         }
-        if (!params_base.slot_save_node_tool || !slot.task->params.chat_parser_params.parse_tool_calls ||
-            slot.task->params.chat_parser_params.format == COMMON_CHAT_FORMAT_CONTENT_ONLY) {
+        // the chat session owns parsing; a request without tools parses to no tool calls
+        if (!params_base.slot_save_node_tool || !slot.task->chat_session_node_tool.has_template() ||
+            slot.task->chat_session_node_tool.format() == COMMON_CHAT_FORMAT_CONTENT_ONLY) {
             return false;
         }
         try {
-            const common_chat_msg msg = common_chat_parse(slot.generated_text, false, slot.task->params.chat_parser_params);
+            common_chat_session session = slot.task->chat_session_node_tool;
+            const common_chat_msg msg = session.finish(slot.generated);
             return !msg.tool_calls.empty();
         } catch (const std::exception & e) {
             SLT_DBG(slot, "auto-save: could not parse the response for tool calls, %s\n", e.what());
@@ -4455,10 +4457,32 @@
     }
 
     // process_single_task(), SLOT_RESTORE: after upstream's load
-    void manual_restore_finish(server_slot * slot, const std::string & filepath) {
+    void manual_restore_finish(server_slot * slot, const std::string & filepath, bool has_saved_ckpts) {
+        // checkpoints the save appended to the file (load_slot_checkpoints) describe this state, so they
+        // survive restore_finish's clear, which is there to drop a previous task's checkpoints
+        std::list<common_prompt_checkpoint> saved;
+        if (has_saved_ckpts) {
+            saved = std::move(slot->prompt.checkpoints);
+        }
+
         // fork: restore flags, FULL/SWA checkpoints and the logits sidecar (see restore_finish)
         restore_finish(*slot, &filepath, slot->prompt.tokens.size());
         restore_swa_checkpoint(*slot);
+
+        if (saved.empty()) {
+            return;
+        }
+        // the checkpoint synthesised at the restored position follows the saved ones unless the saved
+        // list already reaches that position; the cap is the one load_slot_checkpoints applied
+        for (auto & cur : slot->prompt.checkpoints) {
+            if (cur.pos_max > saved.back().pos_max) {
+                saved.push_back(std::move(cur));
+            }
+        }
+        while (saved.size() > (size_t) std::max(params_base.n_ctx_checkpoints, 0)) {
+            saved.pop_front();
+        }
+        slot->prompt.checkpoints = std::move(saved);
     }
 
     // after the decode loop: the mid-prefill saves of slots resident at a node or checkpoint position

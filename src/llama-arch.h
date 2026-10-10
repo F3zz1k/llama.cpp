@@ -65,6 +65,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA4,
     LLM_ARCH_GEMMA4_ASSISTANT,
     LLM_ARCH_GEMMA_EMBEDDING,
+    LLM_ARCH_GEMMA_EMBEDDING2,
     LLM_ARCH_STARCODER2,
     LLM_ARCH_MAMBA,
     LLM_ARCH_MAMBA2,
@@ -167,6 +168,7 @@ enum llm_arch {
     LLM_ARCH_POCKETTTS,
     LLM_ARCH_MINIMAX_01,
     LLM_ARCH_HRM_TEXT,
+    LLM_ARCH_K2_HORIZON,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -285,6 +287,8 @@ enum llm_kv {
     LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
     LLM_KV_ATTENTION_SCALE,
     LLM_KV_ATTENTION_ROPE_PATTERN,
+    LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,
+    LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT,
 
     LLM_KV_ATTENTION_OUTPUT_SCALE,
     LLM_KV_ATTENTION_VALUE_SCALE,
@@ -414,6 +418,7 @@ enum llm_kv {
 
     LLM_KV_CLASSIFIER_OUTPUT_LABELS,
     LLM_KV_CLASSIFIER_POOLING_TYPE,
+    LLM_KV_CLASSIFIER_ACTIVATION,
 
     LLM_KV_DECISION_BLOCK_COUNT,
     LLM_KV_DECISION_ROUTING_BLOCK_COUNT,
@@ -766,6 +771,8 @@ enum llm_tensor {
     LLM_TENSOR_DFLASH_SELECTOR_PREV,
     LLM_TENSOR_DFLASH_SELECTOR_NEXT,
     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
+    LLM_TENSOR_ATTN_V_GATE,
+    LLM_TENSOR_ATTN_V_EXPS,
 };
 
 
@@ -850,3 +857,4 @@ bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
+bool llm_arch_supports_mixed_batch(const llm_arch & arch);
