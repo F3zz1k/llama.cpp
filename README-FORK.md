@@ -138,8 +138,10 @@ Textual conflicts are no longer the main risk; **silent semantic breaks are**. A
    format itself (`state_skip`, positional capture, deferred copy); the 2026-10-10 merge needed
    `state_skip` taught the new rotation fields, which only `test-state-skip-positional-*` caught.
 2. Check upstream API renames that fork files use but git cannot see (the 2026-10-10 merge: the chat
-   session refactor, #30210, moved parsing out of `task_params` and changed specialised template
-   handlers to return function pointers).
+   session refactor, #30210, moved parsing out of `task_params`, changed specialised template
+   handlers to return function pointers, and stopped reading `message_delimiters` on raw
+   `/completion` prompts, which silently removed the system node for them; only
+   `test_slot_save_resend` and `test_slot_save_prefill_ckpt` caught that).
 3. Build CPU and SYCL, run `ctest` and `tools/server/tests/unit/test_slot_save*.py`, and compare with
    the previous `main-patched` run.
 
