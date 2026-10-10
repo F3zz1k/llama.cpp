@@ -276,26 +276,6 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 
 }
 
-void llama_memory_hybrid_idx::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
-    if (!mem_idx) {
-        // no indexer section to lose, so the base class's attn-delta + whole-recurrent split is correct
-        llama_memory_hybrid::state_write_range(io, seq_id, p0, p1, flags);
-
-        return;
-    }
-
-    // [TAG_HYBRID_IDX_STATE] same section order as state_write: the attention delta and the whole
-    // recurrent state (llama_memory_hybrid::state_write_range), then the indexer section last. The
-    // indexer holds one key per attention cell, so it takes the same [p0, p1) filter. On restore the
-    // indexer delta adopts the layout the attention delta was just given ([TAG_HYBRID_IDX_SINFO]),
-    // which state_read_meta supports under NO_CLEAR, so base + deltas compose like a plain hybrid.
-    llama_memory_hybrid::state_write_range(io, seq_id, p0, p1, flags);
-
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_idx->state_write_range(io, seq_id, p0, p1, flags);
-    }
-}
-
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike

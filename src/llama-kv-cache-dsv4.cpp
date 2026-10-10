@@ -1635,16 +1635,6 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     state_write_impl(io, seq_id, -1, flags);
 }
 
-void llama_kv_cache_dsv4::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_state_seq_flags flags) const {
-    if (p1 >= 0 || seq_id < 0) {
-        // a bounded [p0, p1) range or a whole-context save cannot be expressed: write whole
-        state_write_impl(io, seq_id, -1, flags);
-        return;
-    }
-
-    state_write_impl(io, seq_id, std::max<llama_pos>(p0, 0), flags);
-}
-
 void llama_kv_cache_dsv4::state_write_impl(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     // p0 > 0: a delta of positions [p0, -1) (see state_write_range); p0 <= 0: the whole sequence
