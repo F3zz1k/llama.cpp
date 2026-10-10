@@ -21,6 +21,7 @@ add_library(${TARGET} STATIC
     server-decision.h
     server-context.cpp
     server-context.h
+    server-context-disk-cache.inc # fork: auto disk cache
     server-stream.cpp
     server-stream.h
     server-tools.cpp
