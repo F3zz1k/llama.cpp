@@ -102,6 +102,7 @@ endif()
 
 set(MTMD_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-stub.h # fork
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper.h
     )
 
