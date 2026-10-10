@@ -1,6 +1,8 @@
 // fork-only: the server-side helpers of the automatic disk KV cache, see server-disk-cache.h.
 
 #include "server-disk-cache.h"
+#include "server-context.h"
+#include "server-task.h"
 
 #include "gguf.h"
 
@@ -917,4 +919,42 @@ static bool slot_node_meta_probe(const std::string & state_filepath,
     std::vector<server_media_record> media;
     return slot_meta_read(state_filepath, /*cur_fp_mmproj=*/0, fp, toks, media,
                           &parent_id, &range_lo, &range_hi);
+}
+
+//
+// the cache's parts of upstream's HTTP handlers (server_routes)
+//
+
+// get_res_props(): the cache's capabilities and the projector fingerprint
+void server_props_disk_cache(const server_context_meta & meta, json & props) {
+    if (!meta.auto_cache_caps.is_null()) {
+        // the memory class as the auto disk cache sees it (docs/disk-cache.md, "Seeing hits and misses")
+        props["auto_cache"] = meta.auto_cache_caps;
+    }
+
+    if (meta.has_mtmd) {
+        // projector identity fingerprint (hex, matches the startup log line) so
+        // operators can tell which mmproj a KV snapshot store belongs to.
+        // note: this belongs here rather than in the get_props handler, so that it is also
+        //       captured into cached_props and keeps being reported while the server sleeps.
+        char fp_hex[17];
+        snprintf(fp_hex, sizeof(fp_hex), "%016" PRIx64, meta.fp_mmproj);
+        props["fp_mmproj"] = fp_hex;
+    }
+}
+
+// handle_completions_impl(): the system node's position for a single string prompt
+void server_task_preamble_end(server_task & task, const server_context_meta & meta, const llama_vocab * vocab,
+                              const json & data, const json & prompt, size_t n_inputs) {
+    // the system node's position, from the chat path's preamble end (characters of the
+    // rendered prompt); a /completion client with a string prompt may send it too. A media
+    // prompt takes the same path: tokens() compares against the cell tokens, where a media
+    // cell never equals a text token, so a preamble containing media simply gets no node.
+    if (meta.chat_params.preamble_cache && n_inputs == 1 && prompt.is_string()) {
+        const int32_t n_chars = json_value(data, "preamble_end_chars", -1);
+        if (n_chars > 0) {
+            task.params.preamble_end = meta.chat_params.preamble_cache->tokens(
+                vocab, prompt.get<std::string>(), n_chars, task.tokens.get_cell_tokens());
+        }
+    }
 }

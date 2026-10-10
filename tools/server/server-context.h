@@ -20,7 +20,6 @@ struct server_context_meta {
     std::set<std::string> model_tags;
     std::string model_path;
     bool has_mtmd;
-    uint64_t fp_mmproj; // gguf-header hash of the loaded mmproj file (0 when text-only)
     bool has_inp_image;
     bool has_inp_audio;
     bool has_inp_video;
@@ -54,8 +53,11 @@ struct server_context_meta {
     uint64_t model_size;
     std::string model_ftype;
 
+    // fork: auto disk cache. Last, with default initialisers, so that get_meta()'s positional initialiser does
+    // not name them: get_meta() sets them after it (server_context_impl::meta_fill).
+    uint64_t fp_mmproj = 0; // gguf-header hash of the loaded mmproj file (0 when text-only)
     // the auto disk cache's capabilities for this model's memory class (null when the cache is off)
-    json auto_cache_caps;
+    json auto_cache_caps = nullptr;
 };
 
 enum server_state {

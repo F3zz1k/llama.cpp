@@ -4100,3 +4100,1001 @@
             }
         }
     }
+
+    // ----- the cache's parts of upstream methods, each called from one place in the method named -----
+
+    // A new task whose prefix the background writer still holds (aw_pending_prefix) is held in STARTED until
+    // that unit is published, at most AW_PENDING_WAIT_MS, then proceeds to the disk lookup as usual. The wait
+    // never blocks the server thread: other slots keep prefilling and decoding meanwhile. Mirrors the
+    // restore's own gates, so a task that would not restore does not wait.
+    bool auto_pending_defer(server_slot & slot, const server_tokens & input_tokens) {
+        if (!aw.running || input_tokens.empty() || !slot.task->params.cache_prompt || !slot.task->need_sampling() ||
+                !are_lora_equal(slot.lora, params_base.lora_adapters)) {
+            return false;
+        }
+        const int32_t n_mem = (int32_t) slot.prompt.tokens.get_common_prefix(input_tokens);
+        const size_t  n     = aw_pending_prefix(input_tokens, n_mem);
+        const int64_t now   = ggml_time_us();
+        if (n > 0 && slot.aw_pending_t0_us < 0) {
+            slot.aw_pending_t0_us = now;
+            SLT_INF(slot, "auto-restore: %zu queued unit(s) prefix this request, waiting for the writer to publish them\n", n);
+        }
+        if (slot.aw_pending_t0_us < 0) {
+            return false;
+        }
+        const bool timed_out = now - slot.aw_pending_t0_us >= AW_PENDING_WAIT_MS * 1000;
+        if (n > 0 && !timed_out) {
+            return true;
+        }
+        SLT_INF(slot, "auto-restore: waited %.1f ms for the queued unit(s) that prefix this request%s\n",
+                (now - slot.aw_pending_t0_us) / 1000.0, timed_out && n > 0 ? " (timed out)" : "");
+        slot.aw_pending_t0_us = -1;
+        return false;
+    }
+
+    // load_model(): the projector fingerprint, false when it cannot be computed (the load fails)
+    bool mmproj_fingerprint_load(const std::string & mmproj_path) {
+        // projector identity fingerprint (header-only read, ~ms): guards media KV
+        // snapshots against projector swap/requant/dimension changes and is exposed
+        // in /props. Computed whenever an mmproj is loaded, NOT gated on the auto
+        // disk cache, precisely because /props reports it.
+        if (!mmproj_header_fingerprint(mmproj_path, fp_mmproj)) {
+            SRV_ERR("failed to fingerprint multimodal projector, '%s'\n", mmproj_path.c_str());
+            return false;
+        }
+        SRV_INF("multimodal projector fingerprint: %016" PRIx64 "\n", fp_mmproj);
+        return true;
+    }
+
+    // load_model(): what the memory type can do for a save or restore, next to n_swa
+    void memory_caps_init() {
+        // NOTE: --swa-full only enlarges the SWA cache; it does NOT disable masking.
+        // llama_kv_cache_iswa still constructs kv_swa with hparams.n_swa/swa_type, and
+        // llama_kv_cache::state_write masks on those members unconditionally, so saves stay
+        // WINDOWED even under --swa-full. Zeroing n_swa here would disarm the disk-cache SWA
+        // guards while the engine keeps writing windowed blobs, letting a restore claim a prefix
+        // over a hole (silent wrong attention). Keep the scheduling value for the batch planner,
+        // but keep a model-derived value for every save/restore soundness decision.
+        n_swa_mem  = llama_model_n_swa(model_tgt);   // what the ENGINE masks with, never 0 for an SWA model
+        side_only_supported = params_base.slot_restore_selective && llama_memory_can_skip_positional(llama_get_memory(ctx_tgt));
+        side_skip_supported = params_base.slot_restore_selective && llama_memory_can_skip_side(llama_get_memory(ctx_tgt));
+    }
+
+    // load_model(): the fingerprint, the startup scan of the store and the background writer
+    void auto_cache_on_load() {
+        // AUTO disk prompt/KV cache (invariant 1): compute the model fingerprint and build the
+        // longest-prefix index ONCE, header-only, but ONLY when the feature is enabled. When OFF
+        // this is a single boolean test and nothing else (no fingerprint, no scan, no allocation).
+        // The fingerprint alone is also needed whenever --slot-save-path is set: manual media
+        // snapshots persist it in their v2 .meta sidecar and manual restores verify against it.
+        if (auto_cache_enabled() || !params_base.slot_save_path.empty()) {
+            cur_fp = auto_compute_fingerprint();
+        }
+        if (auto_cache_enabled()) {
+            auto_index_scan();
+            SRV_INF("auto disk prompt cache enabled: indexed %zu prefix boundaries from %s (block=%d)\n",
+                    auto_idx.by_boundary.size(), params_base.slot_save_path.c_str(), params_base.slot_save_block);
+            aw_start();
+        }
+    }
+
+    // load_model(): the system node's preamble cache in chat_params
+    void preamble_cache_init() {
+        // the system node's template-generic position (server_preamble_cache), only when the node is on
+        if (auto_cache_enabled() && params_base.slot_save_node_system) {
+            chat_params.preamble_cache = std::make_shared<server_preamble_cache>();
+            chat_params.preamble_cache->min_tokens = std::max(params_base.slot_save_block, params_base.slot_save_context_min_tokens);
+        }
+    }
+
+    // get_available_slot(): save the conversation of the slot `ret` that `task` is about to take over
+    void reclaim_save(server_slot * ret, const server_task & task) {
+        // RECLAIM save (--slot-save-on-reclaim, default on): get_available_slot just picked `ret` for a
+        // task whose prompt shares too little with the slot's (or picked it by LRU), so `update_cache`
+        // says the slot's conversation is about to be overwritten. Persist it to disk first. This must
+        // NOT depend on cache_idle_slots: that path saves only the slots that stay idle AFTER the new
+        // task launched, so with --parallel 1 it never reaches the slot being taken over, and a
+        // conversation preempted within --slot-save-idle-seconds of its last request used to vanish
+        // from disk (it lived on only in --cache-ram). The two sites never save the same slot for the
+        // same task (this one saves `ret`, that one the others), and the callee's exact-length dedup
+        // absorbs any repeat. Reads `update_cache` BEFORE the `&& prompt_cache` narrowing so disk save
+        // works without --cache-ram. `ret` is idle, so this delays only the new task's first token by
+        // one save (a delta under --slot-save-incremental).
+        // Gate on "the new task does not extend the slot", NOT on `update_cache`: that flag is the
+        // RAM cache's own rule (f_keep < 0.5, or an LRU pick), and two conversations that share a
+        // long leading prefix (a common system prompt) keep f_keep >= 0.5 while the slot's own tail
+        // is still overwritten. Save whenever at least one block of the slot's tokens lies past the
+        // common prefix with the new task; a task that extends the slot (or diverges within the
+        // last block) loses nothing worth a write.
+        if (auto_cache_enabled() && params_base.slot_save_on_reclaim && !ret->prompt.tokens.empty()) {
+            const size_t n_lcp_reclaim = ret->prompt.tokens.get_common_prefix(task.tokens);
+            if (n_lcp_reclaim + (size_t) params_base.slot_save_block <= (size_t) ret->prompt.n_tokens()) {
+                auto_save_slot_if_useful(*ret, AUTO_SAVE_SITE_RECLAIM);
+            }
+        }
+    }
+
+    // launch_slot_with_task(), first: drop the logits captured for the previous prompt
+    void logits_capture_reset(server_slot & slot) {
+        // A new task is being assigned to this slot: its prompt may differ from whatever produced
+        // the slot's current `logits_last` (even at the same token count). Invalidate the capture so
+        // a SLOT_SAVE issued on the new prompt can never serialize a stale, mismatched distribution.
+        // The stamp is re-established only by a real decode of the new prompt (the capture point).
+        slot.logits_last.clear();
+        slot.logits_last_n_tokens = -1;
+    }
+
+    // launch_slot_with_task(): the system node's position, kept on the slot's prompt
+    void ctx_boundary_stash(server_slot & slot, const server_task & task) {
+        // stash the system-preamble boundary for the [0,B) shared-context node onto the persistent
+        // prompt, computed once here at task launch: the template-generic preamble end when the chat
+        // path measured one, else the first user message from the message delimiters (a /completion
+        // client's own message_delimiters). The save site also runs at idle-flush and shutdown, when
+        // the transient task may be gone, so it must never read the task for this: it reads
+        // slot.prompt.ctx_boundary instead. -1 (no boundary) makes the node a no-op.
+        slot.prompt.ctx_boundary = task.params.preamble_end >= 0
+            ? task.params.preamble_end
+            : task.params.message_spans.first_user_message_pos();
+    }
+
+    // process_single_task(), --cache-idle-slots: save an idle slot before the RAM cache takes it
+    void idle_slot_save(server_slot & slot) {
+        // Auto-save (write path): persist this idle slot's KV to disk before
+        // the in-memory cache drops it. Gated so the whole call frame is elided
+        // when the feature is OFF; the callee re-checks all correctness guards
+        // (fingerprint, need_sampling, LoRA, media identity, >=1 block).
+        if (auto_cache_enabled()) {
+            auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_CACHE_IDLE);
+        }
+    }
+
+    // process_single_task(), METRICS: the cache's counters
+    void metrics_result_fill(server_task_result_metrics * res) {
+        auto_metrics_fill(res->metrics);
+        if (const auto & pc = chat_params.preamble_cache) {
+            res->metrics.n_sysnode_probed        = pc->n_probed.load();
+            res->metrics.n_sysnode_probe_renders = pc->n_probe_renders.load();
+            res->metrics.n_sysnode_probe_failed  = pc->n_probe_failed.load();
+            res->metrics.n_sysnode_seam_mismatch = pc->n_seam_mismatch.load();
+            res->metrics.n_sysnode_probe_short   = pc->n_probe_short.load();
+        }
+    }
+
+    // process_single_task(), SLOT_SAVE: true when the name is refused (the error is sent)
+    bool manual_save_refused(const server_task & task, const std::string & filename) {
+        // fork: auto-* names belong to the disk cache. Its units are immutable once published
+        // and other instances sharing the directory may be reading one; overwriting it in place
+        // (and dropping its .meta) would also orphan its delta children. Restoring one by name
+        // stays allowed.
+        if (filename.rfind("auto-", 0) == 0) {
+            send_error(task, "filenames starting with 'auto-' are reserved for the disk cache", ERROR_TYPE_INVALID_REQUEST);
+            return true;
+        }
+        return false;
+    }
+
+    // process_single_task(), SLOT_SAVE: publish the temp file and its sidecars, false when the save failed
+    // (the error is sent)
+    bool manual_save_publish(const server_task & task, server_slot * slot, const std::string & filepath,
+                             const std::string & tmp, size_t nwrite) {
+        {
+            std::error_code ec;
+            std::filesystem::remove(slot_meta_sidecar_path(filepath), ec);
+            std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
+            std::filesystem::remove(slot_draft_sidecar_path(filepath), ec);
+            std::filesystem::remove(slot_fp_sidecar_path(filepath), ec);
+            std::filesystem::rename(tmp, filepath, ec);
+            if (ec) {
+                std::filesystem::remove(tmp, ec);
+                send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                return false;
+            }
+        }
+        // fork: the model / projector identity upstream's format does not carry (see
+        // slot_fp_sidecar_path). Best effort: without it the restore is unchecked, as upstream's.
+        if (!slot_fp_write(filepath, { cur_fp.fp_model, cur_fp.fp_mmproj_loaded, cur_fp.fp_mmproj })) {
+            SLT_WRN(*slot, "%s", "failed to write the fingerprint sidecar; a restore of this file is unchecked\n");
+        }
+
+        // fork: the regenerate logits sidecar (FULL, RS and NO classes), next to upstream's file and
+        // outside it, so the .bin stays upstream's format. Written only when the captured logits
+        // belong to exactly the state just saved (stamped with its token count), so a stale
+        // distribution can never be paired with this snapshot. Best effort: without it an exact
+        // resend after the restore re-prefills instead of emitting its first token at once.
+        if (logits_sidecar_manual()) {
+            const size_t n_tok = slot->prompt.tokens.size();
+            if (slot->logits_last_n_tokens == (int32_t) n_tok && !slot->logits_last.empty()) {
+                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                if (slot_logits_write(filepath, slot->logits_last, nv, (uint32_t) n_tok) == 0) {
+                    SLT_WRN(*slot, "%s", "failed to write logits sidecar; regenerate fast-path disabled for this snapshot\n");
+                }
+            } else {
+                SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, n_tokens=%zu); sidecar omitted\n",
+                        slot->logits_last_n_tokens, n_tok);
+            }
+        }
+
+        // enforce the bounded slot-save store (LRU by mtime). If this single
+        // snapshot exceeds the byte cap, reject the save instead of evicting everything.
+        // Eviction is opt-in: it runs ONLY when --slot-save-auto owns this directory as a
+        // server-managed cache. A plain manual --slot-save-path save never deletes files.
+        if (nwrite > 0 && auto_cache_enabled() &&
+            (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
+            bool oversized = false;
+            slot_save_enforce_limits(params_base.slot_save_path,
+                                     params_base.slot_save_max_count,
+                                     params_base.slot_save_max_bytes,
+                                     filepath, oversized);
+            if (oversized) {
+                send_error(task,
+                           "slot snapshot exceeds --slot-save-max-mb; save rejected",
+                           ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // process_single_task(), SLOT_RESTORE: a file with a .meta sidecar is restored here, true when it was (the
+    // result or the error is sent); otherwise the slot is prepared for upstream's restore below
+    bool manual_restore_meta(const server_task & task, server_slot * slot, int id_slot, const std::string & filename,
+                             const std::string & filepath, int64_t t_start) {
+        // fork: a file with a .meta sidecar is an auto-cache unit, or a manual media save
+        // written before this endpoint adopted upstream's format. Neither is upstream's
+        // format, so it keeps the fork path, which composes delta chains and rebuilds media
+        // from the sidecar. Every other file takes upstream's body below, unchanged.
+        std::error_code meta_ec;
+        aw_def_force_slot(id_slot, "forced"); // the restore replaces the slot's cells
+        if (std::filesystem::exists(slot_meta_sidecar_path(filepath), meta_ec) && !meta_ec) {
+            // shared store lock until the chain and its media sidecar are read (auto_store_lock)
+            auto_store_lock rd_lock(std::filesystem::path(filepath).parent_path().string(),
+                                    /*exclusive=*/false, auto_store_lock::RESTORE_TIMEOUT_MS);
+            if (!rd_lock.held()) {
+                send_error(task, "Unable to restore slot: the slot-save store is busy, retry",
+                           ERROR_TYPE_UNAVAILABLE);
+                return true;
+            }
+            // Compose the restore chain (U9 / decision 2). A whole unit (v1/v2 snapshot, parent 0)
+            // restores as a single clearing load. But the same directory may hold an auto-cache
+            // v3/v4 DELTA tip whose .bin
+            // carries only cells [parent_hi, N); pointing a manual restore at one MUST NOT be
+            // refused (decision 2). Read its node tail and, when it is a delta, walk parent
+            // links via the SHARED auto_build_restore_chain so base + deltas compose to the
+            // full cell set before loading: the identical path the auto restore uses, so a v4
+            // media delta tip restores correctly here too. A missing .meta / whole snapshot
+            // (parent 0) keeps the single-file chain; only a genuinely broken delta chain
+            // (a parent file gone or corrupt) errors, the same way a corrupt whole unit would.
+            std::vector<std::string> restore_chain = { filepath };
+            {
+                model_fp     tip_fp;
+                llama_tokens tip_toks;
+                std::vector<server_media_record> tip_media;
+                uint64_t tip_parent_id = 0;
+                uint32_t tip_range_lo  = 0;
+                uint32_t tip_range_hi  = 0;
+                if (slot_meta_read(filepath, cur_fp.fp_mmproj, tip_fp, tip_toks, tip_media,
+                                   &tip_parent_id, &tip_range_lo, &tip_range_hi) &&
+                    (tip_parent_id != 0 || tip_range_lo != 0)) {
+                    if (!auto_build_restore_chain(filepath, tip_toks, tip_parent_id, tip_range_lo,
+                                                  restore_chain)) {
+                        send_error(task, "Unable to restore slot: the delta snapshot's parent "
+                                         "chain is missing or inconsistent", ERROR_TYPE_INVALID_REQUEST);
+                        return true;
+                    }
+                }
+            }
+
+            // Shared restore body (also used by the transparent auto-restore path): loads the
+            // composed chain into seq slot->id, sets just_restored + restored_logits, rebuilds
+            // the FULL-model checkpoint. On a load failure the slot seq is cleared and we error.
+            size_t token_count = 0;
+            size_t nread = 0;
+            if (!do_slot_restore(*slot, restore_chain, &token_count, &nread)) {
+                send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                return true;
+            }
+
+            // media snapshots: rebuild the prompt's media chunks as stubs from the v2
+            // .meta sidecar: without them the restored NULL cells are untraversable.
+            // Any rehydration failure drops the loaded state entirely (a half-rehydrated
+            // slot must never survive to serve requests) and errors with the reason.
+            {
+                std::string err;
+                if (!manual_restore_rehydrate_media(*slot, filepath, err)) {
+                    auto_restore_drop(*slot);
+                    send_error(task, "cannot restore media snapshot: " + err, ERROR_TYPE_INVALID_REQUEST);
+                    return true;
+                }
+            }
+
+            restore_swa_checkpoint(*slot);
+
+            const int64_t t_end = ggml_time_us();
+            const double t_restore_ms = (t_end - t_start) / 1000.0;
+
+            auto res = std::make_unique<server_task_result_slot_save_load>();
+            res->id       = task.id;
+            res->id_slot  = id_slot;
+            res->filename = filename;
+            res->is_save  = false;
+            res->n_tokens = slot->prompt.tokens.size();
+            res->n_bytes  = nread;
+            res->t_ms     = t_restore_ms;
+            queue_results.send(std::move(res));
+            return true;
+        }
+
+        // fork: nothing in ctx_dft belongs to the state about to be loaded, and a failed load
+        // below must not leave the previous restore's flag and logits armed
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+        }
+        slot->just_restored = false;
+        slot->restored_logits.clear();
+        return false;
+    }
+
+    // process_single_task(), SLOT_RESTORE: refuse (throw) a file whose .fp sidecar names another model or projector
+    void manual_restore_check_fp(const std::string & filepath, const server_tokens & restored) {
+        // fork: the fingerprint sidecar, when the save wrote one (see slot_fp_sidecar_path).
+        // Text KV is projector-independent, so the projector is compared only for a media save.
+        {
+            slot_fp_record rec;
+            const int st = slot_fp_read(filepath, rec);
+            if (st < 0) {
+                throw std::runtime_error("unreadable fingerprint sidecar (.fp)");
+            }
+            if (st > 0 && rec.fp_model != cur_fp.fp_model) {
+                throw std::runtime_error("the file was saved by a different model");
+            }
+            if (st > 0 && restored.has_media() &&
+                (rec.fp_mmproj_loaded != cur_fp.fp_mmproj_loaded || rec.fp_mmproj != cur_fp.fp_mmproj)) {
+                throw std::runtime_error("the file holds media encoded by a different projector (--mmproj)");
+            }
+        }
+    }
+
+    // process_single_task(), SLOT_RESTORE: after upstream's load
+    void manual_restore_finish(server_slot * slot, const std::string & filepath) {
+        // fork: restore flags, FULL/SWA checkpoints and the logits sidecar (see restore_finish)
+        restore_finish(*slot, &filepath, slot->prompt.tokens.size());
+        restore_swa_checkpoint(*slot);
+    }
+
+    // after the decode loop: the mid-prefill saves of slots resident at a node or checkpoint position
+    void prefill_nodes_save() {
+        // ===== MID-PREFILL SHARED-CONTEXT BASE whole-save (Option A) =====================
+        // Runs AFTER the decode loop, so every batch chunk has been llama_decode'd and the KV
+        // cells for the tokens added in pre_decode() actually exist. A slot armed at B_ctx and now
+        // resident at EXACTLY [0, B_ctx) (clamped by the prefill loop, still SLOT_STATE_PROCESSING_
+        // PROMPT because B_ctx < N is a strict prefix) holds the true whole state at B_ctx: whole-
+        // save it ONCE, then disarm so the slot prefills [B_ctx, N) normally. post_decode() is NOT a
+        // viable hook: a still-prefilling slot has i_batch == -1 and is skipped by its
+        // is_inside_view() early-return. Cost when nothing is armed: one cheap slot scan.
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                continue;
+            }
+            if (slot.ctx_save_pos > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) {
+                auto_save_context_base(slot);
+                slot.ctx_save_pos = -1; // one-shot: neither re-clamp nor re-save this task
+            }
+            if (slot.prompt_save_pos > 0 && slot.prompt.n_tokens() == slot.prompt_save_pos) {
+                // the slot is resident at exactly [0, prompt_save_pos): the regular save persists that
+                // prefix (a delta on the deepest saved node under --slot-save-incremental)
+                auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_PROMPT_NODE);
+                slot.prompt_save_pos = -1;
+            }
+            // periodic prefill checkpoints: the same mechanism every --slot-save-prefill-interval tokens
+            while (slot.ckpt_save_idx < slot.ckpt_save_pos.size() &&
+                   slot.ckpt_save_pos[slot.ckpt_save_idx] <= slot.prompt.n_tokens()) {
+                if (slot.ckpt_save_pos[slot.ckpt_save_idx] == slot.prompt.n_tokens()) {
+                    SLT_INF(slot, "auto-save: prefill checkpoint at %d of %d prompt tokens\n",
+                            slot.prompt.n_tokens(), slot.task->n_tokens());
+                    auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_PREFILL_CKPT);
+                }
+                slot.ckpt_save_idx++;
+            }
+            if (aw.test_prefill_delay_ms > 0) {
+                // test hook (LLAMA_TEST_SLOT_SAVE_PREFILL_DELAY_MS): slow every prefill batch down so a test can
+                // interrupt a prefill between two checkpoints
+                std::this_thread::sleep_for(std::chrono::milliseconds(aw.test_prefill_delay_ms));
+            }
+        }
+        // ===== end MID-PREFILL BASE =====================================================
+    }
+
+    // pre_decode(), new prompt: a task with a shared prompt prefix is neither restored nor saved, say so
+    void shared_prefix_note(server_slot & slot) {
+        if (auto_cache_enabled() && slot.task->n_tokens_shared > 0) {
+            // a shared prompt prefix (decision tasks): the parent and its children neither
+            // restore nor save (need_sampling() is false for the parent), so say so
+            metrics.n_auto_skipped_shared++;
+            const int64_t now_ms = ggml_time_ms();
+            if (auto_shared_last_wrn_ms < 0 || now_ms - auto_shared_last_wrn_ms >= 60 * 1000) {
+                auto_shared_last_wrn_ms = now_ms;
+                SLT_WRN(slot, "auto disk cache: a task with a shared prompt prefix (%d tokens) is neither restored nor saved "
+                              "(skipped so far = %" PRIu64 "; this line is rate-limited to one per minute, see "
+                              "llamacpp:auto_cache_skipped_shared_total)\n",
+                        (int) slot.task->n_tokens_shared, metrics.n_auto_skipped_shared);
+            }
+        }
+    }
+
+    // pre_decode(), new prompt: restore a longer prefix of the request from disk, n_past recomputed
+    void auto_restore_lookup(server_slot & slot, const server_tokens & input_tokens, int & n_past) {
+        // ===== AUTO-RESTORE: cold/cross-process KV reuse from disk (opt-in) ==========
+        // If the in-memory match (n_past) is POOR and the disk index holds a snapshot
+        // whose persisted tokens are a verified, fingerprint-matching, longer prefix of
+        // this request, restore it INTO the slot and RECOMPUTE n_past so all downstream
+        // machinery runs unchanged, agnostic to HOW the tokens arrived. Media requests
+        // look up exactly like text ones: the chain hashes fold each chunk's identity
+        // record, and auto_restore_into_slot byte-verifies the cells PLUS every media
+        // record (id/shape/type) before any multi-GB load, falling back to a normal
+        // prefill on any mismatch/failure (invariants 2/3/4). (An earlier revision
+        // gated this block on !slot.prompt.tokens.has_media(), which tested the
+        // slot's STALE PREVIOUS prompt, not the request; no request property replaces
+        // it, media requests are simply first-class now.)
+        // Decision tasks (the only ones that set n_tokens_shared, on the group
+        // PARENT) never reach this block: need_sampling() is false for them, and
+        // auto-save excludes them as well, so they neither restore nor publish.
+        if (auto_cache_enabled()
+                && slot.task->need_sampling()        // generative only (not embed/rerank)
+                && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
+                && are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures global LoRA (invariant 3)
+            // Try candidates best-first (longest usable snapshot first). Each
+            // rejected candidate costs only a small .meta read + byte-compare; the
+            // multi-GB state loads only once a candidate passes its gates. This
+            // fall-through is what stops a longer superset snapshot (unusable by a
+            // FULL model, which needs a whole-prefix match) from shadowing a shorter
+            // usable one at the same boundary. Media requests look up first-class:
+            // auto_index_lookup folds each chunk's identity into the boundary hashes.
+            int n_restored = 0;
+            auto_not_prefix_skips = 0;
+            // the margin gate compares a disk unit against what the slot can really keep:
+            // a class that cannot rewind keeps only a strict extension of its cells, or an
+            // in-memory context checkpoint at or below the divergence, not the raw LCP
+            const int32_t n_usable = auto_usable_warm_reuse(slot, n_past, (int32_t) input_tokens.size());
+            if (n_usable < n_past) {
+                SLT_DBG(slot, "auto-restore: the slot matches %d tokens but can keep only %d of them\n",
+                        (int) n_past, n_usable);
+            }
+            for (const auto & cand : auto_index_lookup(input_tokens)) {
+                // auto_restore_into_slot may CLEAR the slot
+                // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
+                // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
+                // deleting the file mid-read). In that case the slot tokens are now
+                // empty. We therefore RECOMPUTE n_past UNCONDITIONALLY after any
+                // attempt, not only on success, so a cleared-but-failed restore
+                // falls back to n_past=0 (clean cold prefill) instead of carrying a
+                // stale n_keep_mem>0 into keep_first() on an empty token vector
+                // (which would GGML_ASSERT/abort). The recompute is harmless on the
+                // early-return-before-clear paths (margin/fp/verify rejects): those
+                // leave prompt.tokens untouched, so the LCP is identical to before.
+                const int restored = auto_restore_into_slot(slot, cand, input_tokens, n_usable, (int) n_past);
+                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                if (restored > 0) {
+                    n_restored = restored;
+                    break; // restored; stop trying shorter candidates
+                }
+            }
+            // hit / miss accounting (llamacpp:auto_cache_restore_*_total and the
+            // per-request timings.cache_disk_n). A MISS is a request that still had
+            // at least one whole block beyond its in-memory match and got nothing
+            // from disk: that includes genuinely new prompts no cache could hold,
+            // so read it next to auto_cache_evicted_total, not as a ratio alone.
+            // A restore is only a HIT once the prompt actually keeps it: it is counted
+            // where n_prompt_cached is final (auto_restore_account), because a later
+            // n_past clamp can still discard it (e.g. an RS exact resend re-prefills).
+            if (n_restored > 0) {
+                // account what the restore actually loaded, not the block-aligned claim:
+                // a plain-attention restore keeps the whole unit and the generic path trims
+                // it to the real LCP (n_past, recomputed above), every cell of which came
+                // from disk since the restore replaced the slot. auto_restore_account then
+                // clamps it to the final n_past.
+                slot.n_auto_restored_pending = std::max(n_restored, (int) n_past);
+            } else if ((int) input_tokens.size() >= n_usable + params_base.slot_save_block) {
+                metrics.n_auto_restore_miss++;
+                {
+                    // a unit of this model held more of the prefix under another identity
+                    std::string why;
+                    int32_t     cover = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(auto_idx.mtx);
+                        cover = auto_foreign_cover_locked(input_tokens, why);
+                    }
+                    if (cover >= n_usable + params_base.slot_save_block) {
+                        metrics.n_auto_restore_miss_identity++;
+                        SLT_WRN(slot, "auto-restore: miss, a unit of this model covers %d tokens of the prefix but was written under another identity (%s); it is never restored here\n",
+                                cover, why.c_str());
+                    }
+                }
+                if (auto_not_prefix_skips > 0) {
+                    // a snapshot of this prefix exists, but the request diverges inside it
+                    // and this class cannot rewind (FULL, RS, NO, or SWA past one window):
+                    // only a node at or before the divergence could have served it
+                    metrics.n_auto_restore_not_prefix++;
+                    SLT_WRN(slot, "auto-restore: miss, %zu snapshot(s) share this prefix but the request diverges inside them and this memory class cannot rewind (seq_rm_type = %d, n_swa = %d); a node at or before the divergence is needed\n",
+                            auto_not_prefix_skips, (int) ctx_tgt_seq_rm_type, n_swa_mem);
+                }
+            }
+        }
+        // ===== end AUTO-RESTORE =====================================================
+    }
+
+    // pre_decode(), new prompt: true when the first token was emitted from the restored logits (the slot needs
+    // no prompt batch); may instead clear the restored state, n_past and pos_next with it
+    bool restore_continue(server_slot & slot, int & n_past, llama_pos & pos_next) {
+        // ===== restore-continue (regenerate fast-path) ==============================
+        // A just-restored FULL/recurrent slot receiving the EXACT restored tokens (no
+        // suffix) cannot rewind its memory: the normal path would re-decode into the
+        // already-occupied sequence and crash (the pure-recurrent gate at the relaxed
+        // checkpoint predicate below is FALSE for this case, so just_restored would never
+        // be consumed and [TAG_PROMPT_LOGITS] would decrement n_past and re-decode into
+        // the occupied sequence). Detect that case here, BEFORE the n_past>0 guard, and:
+        //   - if we have the saved next-token logits: emit the first token with NO decode,
+        //     keeping the full restored state, then continue normal autoregression;
+        //   - otherwise: fall back to a SAFE clear-then-reprefill (never crash).
+        // Gated so it is unreachable for non-recurrent models, with-suffix requests
+        // and non-generative slots. Media prompts DO reach it: the auto path never
+        // had a server-wide mtmd gate (and the manual /slots endpoints save media
+        // slots in upstream's format), so a byte-identical media resend on a FULL-seq_rm model
+        // restores its whole snapshot and lands exactly here.
+        // The body is media-safe by construction:
+        // init_sampler skips LLAMA_TOKEN_NULL cells, and the speculative begin feeds
+        // get_text_tokens() (the media-safe accessor), never get_tokens(). With-suffix
+        // restore reuse is left entirely to the unchanged relaxed-predicate path below.
+        // NOTE: cache_prompt==false sets n_past=0 above, so this gate (which
+        // requires n_past == task->n_tokens()) is naturally not entered for a
+        // no-cache request; that case safely takes the normal full-clear +
+        // reprefill path (common_context_seq_rm at [p0,-1) empties the restored
+        // sequence first), so regenerate degrades to a cold reprefill, never a crash.
+        // No `n_past < n_ctx` clause: the fast path emits with NO decode so it
+        // needs no free context slot; a full-n_ctx no-suffix restore is handled
+        // here rather than falling through to a zero-token-added crash window.
+        // Every class has a logits sidecar now, but a class that can rewind by one token
+        // enters only with logits for exactly n_past tokens: a unit rewound to a shorter
+        // request carries the logits of its own end, and without usable logits such a
+        // class re-decodes one token below instead of re-prefilling everything.
+        const bool restored_logits_ok = !slot.restored_logits.empty() && slot.restored_logits_n == n_past;
+        const bool cannot_rewind_one  = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+                                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        if (slot.just_restored &&
+            (restored_logits_ok || cannot_rewind_one) &&
+            slot.task->need_sampling() &&
+            slot.alora_invocation_start <= 0 &&
+            n_past == slot.task->n_tokens() &&
+            n_past == (int) slot.prompt.n_tokens()) {
+
+            slot.just_restored = false; // one-shot consume (this path owns it)
+
+            if (restored_logits_ok) {
+                // --- fast path: emit first token from saved logits, no decode ---
+                slot.stats.n_prompt_cached    = n_past; // entire prompt "reused"
+                slot.stats.n_prompt_processed = 0;      // prompt_n = 0 => observable reuse signal
+                auto_restore_account(slot, n_past);
+
+                // prime the sampler over the full restored prompt (penalties/grammar
+                // history), exactly as the normal DONE_PROMPT transition (init_sampler) would.
+                slot.stats.n_gen = 0;
+                slot.init_sampler();
+
+                slot.state   = SLOT_STATE_GENERATING;
+                slot.i_batch = -1;
+
+                // rebuild the (cold, unsaved) draft context for the restored prompt,
+                // mirroring the normal prompt-done transition.
+                if (slot.can_speculate()) {
+                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                }
+
+                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                const std::vector<float> saved_logits = std::move(slot.restored_logits);
+                slot.restored_logits.clear(); // consumed
+                const llama_token id = common_sampler_sample_from_logits(
+                        slot.smpl.get(), saved_logits.data(), nv, /*grammar_first=*/false);
+
+                common_sampler_accept(slot.smpl.get(), id, true);
+
+                // mirror the generation accounting from the normal sample path
+                // (upstream: stats.n_gen, then update_prompt_last() on the first
+                // token, then update_gen_last()). No prompt metrics are queued:
+                // this path processes zero prompt tokens by construction.
+                const int64_t t_current = ggml_time_us();
+                slot.stats.n_gen += 1;
+                if (slot.stats.n_gen == 1) {
+                    slot.stats.update_prompt_last();
+                    slot.t_print_last = t_current;
+                    slot.n_gen_last   = 0;
+                }
+                slot.stats.update_gen_last();
+
+                if (slot.task->params.stream) {
+                    // mirror the normal prompt-start streaming signal exactly so a
+                    // return_progress client still gets its initial 0% progress event
+                    if (slot.task->params.return_progress) {
+                        send_partial_response(slot, {}, true);
+                    } else {
+                        // signal HTTP to send the headers (200 status)
+                        send_partial_response(slot, {}, false, true);
+                    }
+                }
+
+                completion_token_output result;
+                result.tok  = id;
+                // inline of the accept_special_token lambda (defined later in this method,
+                // out of scope here): keep special tokens iff the server allows specials
+                // or the request explicitly preserves this token.
+                const bool keep_special =
+                    params_base.special ||
+                    slot.task->params.sampling.preserved_tokens.find(result.tok) !=
+                        slot.task->params.sampling.preserved_tokens.end();
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, keep_special);
+                result.prob         = 1.0f;
+
+                // First-token logprobs (n_probs>0): the post-sampling variant reads the
+                // candidate set (cur_p), which common_sampler_sample_from_logits leaves
+                // populated, so we can serve it exactly as the normal path does. The
+                // pre-sampling variant is computed from the saved logits themselves (the
+                // context holds no row for a decode this path never ran).
+                if (slot.task->params.sampling.n_probs > 0) {
+                    const bool post = slot.task->params.post_sampling_probs;
+                    populate_token_probs(slot, result, post, params_base.special, /*idx=*/-1,
+                                         post ? nullptr : saved_logits.data());
+                }
+
+                if (!process_token(result, slot)) {
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics_on_prediction(slot);
+                    slot.release();
+                }
+
+                SLT_INF(slot, "%s", "restore-continue: emitted first token from saved logits (prompt_n=0)\n");
+                return true; // skip the rest of prompt-batch building for this slot; iterate() proceeds to the next
+            }
+
+            // --- safe fallback: no valid sidecar -> clear restored seq, then reprefill ---
+            // FULL models support full-sequence removal; clearing first guarantees the
+            // subsequent reprefill writes into an EMPTY sequence instead of re-decoding
+            // into the already-occupied restored state (which is the crash being fixed).
+            SLT_WRN(slot, "%s", "restore-continue: no saved logits; clearing restored state and re-prefilling\n");
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+            slot.prompt.tokens.clear();
+            slot.prompt.checkpoints.clear();
+            n_past   = 0;
+            pos_next = 0; // mirror the do_reset path; keep the stale full-length value from leaking into the checkpoint-erase loop below
+            // fall through to the normal guard below with an empty sequence (safe)
+        }
+        // ===== end restore-continue =================================================
+        return false;
+    }
+
+    // pre_decode(), new prompt: consumes the slot's restore flag; true when a restored window memory is strictly
+    // extended and the checkpoint search must be skipped
+    bool restored_extend_only_get(server_slot & slot, bool has_new_tokens, bool pos_min_is_tail, int n_past) {
+        // Consume just_restored UNCONDITIONALLY, before the gate: the tail-aware threshold
+        // makes the gate false for the restore-plus-suffix case, so a consume inside the
+        // gate would leave the flag set. It is also cleared in server_slot::reset(), which
+        // bounds an unconsumed flag to the task that owns it: this consume sits inside the
+        // `n_past > 0 && n_past <= prompt.n_tokens()` block, which a fully divergent or
+        // cache_prompt == false task never enters.
+        const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
+
+        // A just-restored WINDOW memory (PART, in practice SWA) that is being
+        // strictly EXTENDED needs no rewind at all, so skip the search below
+        // entirely. Every position the model can attend to from n_past is
+        // present: llama_kv_cache::state_write persists exactly the unmasked
+        // window [n_past - n_swa, n_past). This is NOT the same cell set a live
+        // slot holds, and the difference is the whole reason the gate misfires
+        // here: find_slot only marks an SWA-masked cell REUSABLE, it does not
+        // erase it, and the SWA sub-cache is sized PAD(min(size_base, n_swa *
+        // (unified ? n_seq_max : 1) + n_ubatch), 256): normally > n_swa, though
+        // NOT when size_base < n_swa (a tiny --ctx-size), where the min clamps it.
+        // In the normal case a live slot still physically holds older positions
+        // and reports a pos_min strictly BELOW pos_min_thold, which keeps the gate
+        // shut for it. A restored slot reports pos_min == n_past - n_swa ==
+        // pos_min_thold, so the gate opens.
+        // The search can only do harm here: the ONLY checkpoint such a slot has is the one
+        // synthesised from the LIVE window after the restore (do_slot_restore
+        // clears the list for every class, then auto_restore_into_slot and the
+        // manual SWA branch each create one, or NONE under --ctx-checkpoints 0,
+        // where create_checkpoint now returns early), whose pos_min IS the window
+        // start L - n_swa, the same expression as pos_min_thold when
+        // has_new_tokens. The acceptance test is
+        // `cur.pos_min == 0 || cur.pos_min < pos_min_thold`, and the second
+        // disjunct is then false, so do_reset fires and the SWA disk restore is
+        // loaded and thrown away. NOT universal, and the first disjunct is why:
+        // when L <= n_swa_mem nothing was masked at save time, pos_min == 0, and
+        // the checkpoint IS accepted (losing one position rather than everything).
+        // That regime is narrow: the save floor is
+        // max(slot_save_block, slot_save_min_tokens), so on gemma-26b-a4b
+        // (n_swa 1024, floor 1024) it needs L == 1024 exactly, and it widens only
+        // for n_swa > 1024 or a lowered --slot-save-min-tokens. The measured
+        // production case (13,611 tokens, n_swa 1024) is the regime above.
+        // The four terms, exactly: (1) the slot carries a restore no earlier task
+        // consumed, i.e. an auto-restore performed for THIS task or a manual
+        // /slots restore with no task since (server_slot::reset() clears the flag,
+        // which bounds it to one task); (2) the
+        // request strictly extends it, so no rewind is needed; (3) pos_min is a
+        // real window start, NOT a tail, so FULL and RS keep the unchanged path,
+        // because for them the search is what keeps the NOTE's GGML_ABORT
+        // unreachable; (4) the restored KV ends exactly at n_past, so nothing
+        // above it needs removing (a diverging manual /slots restore has
+        // n_past < prompt.n_tokens() and still takes the search).
+        // Inert for PART with n_swa == 0 (no checkpoints are ever created for it,
+        // and pos_min == 0 keeps the gate closed) and under --swa-full (n_swa == 0
+        // makes pos_min_thold == pos_next, gate closed).
+        // KNOWN GAP, deliberately not covered: the SWA EXACT-resend case
+        // (has_new_tokens false) keeps today's behaviour, checkpoint rejected by
+        // one position, cold reprefill. Covering it would need either an
+        // off-by-one relaxation of the acceptance test or widening this skip to a
+        // path a warm slot does not take, which is the class of change that
+        // produced this file's incident history. Extension is the case with
+        // production evidence.
+        const bool restored_extend_only = slot_was_restored && has_new_tokens &&
+                                          !pos_min_is_tail &&
+                                          n_past == slot.prompt.n_tokens();
+        return restored_extend_only;
+    }
+
+    // pre_decode(), new prompt: arm the system node, the prompt node and the periodic prefill checkpoints
+    void prefill_nodes_arm(server_slot & slot, const server_tokens & input_tokens, int n_past,
+                           bool restored_now, int32_t n_resident, int32_t restored_unit) {
+        // ===== ARM the mid-prefill shared-context base save (Option A) ==============
+        // Reset here first (STARTED runs exactly once per task) so a target left over
+        // from a released/aborted task never leaks into slot reuse. Then arm iff this is
+        // a COLD prefill of a text-only generative request that has a block-aligned
+        // first-user boundary B_ctx clearing the floor and strictly inside the prompt.
+        // The prefill loop clamps the batch at B_ctx; the post-decode hook whole-saves
+        // [0, B_ctx) when the slot is resident at exactly B_ctx. Because the resident
+        // sequence IS the true whole state at B_ctx, the whole-save is sound for dense,
+        // SWA AND recurrent/hybrid: there is NO model-class gate (unlike the old
+        // idle-flush [0,B) sub-range checkpoint this replaces).
+        slot.ctx_save_pos    = -1;
+        slot.prompt_save_pos = -1;
+        slot.ckpt_save_pos.clear();
+        slot.ckpt_save_idx   = 0;
+        slot.ckpt_prev_whole.clear();
+        const bool cold_prefill_was_open = slot.cold_prefill_open;
+        slot.cold_prefill_open = false;
+        if (auto_cache_enabled() &&
+            slot.task->need_sampling() &&               // generative only (not embed/rerank; keeps the can_split path)
+            slot.alora_invocation_start <= 0 &&         // aLoRA caching bound (mirror the auto-restore gate)
+            are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures the global LoRA set (invariant 3)
+            const int     B        = params_base.slot_save_block;
+            const int32_t n_prompt = slot.task->n_tokens();
+            const auto &  spans    = slot.task->params.message_spans;
+
+            // A mid-prefill cut must not split a media chunk, and the prefill loop can only
+            // stop right after a TEXT token (it clamps after pushing one; a chunk is
+            // processed whole). So a node sits where the previous cell is text: a text
+            // position, or the start of a chunk. A candidate inside or right after a chunk
+            // moves down to that chunk's start. A no-op for a text-only prompt.
+            const auto cut_down = [&](int32_t p) -> int32_t {
+                while (p > 0 && input_tokens[p - 1] == LLAMA_TOKEN_NULL) {
+                    p--;
+                }
+                return p;
+            };
+
+            // --- SYSTEM node (--slot-save-node-system, default on) ---
+            // Position: the end of the leading system preamble, exactly (nodes need not be
+            // block-aligned). For a chat request it is template-generic: the prefix of the
+            // prompt that the system / developer messages, the tools and the template decide on
+            // their own (server_preamble_cache), so a request carrying only a system prompt (a
+            // pre-cache of it) caches all of it, and a template's default system prompt counts
+            // too. Without one (a raw /completion prompt), the message delimiters: the first
+            // user message, or the end of the system span when there is no user message.
+            // Capped at n_prompt - 1: the node must be a strict prefix to be cut mid-prefill.
+            // Floor: --slot-save-context-min-tokens. COLD only, and only when at least one block
+            // of [0, B_ctx) is new: a node a few tokens past one just restored (a system-only
+            // pre-cache followed by system + user requests) would be a near-duplicate root.
+            if (params_base.slot_save_node_system) {
+                const int     floor    = std::max(B, params_base.slot_save_context_min_tokens);
+                int32_t       B_ctx    = slot.prompt.ctx_boundary; // stashed at task launch
+                if (B_ctx <= 0) {
+                    B_ctx = spans.system_only_context_end();
+                }
+                B_ctx = B_ctx > 0 ? std::min(B_ctx, n_prompt - 1) : -1;
+                const auto    ok    = [&](int32_t x) { return x >= floor && x < n_prompt && n_past + B <= x; };
+                const int32_t B_cut = B_ctx > 0 ? cut_down(B_ctx) : -1;
+                if (ok(B_cut)) {
+                    slot.ctx_save_pos = B_cut;
+                } else if (B_cut != B_ctx && ok(B_ctx)) {
+                    metrics.n_auto_node_media_skipped++; // only the media cut stopped it
+                }
+            }
+
+            // --- PROMPT node (--slot-save-node-prompt, default cold) ---
+            // Position: the end of the last user message, exactly, like the system node
+            // (n_prompt - 1 block-aligned down without a user span). A unit saved after the
+            // response (idle, reclaim, shutdown, --slot-save-node-response) is prompt +
+            // generation, and a memory class that cannot rewind (recurrent, hybrid, FULL,
+            // sliding-window past one window) can restore it only for a request that extends
+            // it. A resend, a regenerate, an edit of the response or a follow-up whose
+            // history is not re-rendered token for token diverges inside it; this node sits
+            // before that divergence. 'cold' arms it only for a prompt that got essentially
+            // no reuse (n_past < the save floor), so at most once per conversation start. 'on'
+            // arms it whenever at least one block of new prompt precedes it: that is the
+            // setting for a client that re-renders the previous response differently on
+            // every turn (reasoning dropped or trimmed, answers rewritten, tool calls
+            // re-serialised), whose after-response units can never serve the next turn on
+            // these classes, and for regenerate or edit after a restart. The mid-prefill save
+            // is the true whole state at that position, so it is sound for every memory class.
+            // Floor: max(--slot-save-block, --slot-save-min-tokens), as for any other save.
+            // When the system node is armed, the prompt node must lie at least one block past
+            // it: anything closer is a prefix that the system node already covers for every
+            // request that could reuse it, and would only cost a second save on a cold first
+            // prompt with a short first message.
+            // A prefill that resumes an interrupted one counts as cold too (--slot-save-prefill-interval
+            // only, so the default behaviour is unchanged): the prompt that was cut short never reached
+            // its prompt node. Recognised by (a) this slot still holding all of an unfinished cold
+            // prefill, (b) a disk restore of a whole unit (not trimmed) whose length is a multiple of the
+            // interval, which is what a periodic checkpoint is (any other unit ends there only by
+            // coincidence, about once in N/block system nodes, at the cost of one extra node), or
+            // (c) a reuse that already reaches into the last user message, which only a checkpoint
+            // inside it (or a warm slot that prefilled part of it) can give. A warm or RAM reuse that
+            // happens to end on a multiple of N is not a resume.
+            const int32_t interval = params_base.slot_save_prefill_interval;
+            const int32_t user_pos = spans.last_user_message_pos();
+            const bool    resumed  = interval > 0 && n_past > 0 && (
+                    (cold_prefill_was_open && !restored_now && n_past == n_resident) ||
+                    (restored_now && restored_unit == n_past && n_past % interval == 0) ||
+                    (user_pos > 0 && n_past > user_pos));
+            const bool    is_cold  = n_past < std::max(B, params_base.slot_save_min_tokens) || resumed;
+            if (params_base.slot_save_node_prompt != COMMON_SLOT_SAVE_NODE_PROMPT_OFF) {
+                const int     floor    = std::max(B, params_base.slot_save_min_tokens);
+                const int32_t user_end = spans.last_user_message_end();
+                const int32_t e        = std::min(user_end > 0 ? user_end : n_prompt - 1, n_prompt - 1);
+                // exact at the end of the user message (the history re-renders everything after it,
+                // the generation prompt included, so nothing past it is safe); without a user span,
+                // block-aligned down from n_prompt - 1 so that it still lies before most generation
+                // prompts
+                const int32_t B_al     = e <= 0 ? -1 : (user_end > 0 ? e : e - (e % B));
+                const int32_t B_p      = B_al > 0 ? cut_down(B_al) : -1;
+                const auto    ok       = [&](int32_t x) {
+                    const bool want = params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_ON
+                                      ? n_past + B <= x
+                                      : is_cold;
+                    const bool past_sys = slot.ctx_save_pos <= 0 || x >= slot.ctx_save_pos + B;
+                    return want && past_sys && x >= floor && x < n_prompt && n_past < x;
+                };
+                if (ok(B_p)) {
+                    slot.prompt_save_pos = B_p;
+                } else if (B_p != B_al && ok(B_al)) {
+                    metrics.n_auto_node_media_skipped++; // only the media cut stopped it
+                }
+            }
+
+            // --- PERIODIC PREFILL CHECKPOINTS (--slot-save-prefill-interval, default off) ---
+            // Every multiple of the interval strictly between the reuse and the end of the prompt,
+            // at or above the save floor. Like the nodes above, a checkpoint is the true whole state
+            // at its position, so it is sound for every memory class, and it is cut where the
+            // previous cell is text (a position inside or right after a media chunk moves down to
+            // the chunk's start; one that then falls at or below the reuse or the previous
+            // checkpoint is dropped). A position the system or the prompt node already takes is not
+            // armed twice.
+            if (interval > 0) {
+                const int32_t floor = std::max(B, params_base.slot_save_min_tokens);
+                int32_t       prev  = n_past;
+                for (int64_t p = ((int64_t) n_past / interval + 1) * interval; p < n_prompt; p += interval) {
+                    const int32_t c = cut_down((int32_t) p);
+                    if (c < floor || c <= prev || c == slot.ctx_save_pos || c == slot.prompt_save_pos) {
+                        if (c != (int32_t) p && p >= floor) {
+                            metrics.n_auto_node_media_skipped++;
+                        }
+                        continue;
+                    }
+                    slot.ckpt_save_pos.push_back(c);
+                    prev = c;
+                }
+                if (params_base.slot_save_node_prompt == COMMON_SLOT_SAVE_NODE_PROMPT_COLD && is_cold) {
+                    slot.cold_prefill_open = true; // cleared when the prompt is done
+                }
+                if (!slot.ckpt_save_pos.empty()) {
+                    SLT_INF(slot, "auto-save: %zu prefill checkpoint(s) armed every %d tokens, first at %d (reuse %d of %d)%s\n",
+                            slot.ckpt_save_pos.size(), interval, slot.ckpt_save_pos.front(), n_past, n_prompt,
+                            resumed ? ", resuming an interrupted prefill" : "");
+                }
+            }
+        }
+        // ===== end ARM =============================================================
+    }
+
+    // pre_decode(), prompt batch: true when the batch must stop here, at a node or checkpoint position
+    bool prefill_nodes_stop(const server_slot & slot) {
+        // mid-prefill shared-context base (Option A): stop this batch EXACTLY at the
+        // block-aligned first-user boundary B_ctx, never crossing it, so that once this
+        // batch is decoded the slot's resident sequence is precisely [0, B_ctx): the
+        // true whole state there for the post-decode whole-save. One-shot: the hook
+        // disarms ctx_save_pos, after which the slot prefills [B_ctx, N) unclamped. If
+        // B_ctx exceeds n_batch the loop's own batch.size() < n_batch cap stops it first
+        // and a later update_slots() iteration re-enters here to reach B_ctx.
+        if ((slot.ctx_save_pos    > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) ||
+            (slot.prompt_save_pos > 0 && slot.prompt.n_tokens() == slot.prompt_save_pos)) {
+            return true;
+        }
+        // the same for the periodic prefill checkpoints (empty unless --slot-save-prefill-interval)
+        if (slot.ckpt_save_idx < slot.ckpt_save_pos.size() &&
+            slot.prompt.n_tokens() == slot.ckpt_save_pos[slot.ckpt_save_idx]) {
+            return true;
+        }
+        return false;
+    }
+
+    // pre_decode(), after the prompt batch: tasks waiting for a queued prefix to be published
+    void aw_pending_wait(int n_aw_deferred) {
+        if (n_aw_deferred > 0 && !aw.def.empty()) {
+            // a task waits for a queued prefix: the writer cannot publish it before the deferred copies
+            aw_def_force_all("wait");
+        }
+        if (n_aw_deferred > 0 && batch.size() == 0) {
+            // nothing else to decode: wait briefly for the writer instead of spinning the loop (the queue
+            // loop re-runs update_slots at once, and new tasks are taken between iterations)
+            std::unique_lock<std::mutex> lk(aw.mtx);
+            aw.cv.wait_for(lk, std::chrono::milliseconds(20));
+        }
+    }
+
+    // post_decode(), sampled: the slot's last-token logits for the regenerate sidecar
+    void logits_capture(server_slot & slot, int tok_idx) {
+        // Feature A: capture this slot's last-token full-vocab logits for a possible disk
+        // save. Cost: one ~n_vocab*4-byte copy per decoded token, incurred ONLY on the FULL and RS
+        // classes (logits_sidecar_class) AND only when slot saving is enabled (--slot-save-path
+        // set); attention models and servers without slot-save pay nothing at all. The copy is
+        // unavoidable for correctness: ctx logits are overwritten by the next slot's decode,
+        // so a lazy read at SLOT_SAVE would be wrong under --parallel>1. Captured per-slot
+        // from this slot's own tok_idx so it is correct for any N/interleave (never read
+        // from the shared ctx at save time). common_sampler_sample already synchronized the
+        // context above, so llama_get_logits_ith is valid here.
+        if (logits_sidecar_class() && !params_base.slot_save_path.empty()) {
+            const float * lg = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+            if (lg) {
+                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                slot.logits_last.assign(lg, lg + nv);
+                // Stamp the capture with the token count of the state it corresponds to.
+                // At this point process_token() has NOT yet appended the just-sampled token,
+                // so prompt.tokens.size() is exactly the length whose final token produced
+                // these logits, i.e. it matches the token_count a SLOT_SAVE would record.
+                slot.logits_last_n_tokens = (int32_t) slot.prompt.tokens.size();
+            } else {
+                // capture failed -> invalidate so a later save never serializes stale logits
+                slot.logits_last.clear();
+                slot.logits_last_n_tokens = -1;
+            }
+        }
+    }
+
+    // post_decode(), response done: the response node, when auto_save_after_response_wanted said so
+    void response_node_save(server_slot & slot, bool save) {
+        if (save) {
+            auto_save_slot_if_useful(slot, AUTO_SAVE_SITE_RESPONSE_NODE);
+        }
+    }
+
+    // post_decode(), speculative: the same logits capture for the last accepted token
+    void logits_capture_spec(server_slot & slot, int32_t i_row_last, size_t n_draft,
+                             const std::vector<llama_token> & accepted) {
+        // the same last-token logits capture as the non-speculative path (see Feature A there):
+        // the last accepted token was sampled from row i_row_last, and once the accepted tokens
+        // are added below, prompt.tokens is exactly the state whose final token produced them
+        if (logits_sidecar_class() && !params_base.slot_save_path.empty()) {
+            const float * lg = i_row_last >= 0 ? llama_get_logits_ith(slot.ctx_tgt, i_row_last) : nullptr;
+            if (lg) {
+                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                slot.logits_last.assign(lg, lg + nv);
+                slot.logits_last_n_tokens = (int32_t) (slot.prompt.n_tokens() - n_draft + accepted.size() - 1);
+            } else {
+                slot.logits_last.clear();
+                slot.logits_last_n_tokens = -1;
+            }
+        }
+    }
+
+    // server_context::get_meta(): the cache's fields of the meta, set after upstream's positional initialiser
+    void meta_fill(server_context_meta & meta) const {
+        meta.fp_mmproj       = fp_mmproj;
+        meta.auto_cache_caps = auto_cache_caps();
+    }

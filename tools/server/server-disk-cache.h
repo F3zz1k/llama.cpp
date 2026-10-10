@@ -353,3 +353,10 @@ void slot_save_enforce_limits(const std::string & dir,
                               uint64_t * n_bound_exceeded = nullptr,
                               bool * chain_rejected = nullptr);
 bool mmproj_header_fingerprint(const std::string & path, uint64_t & out);
+
+// the cache's parts of upstream's HTTP handlers (server-context.cpp, server_routes)
+struct server_context_meta;
+struct server_task;
+void server_props_disk_cache(const server_context_meta & meta, json & props);
+void server_task_preamble_end(server_task & task, const server_context_meta & meta, const llama_vocab * vocab,
+                              const json & data, const json & prompt, size_t n_inputs);
