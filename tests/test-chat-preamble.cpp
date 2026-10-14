@@ -60,7 +60,7 @@ static std::optional<rendered> render(const common_chat_templates * tmpls,
     }
     std::string prompt;
     try {
-        prompt = common_chat_templates_apply(tmpls, in).prompt;
+        prompt = common_chat_templates_apply(tmpls, in).prompt.str();
     } catch (const std::exception &) {
         return std::nullopt;
     }
@@ -209,7 +209,7 @@ static int bench(int argc, char ** argv) {
                 const auto t0 = std::chrono::steady_clock::now();
                 std::string prompt;
                 try {
-                    prompt = common_chat_templates_apply(tmpls.get(), in).prompt;
+                    prompt = common_chat_templates_apply(tmpls.get(), in).prompt.str();
                 } catch (const std::exception &) {
                     break;
                 }
@@ -275,7 +275,7 @@ int main(int argc, char ** argv) {
             in.messages  = { msg("system", "S"), msg("user", "REAL question") };
             in.use_jinja = true;
             try {
-                const std::string prompt = common_chat_templates_apply(tmpls.get(), in).prompt;
+                const std::string prompt = common_chat_templates_apply(tmpls.get(), in).prompt.str();
                 const int32_t c = common_chat_preamble_end(tmpls.get(), in, prompt);
                 if (c != -1) {
                     fail("raising template", "expected -1, got " + std::to_string(c));

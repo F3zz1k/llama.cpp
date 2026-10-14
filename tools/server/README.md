@@ -223,7 +223,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
-| `--slot-save-path PATH` | path to save slot kv cache to (default: disabled); this flag alone never deletes files. eviction/bounded-store behaviour applies only under --slot-save-auto |
+| `--slot-save-path PATH` | path to save slot kv cache to (default: disabled); this flag alone never deletes files. eviction/bounded-store behaviour applies only under --slot-save-auto<br/>(env: LLAMA_ARG_SLOT_SAVE_PATH) |
 | `--slot-save-max-count N` | max number of snapshots kept in the --slot-save-auto cache (treated as a dedicated dir); oldest are evicted; no effect without --slot-save-auto (default: 0, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_COUNT) |
 | `--slot-save-max-mb N` | max total size (MiB) of the --slot-save-auto cache store; oldest snapshots are evicted; no effect without --slot-save-auto (default: 0, 0 = unlimited)<br/>(env: LLAMA_ARG_SLOT_SAVE_MAX_MB) |
 | `--slot-save-auto` | automatically restore/save prompt KV to/from --slot-save-path across requests and restarts (transparent disk prompt cache); requires --slot-save-path (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_AUTO) |
@@ -1737,13 +1737,13 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya, clef, pplx-decider, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
 
-For laya, clef and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. A server that runs clef only serves this endpoint, text generation is not available.
+For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. A server that runs clef only serves this endpoint, text generation is not available.
 
 *Image input:*
 
-Image input needs a model that supports it (for example: openjev, clef, pplx-decider, lfm2-d1, lfm2-d1-omni) and its multimodal projector, see `--mmproj`.
+Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni) and its multimodal projector, see `--mmproj`.
 
 Images can be given in two ways, and both can be used in the same request:
 

@@ -52,7 +52,7 @@ int32_t common_chat_preamble_end(const struct common_chat_templates *        tmp
         probe.messages.insert(probe.messages.end(), tail.begin(), tail.end());
         std::string rendered;
         try {
-            rendered = common_chat_templates_apply(tmpls, probe).prompt;
+            rendered = common_chat_templates_apply(tmpls, probe).prompt.str();
         } catch (const std::exception & e) {
             LOG_DBG("%s: probe not rendered: %s\n", __func__, e.what());
             continue;
