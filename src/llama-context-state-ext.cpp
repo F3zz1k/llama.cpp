@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-state-deferred.h"
 
 #include "ggml-backend.h"
 
@@ -17,7 +18,8 @@
 
 // Streams into a caller-provided sink: every byte, plain or tensor, goes into memory the sink hands
 // out, in pieces no larger than it offers, so a tensor slice is copied from the backend straight into
-// its final staging place with no intermediate buffer.
+// its final staging place with no intermediate buffer (a tensor split across devices is the exception, see
+// llama_state_tensor_read_whole).
 class llama_io_write_sink : public llama_io_write_i {
 public:
     llama_io_write_sink(const llama_state_sink & sink) : sink(sink) {}
@@ -36,6 +38,13 @@ public:
     }
 
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (llama_state_tensor_read_whole(tensor)) {
+            // a split tensor is fetched whole and the host copy is cut at the sink's boundaries
+            bounce.resize(size);
+            ggml_backend_tensor_get(tensor, bounce.data(), offset, size);
+            write(bounce.data(), size);
+            return;
+        }
         while (size > 0) {
             size_t avail = 0;
             void * dst = reserve(size, avail);
@@ -64,6 +73,7 @@ private:
 
     const llama_state_sink & sink;
     size_t size_written = 0;
+    std::vector<uint8_t> bounce; // a split tensor's slice on its way to the sink
 };
 
 // Counts like llama_io_write_dummy and keeps the first n_head bytes of the stream, tensor data as zeros.

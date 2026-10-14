@@ -67,6 +67,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             ARGS -m "${MODEL_DIR}/${model}.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-${model}" --expect-deferred ${expect})
         set_tests_properties(test-state-deferred-${model} PROPERTIES FIXTURES_REQUIRED generate-models)
     endforeach()
+    # the same on a Meta device over two CPU devices (LLAMA_SPLIT_MODE_TENSOR): a split tensor is read in whole
+    # chunks only, so both writers must fetch a slice whole and cut the host copy at the sink's boundaries
+    file(MAKE_DIRECTORY "${DELTA_BYTES_TMP}/deferred-llama-dense-smt")
+    llama_test(test-state-deferred NAME test-state-deferred-llama-dense-smt LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf" --tmp "${DELTA_BYTES_TMP}/deferred-llama-dense-smt" --expect-deferred 1 --sm-tensor)
+    set_tests_properties(test-state-deferred-llama-dense-smt PROPERTIES FIXTURES_REQUIRED generate-models)
     # k-pool memory classes: a sequence's output must not depend on another sequence sharing a unified cache
     # (regression cases of the glm5next branch's k-pool fixes 625fbcbad and 525a329bb, as a behaviour test);
     # llama-dense is the plain-attention control

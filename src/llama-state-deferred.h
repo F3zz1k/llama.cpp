@@ -43,6 +43,11 @@ void llama_state_deferred_before_free_ctx(const llama_context * ctx);
 // a finished capture that still references cells joins the registry the hooks consult
 void llama_state_deferred_register(llama_state_deferred * d);
 
+// A tensor in a Meta buffer (LLAMA_SPLIT_MODE_TENSOR) is split across devices, and the Meta backend serves a
+// read of it only in whole split chunks (one cell's row of a KV tensor), while a sink's pieces end anywhere.
+// A writer that cuts tensor slices at sink boundaries must fetch such a slice whole and cut the host copy.
+bool llama_state_tensor_read_whole(const ggml_tensor * tensor);
+
 struct llama_state_deferred {
     struct seg {
         size_t          size   = 0;

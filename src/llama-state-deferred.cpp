@@ -11,6 +11,13 @@
 #include <mutex>
 #include <stdexcept>
 
+// ggml-backend-impl.h declares this, but it is not on llama's include path
+extern "C" bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
+bool llama_state_tensor_read_whole(const ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer);
+}
+
 //
 // registry of captures that still reference cache cells
 //
@@ -268,6 +275,28 @@ size_t llama_state_deferred_emit(llama_state_deferred * d, const llama_state_sin
         size_t want = s.size - d->seg_off;
         if (max_bytes != 0) {
             want = std::min(want, max_bytes - n);
+        }
+        if (s.host == nullptr && llama_state_tensor_read_whole(s.tensor)) {
+            // a split tensor is read whole into memory the capture owns, then cut like a host segment
+            if (!synced && d->ctx) {
+                llama_synchronize(d->ctx);
+                synced = true;
+            }
+            if (d->seg_off > 0) {
+                s.t_off   += d->seg_off;
+                s.size    -= d->seg_off;
+                d->seg_off = 0;
+                want       = s.size;
+                if (max_bytes != 0) {
+                    want = std::min(want, max_bytes - n);
+                }
+            }
+            std::unique_ptr<uint8_t[]> buf(new uint8_t[s.size]);
+            ggml_backend_tensor_get(s.tensor, buf.get(), s.t_off, s.size);
+            d->n_pending -= s.size;
+            s.host   = buf.get();
+            s.tensor = nullptr;
+            d->resolved.push_back(std::move(buf));
         }
         size_t avail = 0;
         void * dst = sink->reserve(sink->user_data, want, &avail);

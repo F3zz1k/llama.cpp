@@ -46,6 +46,7 @@ struct opts {
     int expect_deferred = -1; // -1: do not check
     uint32_t n_ubatch = 64;
     bool yarn = false;        // YaRN rope scaling: a rope by 0 then scales K (mscale), so it is not the identity
+    bool sm_tensor = false;   // tensor split over two CPU devices through a Meta device (see the header)
 };
 static opts g_o;
 
@@ -189,6 +190,7 @@ int main(int argc, char ** argv) {
         else if (a == "--ubatch")          g_o.n_ubatch = std::atoi(next());
         else if (a == "--expect-deferred") g_o.expect_deferred = std::atoi(next());
         else if (a == "--yarn")            g_o.yarn = true;
+        else if (a == "--sm-tensor")       g_o.sm_tensor = true;
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
     }
 
@@ -199,6 +201,20 @@ int main(int argc, char ** argv) {
 
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
+    static ggml_backend_dev_t smt_devs[3] = { nullptr, nullptr, nullptr };
+    if (g_o.sm_tensor) {
+        // the Meta device splits every weight and the KV cache across its simple devices; two CPU devices
+        // give the split layout without a GPU
+        smt_devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        smt_devs[1] = smt_devs[0];
+        if (!smt_devs[0]) {
+            fprintf(stderr, "no CPU device\n");
+            return 2;
+        }
+        mp.devices      = smt_devs;
+        mp.split_mode   = LLAMA_SPLIT_MODE_TENSOR;
+        mp.n_gpu_layers = 999;
+    }
     llama_model * model = llama_model_load_from_file(g_o.model.c_str(), mp);
     if (!model) {
         fprintf(stderr, "model load failed\n");
@@ -215,8 +231,8 @@ int main(int argc, char ** argv) {
 
     const int N  = g_o.n_node;
     const int LO = g_o.n_lo;
-    printf("model %s  node %d  delta lo %d  more %d  ubatch %u%s\n", g_o.model.c_str(), N, LO, g_o.n_more, g_o.n_ubatch,
-           g_o.yarn ? "  yarn" : "");
+    printf("model %s  node %d  delta lo %d  more %d  ubatch %u%s%s\n", g_o.model.c_str(), N, LO, g_o.n_more, g_o.n_ubatch,
+           g_o.yarn ? "  yarn" : "", g_o.sm_tensor ? "  sm tensor" : "");
 
     // ---- append: root and delta captures, the context keeps decoding, then emission
     size_t n_def_root = 0, n_total_root = 0;
@@ -418,6 +434,16 @@ int main(int argc, char ** argv) {
     };
 
     for (const auto & m : muts) {
+        if (g_o.sm_tensor && (!strcmp(m.name, "add") || !strcmp(m.name, "div") ||
+                              !strcmp(m.name, "shift-other") || !strcmp(m.name, "add-shared") ||
+                              !strcmp(m.name, "cp-stream"))) {
+            // the K-shift graph does not schedule on a Meta device over CPU devices (its subgraph bookkeeping
+            // skips views of host buffers), and a stream copy (ggml_backend_tensor_copy between stream views
+            // of the split KV tensor) faults in the Meta buffer's set_tensor; the writers under test are
+            // covered by the other mutations
+            printf("  %-10s not run under --sm-tensor\n", m.name);
+            continue;
+        }
         const int r = run(m, true);
         if (r < 0 || !deferring) {
             continue;
